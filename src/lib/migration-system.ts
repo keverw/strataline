@@ -5,7 +5,6 @@ import {
   type LogDataInput,
   consoleLogger,
   createSchemaHelpers,
-  createPrefixedLogger,
 } from "./schema-helpers";
 
 /**
@@ -15,6 +14,7 @@ import {
 
 // Migration phase types
 export type SchemaPhase = "beforeSchema" | "afterSchema";
+export type MigrationMode = "job" | "distributed";
 
 // Migration callback types
 export type MigrationCompletionCallback = () => void;
@@ -29,14 +29,19 @@ export interface Migration {
   beforeSchema?: (client: PoolClient, helpers?: SchemaHelpers) => Promise<void>;
 
   // Data migration - runs separately with explicit completion and defer callbacks
-  // The migration should call complete() when it's done, or defer() if it needs to be paused
+  // The migration should call ctx.complete() when it's done, or ctx.defer() if it needs to be paused
   // Only one of complete() or defer() can be called, not both
   // The logger is task-specific and will prefix all messages with the task ID
+  // Mode is required and payload is always passed (empty object if not provided)
   migration?: (
     pool: Pool,
-    logger: SchemaLogger,
-    complete: MigrationCompletionCallback,
-    defer: MigrationDeferCallback,
+    ctx: {
+      logger: SchemaLogger;
+      complete(): void;
+      defer(reason?: string): void;
+      mode: MigrationMode;
+      payload: Record<string, any>;
+    },
   ) => Promise<void>;
 
   // Schema changes after data migration - runs in a transaction
@@ -98,6 +103,7 @@ export class MigrationManager {
   private lockRenewalInterval: NodeJS.Timeout | null = null;
   private lockRenewalSeconds = 60; // Renew every minute
   private logger: MigrationLogger;
+  private initialized = false;
 
   constructor(pool: Pool, logger: MigrationLogger = consoleLogger) {
     this.pool = pool;
@@ -137,9 +143,17 @@ export class MigrationManager {
 
   /**
    * Initialize the migration system
+   * @private
    */
-  async initialize(): Promise<void> {
+
+  private async ensureInitialized(): Promise<void> {
+    // Skip if already initialized
+    if (this.initialized) {
+      return;
+    }
+
     const client = await this.pool.connect();
+
     try {
       // Create migration status table
       await client.query(`
@@ -166,6 +180,9 @@ export class MigrationManager {
     } finally {
       client.release();
     }
+
+    // Mark as initialized
+    this.initialized = true;
   }
 
   /**
@@ -200,6 +217,9 @@ export class MigrationManager {
    */
 
   async getMigrationStatus(): Promise<MigrationStatus[]> {
+    await this.ensureInitialized();
+
+    // Query the migration status table
     const { rows } = await this.pool.query(`
       SELECT
         id,
@@ -218,10 +238,13 @@ export class MigrationManager {
 
   /**
    * Run schema changes for all pending migrations
+   * @param mode Optional migration mode that will be passed to data migrations
    * @returns A structured result object with details about the migration run
    */
 
-  async runSchemaChanges(): Promise<MigrationResult> {
+  async runSchemaChanges(mode: MigrationMode): Promise<MigrationResult> {
+    await this.ensureInitialized();
+
     // Try to acquire the lock
     const lockAcquired = await this.acquireMigrationLock();
     if (!lockAcquired) {
@@ -242,10 +265,33 @@ export class MigrationManager {
       const status = await this.getMigrationStatus();
       const appliedIds = status.map((s) => s.id);
 
-      // Find migrations that haven't been applied yet
-      const pendingMigrations = this.migrations.filter(
-        (m) => !appliedIds.includes(m.id),
-      );
+      // Get the status of migrations that are in our registered list
+      const migrationStatusMap = new Map<string, MigrationStatus>();
+      status.forEach((s) => {
+        migrationStatusMap.set(s.id, s);
+      });
+
+      // Find migrations that haven't been applied yet or have applied_at = 0
+      const pendingMigrations = this.migrations.filter((m) => {
+        // If not in status table, it's pending
+        if (!migrationStatusMap.has(m.id)) return true;
+
+        const migrationStatus = migrationStatusMap.get(m.id)!;
+
+        // If applied_at is 0, it's not fully completed yet
+        if (migrationStatus.appliedAt === 0) return true;
+
+        // If any of the phases are not applied, it's pending
+        if (
+          !migrationStatus.beforeSchemaApplied ||
+          !migrationStatus.migrationComplete ||
+          !migrationStatus.afterSchemaApplied
+        )
+          return true;
+
+        // Otherwise, it's completed
+        return false;
+      });
 
       // If no pending migrations, return early with success
       // Include previously completed migrations in the result
@@ -274,7 +320,7 @@ export class MigrationManager {
             message: `Starting migration ${migration.id} (${migration.description})`,
           });
 
-          const success = await this.runSingleMigration(migration);
+          const success = await this.runSingleMigration(migration, mode);
           if (!success) {
             this.logger.log({
               message: `Migration ${migration.id} did not complete successfully - stopping migration process to prevent out-of-order migrations`,
@@ -337,9 +383,14 @@ export class MigrationManager {
 
   /**
    * Run a single migration's schema changes
+   * @param migration The migration to run
+   * @param mode Optional migration mode to pass to data migration
    * @returns A boolean indicating whether the migration was successful
    */
-  private async runSingleMigration(migration: Migration): Promise<boolean> {
+  private async runSingleMigration(
+    migration: Migration,
+    mode: MigrationMode,
+  ): Promise<boolean> {
     // Create a task-specific logger for this migration
     const taskLogger = this.createTaskLogger(migration.id);
 
@@ -349,6 +400,30 @@ export class MigrationManager {
 
     // Create schema helpers with the task-specific logger
     const helpers = createSchemaHelpers(taskLogger);
+
+    // Ensure migration record exists in the status table
+    const { rows } = await this.pool.query(
+      `SELECT id FROM migration_status WHERE id = $1`,
+      [migration.id],
+    );
+
+    if (rows.length === 0) {
+      // Create initial migration record if it doesn't exist
+      // Set applied_at to 0 initially - will be updated when migration is fully completed
+      const now = Math.floor(Date.now() / 1000);
+      await this.pool.query(
+        `
+        INSERT INTO migration_status (
+          id, description, before_schema_applied, migration_complete, after_schema_applied, applied_at, last_updated
+        ) VALUES ($1, $2, FALSE, FALSE, FALSE, 0, $3)
+        `,
+        [migration.id, migration.description, now],
+      );
+
+      taskLogger.log({
+        message: `Created migration record for ${migration.id}`,
+      });
+    }
 
     // Step 1: Run schema changes before data migration if provided
     if (migration.beforeSchema) {
@@ -378,7 +453,11 @@ export class MigrationManager {
     // Step 2: Run data migration if provided
     if (migration.migration) {
       try {
-        const isComplete = await this.runDataMigration(migration, taskLogger);
+        const isComplete = await this.runDataMigration(
+          migration,
+          taskLogger,
+          mode,
+        );
         if (!isComplete) {
           // If data migration is not complete, do not proceed with afterSchema
           taskLogger.log({
@@ -438,6 +517,22 @@ export class MigrationManager {
       );
     }
 
+    // Update applied_at to mark when the migration was fully completed
+    const completionTime = Math.floor(Date.now() / 1000);
+    await this.pool.query(
+      `
+      UPDATE migration_status
+      SET applied_at = $2
+      WHERE id = $1
+      `,
+      [migration.id, completionTime],
+    );
+
+    // Log that the migration is fully completed with the timestamp
+    taskLogger.log({
+      message: `Marked migration ${migration.id} as fully completed (applied_at = ${completionTime})`,
+    });
+
     // Log successful completion of the entire migration
     taskLogger.log({
       message: `Migration ${migration.id} completed successfully`,
@@ -490,27 +585,15 @@ export class MigrationManager {
       // Update migration status
       const now = Math.floor(Date.now() / 1000);
 
-      if (rows.length === 0) {
-        // First phase being applied - create status record
-        await client.query(
-          `
-          INSERT INTO migration_status (
-            id, description, ${statusField}, applied_at, last_updated
-          ) VALUES ($1, $2, TRUE, $3, $3)
+      // Update existing status record
+      await client.query(
+        `
+        UPDATE migration_status
+        SET ${statusField} = TRUE, last_updated = $2
+        WHERE id = $1
         `,
-          [migration.id, migration.description, now],
-        );
-      } else {
-        // Update existing status record
-        await client.query(
-          `
-          UPDATE migration_status
-          SET ${statusField} = TRUE, last_updated = $2
-          WHERE id = $1
-        `,
-          [migration.id, now],
-        );
-      }
+        [migration.id, now],
+      );
 
       await client.query("COMMIT");
       logger.log({
@@ -539,6 +622,8 @@ export class MigrationManager {
   private async runDataMigration(
     migration: Migration,
     logger: SchemaLogger,
+    mode: MigrationMode,
+    payload: Record<string, any> = {},
   ): Promise<boolean> {
     // Pre-condition: migration.migration is guaranteed to be non-null by the caller.
 
@@ -599,12 +684,13 @@ export class MigrationManager {
           });
 
           // Pass the task-specific logger that already prefixes messages with the task ID
-          const migrationFnExecution = migration.migration!(
-            this.pool,
+          const migrationFnExecution = migration.migration!(this.pool, {
             logger, // This is the task-specific logger created in runSingleMigration
-            completeCallback,
-            deferCallback,
-          );
+            complete: completeCallback,
+            defer: deferCallback,
+            mode,
+            payload,
+          });
 
           // If the migration function returns a promise, await its settlement.
           // This handles cases where the migration function does async work
@@ -641,8 +727,9 @@ export class MigrationManager {
 
   /**
    * Acquire a migration lock to prevent concurrent migrations
+   * @private
    */
-  async acquireMigrationLock(): Promise<boolean> {
+  private async acquireMigrationLock(): Promise<boolean> {
     const client = await this.pool.connect();
     try {
       const now = new Date();
@@ -820,9 +907,130 @@ export class MigrationManager {
   }
 
   /**
-   * Release the migration lock
+   * Run only the data migration phase for a specific migration
+   * @param migrationId The ID of the migration to run
+   * @param mode The migration mode to pass to the data migration
+   * @param payload Optional payload to pass to the data migration
+   * @returns A boolean indicating whether the migration was successful
    */
-  async releaseMigrationLock(): Promise<void> {
+  async runDataMigrationOnly(
+    migrationId: string,
+    mode: MigrationMode,
+    payload: Record<string, any> = {},
+  ): Promise<boolean> {
+    await this.ensureInitialized();
+
+    // Find the migration by ID
+    const migration = this.migrations.find((m) => m.id === migrationId);
+    if (!migration) {
+      this.logger.error({
+        message: `Migration with ID ${migrationId} not found`,
+      });
+      return false;
+    }
+
+    // Create a task-specific logger for this migration
+    const taskLogger = this.createTaskLogger(migration.id);
+
+    // Check if the migration is in the correct state to run data migration only
+    const { rows } = await this.pool.query(
+      `
+      SELECT 
+        before_schema_applied, 
+        migration_complete, 
+        after_schema_applied,
+        applied_at
+      FROM migration_status 
+      WHERE id = $1
+      `,
+      [migrationId],
+    );
+
+    if (rows.length === 0) {
+      taskLogger.error({
+        message: `Migration ${migrationId} not found in status table. Before schema must be applied first.`,
+      });
+      return false;
+    }
+
+    const status = rows[0];
+    if (!status.before_schema_applied) {
+      taskLogger.error({
+        message: `Cannot run data migration for ${migrationId} - before schema has not been applied yet`,
+      });
+      return false;
+    }
+
+    // Check if migration is already complete (migration_complete flag is true and applied_at > 0)
+    if (status.migration_complete && status.applied_at > 0) {
+      taskLogger.log({
+        message: `Data migration for ${migrationId} has already been completed`,
+      });
+      return true;
+    }
+
+    if (status.after_schema_applied) {
+      taskLogger.error({
+        message: `Invalid state for migration ${migrationId} - after schema is applied but data migration is not complete`,
+      });
+      return false;
+    }
+
+    // If there's no data migration function, mark it as complete and return
+    if (!migration.migration) {
+      taskLogger.log({
+        message: `No data migration provided for migration ${migration.id}, marking as complete`,
+      });
+
+      await this.pool.query(
+        `
+        UPDATE migration_status
+        SET migration_complete = TRUE, last_updated = EXTRACT(EPOCH FROM NOW())::bigint
+        WHERE id = $1
+      `,
+        [migration.id],
+      );
+      return true;
+    }
+
+    // Run the data migration
+    try {
+      taskLogger.log({
+        message: `Running data migration for ${migration.id} with mode: ${mode}`,
+      });
+
+      const isComplete = await this.runDataMigration(
+        migration,
+        taskLogger,
+        mode,
+        payload,
+      );
+
+      if (isComplete) {
+        taskLogger.log({
+          message: `Data migration for ${migration.id} completed successfully`,
+        });
+        return true;
+      } else {
+        taskLogger.log({
+          message: `Data migration for ${migration.id} was deferred or did not complete`,
+        });
+        return false;
+      }
+    } catch (err) {
+      taskLogger.error({
+        message: `Error in data migration:`,
+        error: err,
+      });
+      return false;
+    }
+  }
+
+  /**
+   * Release the migration lock
+   * @private
+   */
+  private async releaseMigrationLock(): Promise<void> {
     // Stop the renewal timer
     this.stopLockRenewal();
 

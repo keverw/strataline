@@ -164,6 +164,7 @@ export function createSchemaHelpers(
 ): SchemaHelpers {
   // Create a prefixed logger for the schema helpers
   const prefixedLogger = createPrefixedLogger(logger, prefix);
+
   /**
    * Create a table if it doesn't exist
    */
