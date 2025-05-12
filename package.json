@@ -1,0 +1,51 @@
+{
+  "name": "strataline",
+  "version": "1.0.0",
+  "description": "A structured migration runner for PostgreSQL that treats database changes as layered, resumable operations",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "bun run update-readme && tsup",
+    "dev": "tsup --watch",
+    "test": "bun test",
+    "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,css,scss,md,html}\"",
+    "lint": "eslint src --ext .ts",
+    "update-readme": "bun scripts/update-readme-version.ts"
+  },
+  "keywords": [
+    "postgresql",
+    "migrations",
+    "database",
+    "schema",
+    "bun"
+  ],
+  "author": "Kevin Whitman (https://github.com/keverw)",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/pg": "^8.15.1",
+    "@typescript-eslint/eslint-plugin": "^6.13.0",
+    "@typescript-eslint/parser": "^6.13.0",
+    "eslint": "^8.55.0",
+    "prettier": "^3.5.3",
+    "tsup": "^8.4.0",
+    "typescript": "^5.3.0"
+  },
+  "peerDependencies": {
+    "pg": "^8.15.6"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  }
+}
