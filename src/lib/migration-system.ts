@@ -20,8 +20,8 @@ export type MigrationMode = "job" | "distributed";
 export type MigrationCompletionCallback = () => void;
 export type MigrationDeferCallback = (reason?: string) => void;
 
-// Migration interface
-export interface Migration {
+// Migration interface with generic payload type
+export interface Migration<P = Record<string, any>> {
   id: string;
   description: string;
 
@@ -40,7 +40,7 @@ export interface Migration {
       complete(): void;
       defer(reason?: string): void;
       mode: MigrationMode;
-      payload: Record<string, any>;
+      payload: P;
     },
   ) => Promise<void>;
 
@@ -55,7 +55,7 @@ export interface MigrationStatus {
   beforeSchemaApplied: boolean;
   migrationComplete: boolean;
   afterSchemaApplied: boolean;
-  appliedAt: number;
+  completedAt: number;
   lastUpdated: number;
 }
 
@@ -98,16 +98,80 @@ export class MigrationManager {
   private static readonly LOCK_NAME = "database_migrations";
 
   private pool: Pool;
-  private migrations: Migration[] = [];
+  private migrations: Migration<any>[] = [];
   private lockId: string | null = null;
   private lockRenewalInterval: NodeJS.Timeout | null = null;
-  private lockRenewalSeconds = 60; // Renew every minute
+  private lockRenewalSeconds: number; // Configurable lock renewal interval in seconds
   private logger: MigrationLogger;
   private initialized = false;
 
-  constructor(pool: Pool, logger: MigrationLogger = consoleLogger) {
+  /**
+   * Helper method to update migration status fields
+   * @private
+   */
+  private async markStatus(
+    id: string,
+    fields: {
+      beforeSchemaApplied?: boolean;
+      migrationComplete?: boolean;
+      afterSchemaApplied?: boolean;
+      completedAt?: number;
+    },
+  ): Promise<void> {
+    const updates: string[] = [];
+    const values: any[] = [id];
+    let paramIndex = 2;
+
+    if (fields.beforeSchemaApplied !== undefined) {
+      updates.push(`before_schema_applied = $${paramIndex++}`);
+      values.push(fields.beforeSchemaApplied);
+    }
+
+    if (fields.migrationComplete !== undefined) {
+      updates.push(`migration_complete = $${paramIndex++}`);
+      values.push(fields.migrationComplete);
+    }
+
+    if (fields.afterSchemaApplied !== undefined) {
+      updates.push(`after_schema_applied = $${paramIndex++}`);
+      values.push(fields.afterSchemaApplied);
+    }
+
+    if (fields.completedAt !== undefined) {
+      updates.push(`completed_at = $${paramIndex++}`);
+      values.push(fields.completedAt);
+    }
+
+    // Always update last_updated timestamp
+    updates.push(`last_updated = $${paramIndex++}`);
+    values.push(Math.floor(Date.now() / 1000));
+
+    if (updates.length === 0) return;
+
+    const query = `
+      UPDATE migration_status
+      SET ${updates.join(", ")}
+      WHERE id = $1
+    `;
+
+    await this.pool.query(query, values);
+  }
+
+  /**
+   * Constructor for MigrationManager
+   * @param pool Database connection pool
+   * @param logger Logger instance (defaults to console logger)
+   * @param opts Optional configuration options
+   * @param opts.lockRenewalSeconds Number of seconds between lock renewal attempts (defaults to 60)
+   */
+  constructor(
+    pool: Pool,
+    logger: MigrationLogger = consoleLogger,
+    opts?: { lockRenewalSeconds?: number },
+  ) {
     this.pool = pool;
     this.logger = logger;
+    this.lockRenewalSeconds = opts?.lockRenewalSeconds ?? 60; // Default to 60 seconds if not specified
   }
 
   /**
@@ -163,7 +227,7 @@ export class MigrationManager {
           before_schema_applied BOOLEAN NOT NULL DEFAULT FALSE,
           migration_complete BOOLEAN NOT NULL DEFAULT FALSE,
           after_schema_applied BOOLEAN NOT NULL DEFAULT FALSE,
-          applied_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::bigint,
+          completed_at BIGINT NOT NULL DEFAULT 0,
           last_updated BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::bigint
         )
       `);
@@ -190,7 +254,7 @@ export class MigrationManager {
    * @throws Error if duplicate migration IDs are detected
    */
 
-  register(migrations: Migration[]): void {
+  register<P = Record<string, any>>(migrations: Migration<P>[]): void {
     // Check for duplicate migration IDs
     const ids = new Set<string>();
     const duplicates: string[] = [];
@@ -227,10 +291,10 @@ export class MigrationManager {
         before_schema_applied AS "beforeSchemaApplied",
         migration_complete AS "migrationComplete",
         after_schema_applied AS "afterSchemaApplied",
-        applied_at AS "appliedAt",
+        completed_at AS "completedAt",
         last_updated AS "lastUpdated"
       FROM migration_status
-      ORDER BY applied_at
+      ORDER BY completed_at
     `);
 
     return rows;
@@ -267,9 +331,10 @@ export class MigrationManager {
 
       // Get the status of migrations that are in our registered list
       const migrationStatusMap = new Map<string, MigrationStatus>();
-      status.forEach((s) => {
+
+      for (const s of status) {
         migrationStatusMap.set(s.id, s);
-      });
+      }
 
       // Find migrations that haven't been applied yet or have applied_at = 0
       const pendingMigrations = this.migrations.filter((m) => {
@@ -278,8 +343,8 @@ export class MigrationManager {
 
         const migrationStatus = migrationStatusMap.get(m.id)!;
 
-        // If applied_at is 0, it's not fully completed yet
-        if (migrationStatus.appliedAt === 0) return true;
+        // If completedAt is 0, it's not fully completed yet
+        if (migrationStatus.completedAt === 0) return true;
 
         // If any of the phases are not applied, it's pending
         if (
@@ -387,8 +452,8 @@ export class MigrationManager {
    * @param mode Optional migration mode to pass to data migration
    * @returns A boolean indicating whether the migration was successful
    */
-  private async runSingleMigration(
-    migration: Migration,
+  private async runSingleMigration<P = Record<string, any>>(
+    migration: Migration<P>,
     mode: MigrationMode,
   ): Promise<boolean> {
     // Create a task-specific logger for this migration
@@ -409,12 +474,12 @@ export class MigrationManager {
 
     if (rows.length === 0) {
       // Create initial migration record if it doesn't exist
-      // Set applied_at to 0 initially - will be updated when migration is fully completed
+      // Set completed_at to 0 initially - will be updated when migration is fully completed
       const now = Math.floor(Date.now() / 1000);
       await this.pool.query(
         `
         INSERT INTO migration_status (
-          id, description, before_schema_applied, migration_complete, after_schema_applied, applied_at, last_updated
+          id, description, before_schema_applied, migration_complete, after_schema_applied, completed_at, last_updated
         ) VALUES ($1, $2, FALSE, FALSE, FALSE, 0, $3)
         `,
         [migration.id, migration.description, now],
@@ -439,15 +504,7 @@ export class MigrationManager {
       });
 
       // Mark beforeSchema as applied even though it wasn't provided
-      const now = Math.floor(Date.now() / 1000);
-      await this.pool.query(
-        `
-        UPDATE migration_status
-        SET before_schema_applied = TRUE, last_updated = $2
-        WHERE id = $1
-        `,
-        [migration.id, now],
-      );
+      await this.markStatus(migration.id, { beforeSchemaApplied: true });
     }
 
     // Step 2: Run data migration if provided
@@ -482,14 +539,7 @@ export class MigrationManager {
         message: `No data migration provided for migration ${migration.id}`,
       });
 
-      await this.pool.query(
-        `
-        UPDATE migration_status
-        SET migration_complete = TRUE, last_updated = EXTRACT(EPOCH FROM NOW())::bigint
-        WHERE id = $1
-      `,
-        [migration.id],
-      );
+      await this.markStatus(migration.id, { migrationComplete: true });
     }
 
     // Step 3: Run schema changes after data migration if needed
@@ -506,31 +556,16 @@ export class MigrationManager {
       });
 
       // Mark afterSchema as applied even though it wasn't provided
-      const now = Math.floor(Date.now() / 1000);
-      await this.pool.query(
-        `
-        UPDATE migration_status
-        SET after_schema_applied = TRUE, last_updated = $2
-        WHERE id = $1
-        `,
-        [migration.id, now],
-      );
+      await this.markStatus(migration.id, { afterSchemaApplied: true });
     }
 
-    // Update applied_at to mark when the migration was fully completed
+    // Update completedAt to mark when the migration was fully completed
     const completionTime = Math.floor(Date.now() / 1000);
-    await this.pool.query(
-      `
-      UPDATE migration_status
-      SET applied_at = $2
-      WHERE id = $1
-      `,
-      [migration.id, completionTime],
-    );
+    await this.markStatus(migration.id, { completedAt: completionTime });
 
     // Log that the migration is fully completed with the timestamp
     taskLogger.log({
-      message: `Marked migration ${migration.id} as fully completed (applied_at = ${completionTime})`,
+      message: `Marked migration ${migration.id} as fully completed (completed_at = ${completionTime})`,
     });
 
     // Log successful completion of the entire migration
@@ -544,8 +579,8 @@ export class MigrationManager {
   /**
    * Run a specific phase of a migration
    */
-  private async runMigrationPhase(
-    migration: Migration,
+  private async runMigrationPhase<P = Record<string, any>>(
+    migration: Migration<P>,
     phase: SchemaPhase,
     helpers: SchemaHelpers,
     logger: SchemaLogger,
@@ -583,16 +618,13 @@ export class MigrationManager {
       }
 
       // Update migration status
-      const now = Math.floor(Date.now() / 1000);
-
-      // Update existing status record
       await client.query(
         `
         UPDATE migration_status
         SET ${statusField} = TRUE, last_updated = $2
         WHERE id = $1
         `,
-        [migration.id, now],
+        [migration.id, Math.floor(Date.now() / 1000)],
       );
 
       await client.query("COMMIT");
@@ -619,11 +651,11 @@ export class MigrationManager {
    * and rejects if the migration function throws an error.
    */
 
-  private async runDataMigration(
-    migration: Migration,
+  private async runDataMigration<P = Record<string, any>>(
+    migration: Migration<P>,
     logger: SchemaLogger,
     mode: MigrationMode,
-    payload: Record<string, any> = {},
+    payload: P = {} as P,
   ): Promise<boolean> {
     // Pre-condition: migration.migration is guaranteed to be non-null by the caller.
 
@@ -634,15 +666,7 @@ export class MigrationManager {
         if (callbackCalled) return; // Prevent multiple calls
         callbackCalled = true;
 
-        this.pool
-          .query(
-            `
-          UPDATE migration_status
-          SET migration_complete = TRUE, last_updated = EXTRACT(EPOCH FROM NOW())::bigint
-          WHERE id = $1
-          `,
-            [migration.id],
-          )
+        this.markStatus(migration.id, { migrationComplete: true })
           .then(() => {
             logger.log({
               message: `Data migration marked as complete via callback.`,
@@ -913,10 +937,10 @@ export class MigrationManager {
    * @param payload Optional payload to pass to the data migration
    * @returns A boolean indicating whether the migration was successful
    */
-  async runDataMigrationOnly(
+  async runDataMigrationOnly<P = Record<string, any>>(
     migrationId: string,
     mode: MigrationMode,
-    payload: Record<string, any> = {},
+    payload?: P,
   ): Promise<boolean> {
     await this.ensureInitialized();
 
@@ -939,7 +963,7 @@ export class MigrationManager {
         before_schema_applied, 
         migration_complete, 
         after_schema_applied,
-        applied_at
+        completed_at
       FROM migration_status 
       WHERE id = $1
       `,
@@ -961,8 +985,8 @@ export class MigrationManager {
       return false;
     }
 
-    // Check if migration is already complete (migration_complete flag is true and applied_at > 0)
-    if (status.migration_complete && status.applied_at > 0) {
+    // Check if migration is already complete (migration_complete flag is true and completed_at > 0)
+    if (status.migration_complete && status.completed_at > 0) {
       taskLogger.log({
         message: `Data migration for ${migrationId} has already been completed`,
       });
@@ -982,14 +1006,7 @@ export class MigrationManager {
         message: `No data migration provided for migration ${migration.id}, marking as complete`,
       });
 
-      await this.pool.query(
-        `
-        UPDATE migration_status
-        SET migration_complete = TRUE, last_updated = EXTRACT(EPOCH FROM NOW())::bigint
-        WHERE id = $1
-      `,
-        [migration.id],
-      );
+      await this.markStatus(migration.id, { migrationComplete: true });
       return true;
     }
 
@@ -1003,7 +1020,7 @@ export class MigrationManager {
         migration,
         taskLogger,
         mode,
-        payload,
+        payload || ({} as P),
       );
 
       if (isComplete) {
