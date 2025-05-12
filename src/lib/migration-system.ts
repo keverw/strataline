@@ -1,11 +1,11 @@
 import { type Pool, type PoolClient } from "pg";
 import {
-  type SchemaHelpers,
-  type SchemaLogger,
+  type Logger,
   type LogDataInput,
   consoleLogger,
-  createSchemaHelpers,
-} from "./schema-helpers";
+  createPrefixedLogger,
+} from "./logger";
+import { type SchemaHelpers, createSchemaHelpers } from "./schema-helpers";
 
 /**
  * A simplified migration system that clearly separates schema changes from data migrations
@@ -36,7 +36,7 @@ export interface Migration<P = Record<string, any>> {
   migration?: (
     pool: Pool,
     ctx: {
-      logger: SchemaLogger;
+      logger: Logger;
       complete(): void;
       defer(reason?: string): void;
       mode: MigrationMode;
@@ -86,9 +86,9 @@ export interface MigrationResult {
 }
 
 /**
- * Migration logger interface - uses the same interface as SchemaLogger
+ * Migration logger interface
  */
-export type MigrationLogger = SchemaLogger;
+export type MigrationLogger = Logger;
 
 /**
  * Migration Manager - handles running migrations and tracking their status
@@ -177,32 +177,8 @@ export class MigrationManager {
   /**
    * Create a task-specific logger that includes task ID and stage in log messages
    */
-  private createTaskLogger(taskId: string, stage?: string): SchemaLogger {
-    return {
-      log: (data: LogDataInput) => {
-        this.logger.log({
-          ...data,
-          task: data.task || taskId,
-          stage: data.stage || stage,
-        });
-      },
-      error: (data: LogDataInput) => {
-        this.logger.error({
-          ...data,
-          task: data.task || taskId,
-          stage: data.stage || stage,
-        });
-      },
-      warn: this.logger.warn
-        ? (data: LogDataInput) => {
-            this.logger.warn!({
-              ...data,
-              task: data.task || taskId,
-              stage: data.stage || stage,
-            });
-          }
-        : undefined,
-    };
+  private createTaskLogger(taskId: string, stage?: string): Logger {
+    return createPrefixedLogger(this.logger, { task: taskId, stage });
   }
 
   /**
@@ -385,20 +361,37 @@ export class MigrationManager {
             message: `Starting migration ${migration.id} (${migration.description})`,
           });
 
-          const success = await this.runSingleMigration(migration, mode);
-          if (!success) {
+          const result = await this.runSingleMigration(migration, mode);
+
+          if (result.status !== "success") {
             this.logger.log({
-              message: `Migration ${migration.id} did not complete successfully - stopping migration process to prevent out-of-order migrations`,
+              message: `Migration ${migration.id} did not complete successfully - stopping migration process to prevent out-of-order migrations. Status: ${result.status}, Reason: ${result.reason || "N/A"}`,
             });
 
-            // For deferred migrations, keep them in the pending list since not completed
+            let finalStatus: MigrationResult["status"] = "error";
+            let finalReason = `Migration ${migration.id} failed`;
+
+            if (result.status === "deferred") {
+              finalStatus = "deferred";
+              finalReason = result.reason
+                ? `Migration ${migration.id} was deferred: ${result.reason}`
+                : `Migration ${migration.id} was deferred`;
+            } else if (result.status === "error") {
+              finalStatus = "error";
+              finalReason = result.reason
+                ? `Migration ${migration.id} failed: ${result.reason}`
+                : `Migration ${migration.id} failed due to an unknown error`;
+            }
+
             return {
               success: false,
-              status: "deferred",
-              reason: `Migration ${migration.id} was deferred`,
+              status: finalStatus,
+              reason: finalReason,
               completedMigrations,
               pendingMigrations: remainingPendingMigrations,
               lastAttemptedMigration,
+              // Optionally, include the original error if it's an error status and available
+              ...(result.status === "error" && { error: result.reason }),
             };
           }
 
@@ -421,10 +414,20 @@ export class MigrationManager {
           });
 
           // For error cases, keep them in the pending list since not completed
+
+          // Check if the error already has a phase prefix; if not, add a generic one
+          // This ensures we don't lose information about which phase had the error
+          const errorMessage = error.message || String(error);
+          const errorReason = errorMessage.match(
+            /\[(beforeSchema|dataMigration|afterSchema)\]/,
+          )
+            ? errorMessage // Already has a phase prefix, preserve it
+            : `[runSchemaChanges] ${errorMessage}`; // Add generic prefix for errors without phase info
+
           return {
             success: false,
             status: "error",
-            reason: error.message || String(error),
+            reason: errorReason,
             completedMigrations,
             pendingMigrations: remainingPendingMigrations,
             lastAttemptedMigration,
@@ -450,12 +453,13 @@ export class MigrationManager {
    * Run a single migration's schema changes
    * @param migration The migration to run
    * @param mode Optional migration mode to pass to data migration
-   * @returns A boolean indicating whether the migration was successful
+   * @returns A promise that resolves to a status object
    */
+
   private async runSingleMigration<P = Record<string, any>>(
     migration: Migration<P>,
     mode: MigrationMode,
-  ): Promise<boolean> {
+  ): Promise<{ status: "success" | "deferred" | "error"; reason?: string }> {
     // Create a task-specific logger for this migration
     const taskLogger = this.createTaskLogger(migration.id);
 
@@ -492,12 +496,24 @@ export class MigrationManager {
 
     // Step 1: Run schema changes before data migration if provided
     if (migration.beforeSchema) {
-      await this.runMigrationPhase(
-        migration,
-        "beforeSchema",
-        helpers,
-        taskLogger,
-      );
+      try {
+        await this.runMigrationPhase(
+          migration,
+          "beforeSchema",
+          helpers,
+          taskLogger,
+        );
+      } catch (err: any) {
+        taskLogger.error({
+          message: `[beforeSchema] Error in beforeSchema for migration ${migration.id}:`,
+          error: err,
+        });
+
+        return {
+          status: "error",
+          reason: `[beforeSchema] ${err.message || String(err)}`,
+        };
+      }
     } else {
       taskLogger.log({
         message: `No beforeSchema phase provided for migration ${migration.id}`,
@@ -509,29 +525,18 @@ export class MigrationManager {
 
     // Step 2: Run data migration if provided
     if (migration.migration) {
-      try {
-        const isComplete = await this.runDataMigration(
-          migration,
-          taskLogger,
-          mode,
-        );
-        if (!isComplete) {
-          // If data migration is not complete, do not proceed with afterSchema
-          taskLogger.log({
-            message: `Data migration for ${migration.id} is not complete, stopping migration process`,
-          });
-          return false;
-        }
-      } catch (err) {
-        taskLogger.error({
-          message: `Error in data migration:`,
-          error: err,
-        });
-        // Do not proceed with afterSchema if data migration fails
+      const dataMigrationResult = await this.runDataMigration(
+        migration,
+        taskLogger,
+        mode,
+      );
+
+      if (dataMigrationResult.status !== "success") {
         taskLogger.log({
-          message: `Data migration for ${migration.id} failed, stopping migration process`,
+          message: `[dataMigration] Data migration for ${migration.id} did not complete successfully (status: ${dataMigrationResult.status}). Reason: ${dataMigrationResult.reason || "N/A"}`,
         });
-        return false;
+
+        return dataMigrationResult; // Propagate status and reason
       }
     } else {
       // If there's no data migration, mark it as complete and log
@@ -544,12 +549,24 @@ export class MigrationManager {
 
     // Step 3: Run schema changes after data migration if needed
     if (migration.afterSchema) {
-      await this.runMigrationPhase(
-        migration,
-        "afterSchema",
-        helpers,
-        taskLogger,
-      );
+      try {
+        await this.runMigrationPhase(
+          migration,
+          "afterSchema",
+          helpers,
+          taskLogger,
+        );
+      } catch (err: any) {
+        taskLogger.error({
+          message: `[afterSchema] Error in afterSchema for migration ${migration.id}:`,
+          error: err,
+        });
+
+        return {
+          status: "error",
+          reason: `[afterSchema] ${err.message || String(err)}`,
+        };
+      }
     } else {
       taskLogger.log({
         message: `No afterSchema phase provided for migration ${migration.id}`,
@@ -573,7 +590,7 @@ export class MigrationManager {
       message: `Migration ${migration.id} completed successfully`,
     });
 
-    return true;
+    return { status: "success" };
   }
 
   /**
@@ -583,7 +600,7 @@ export class MigrationManager {
     migration: Migration<P>,
     phase: SchemaPhase,
     helpers: SchemaHelpers,
-    logger: SchemaLogger,
+    logger: Logger,
   ): Promise<void> {
     const client = await this.pool.connect();
 
@@ -604,7 +621,7 @@ export class MigrationManager {
       // Skip if already applied
       if (rows.length > 0 && rows[0][statusField]) {
         logger.log({
-          message: `Skipping ${phase} phase - already applied`,
+          message: `[${phase}] Skipping ${phase} phase - already applied`,
         });
         await client.query("COMMIT");
         return;
@@ -629,12 +646,12 @@ export class MigrationManager {
 
       await client.query("COMMIT");
       logger.log({
-        message: `Completed ${phase} phase`,
+        message: `[${phase}] Completed ${phase} phase`,
       });
     } catch (error) {
       await client.query("ROLLBACK");
       logger.error({
-        message: `Error in ${phase} phase:`,
+        message: `[${phase}] Error in ${phase} phase:`,
         error,
       });
       throw error;
@@ -646,20 +663,21 @@ export class MigrationManager {
   /**
    * Run the data migration phase for a single migration.
    * Assumes migration.migration is defined.
-   * Returns a promise that resolves to true if the complete() callback was called,
-   * false if the migration function finished without calling complete() or if defer() was called,
-   * and rejects if the migration function throws an error.
+   * Returns a promise that resolves to a status object
    */
 
   private async runDataMigration<P = Record<string, any>>(
     migration: Migration<P>,
-    logger: SchemaLogger,
+    logger: Logger,
     mode: MigrationMode,
     payload: P = {} as P,
-  ): Promise<boolean> {
+  ): Promise<{ status: "success" | "deferred" | "error"; reason?: string }> {
     // Pre-condition: migration.migration is guaranteed to be non-null by the caller.
 
-    return new Promise<boolean>((resolve, reject) => {
+    return new Promise<{
+      status: "success" | "deferred" | "error";
+      reason?: string;
+    }>((resolve, reject) => {
       let callbackCalled = false;
 
       const completeCallback = () => {
@@ -669,19 +687,23 @@ export class MigrationManager {
         this.markStatus(migration.id, { migrationComplete: true })
           .then(() => {
             logger.log({
-              message: `Data migration marked as complete via callback.`,
+              message: `[dataMigration] Data migration marked as complete via callback.`,
             });
-            resolve(true); // "Truly done"
+
+            resolve({ status: "success" }); // "Truly done"
           })
           .catch((dbError: any) => {
             logger.error({
-              message: `Error updating migration_status after callback:`,
+              message: `[dataMigration] Error updating migration_status after callback:`,
               error: dbError,
             });
-            // Even if DB update fails, the migration logic itself called complete.
-            // Depending on desired strictness, could reject or still resolve true.
-            // For now, if complete() is called, we trust the migration logic's intent.
-            resolve(true);
+
+            resolve({
+              status: "error",
+              reason:
+                "[dataMigration] Data migration complete callback: Failed to update migration status in database after complete() was called: " +
+                (dbError.message || String(dbError)),
+            });
           });
       };
 
@@ -690,21 +712,21 @@ export class MigrationManager {
         callbackCalled = true;
 
         const logMessage = reason
-          ? `Data migration deferred: ${reason}`
-          : `Data migration deferred`;
+          ? `[dataMigration] Data migration deferred: ${reason}`
+          : `[dataMigration] Data migration deferred`;
 
         logger.log({
           message: logMessage,
         });
 
-        // Resolve to false to indicate migration is not complete
-        resolve(false);
+        // Resolve to deferred status
+        resolve({ status: "deferred", reason: reason });
       };
 
       (async () => {
         try {
           logger.log({
-            message: `Executing data migration function. Waiting for complete() or defer() callback...`,
+            message: `[dataMigration] Executing data migration function. Waiting for complete() or defer() callback...`,
           });
 
           // Pass the task-specific logger that already prefixes messages with the task ID
@@ -730,20 +752,31 @@ export class MigrationManager {
           // if neither callback was called by then, it means for this run, it's not "truly done".
           if (!callbackCalled) {
             logger.log({
-              message: `Data migration function finished without calling complete() or defer().`,
+              message: `[dataMigration] Data migration function finished without calling complete() or defer().`,
             });
 
-            resolve(false);
+            resolve({
+              status: "error",
+              reason:
+                "[dataMigration] Migration function finished without calling complete() or defer().",
+            });
           }
           // If completeCalled is true, the promise has already been resolved by completeCallback.
         } catch (error) {
           logger.error({
-            message: `Error thrown by data migration function:`,
+            message: `[dataMigration] Error thrown by data migration function:`,
             error,
           });
-          // If an error is thrown from the migration function, it's not "truly done".
-          // Reject the promise; this will be caught by runSingleMigration.
-          reject(error);
+
+          // Resolve with error status and include the dataMigration prefix in the reason
+          // This ensures the phase information is preserved when it's propagated up
+          // Handle unknown error type by using String() as fallbackfdataMigration
+          const errorMessage =
+            error instanceof Error ? error.message : String(error);
+          resolve({
+            status: "error",
+            reason: `[dataMigration] ${errorMessage}`,
+          });
         }
       })();
     });
@@ -931,15 +964,13 @@ export class MigrationManager {
   }
 
   /**
-   * Run only the data migration phase for a specific migration
+   * Run only the data migration phase for a specific migration as a job
    * @param migrationId The ID of the migration to run
-   * @param mode The migration mode to pass to the data migration
    * @param payload Optional payload to pass to the data migration
    * @returns A boolean indicating whether the migration was successful
    */
-  async runDataMigrationOnly<P = Record<string, any>>(
+  async runDataMigrationJobOnly<P = Record<string, any>>(
     migrationId: string,
-    mode: MigrationMode,
     payload?: P,
   ): Promise<boolean> {
     await this.ensureInitialized();
@@ -1012,26 +1043,31 @@ export class MigrationManager {
 
     // Run the data migration
     try {
+      // Always use 'job' mode for this method
+      const mode: MigrationMode = "job";
+
       taskLogger.log({
         message: `Running data migration for ${migration.id} with mode: ${mode}`,
       });
 
-      const isComplete = await this.runDataMigration(
+      const result = await this.runDataMigration(
         migration,
         taskLogger,
         mode,
         payload || ({} as P),
       );
 
-      if (isComplete) {
+      if (result.status === "success") {
         taskLogger.log({
           message: `Data migration for ${migration.id} completed successfully`,
         });
+
         return true;
       } else {
         taskLogger.log({
-          message: `Data migration for ${migration.id} was deferred or did not complete`,
+          message: `Data migration for ${migration.id} was deferred or did not complete (status: ${result.status}, reason: ${result.reason || "N/A"})`,
         });
+
         return false;
       }
     } catch (err) {

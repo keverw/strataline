@@ -3,13 +3,19 @@
   "workspaces": {
     "": {
       "name": "strataline",
+      "dependencies": {
+        "@types/tmp": "^0.2.6",
+      },
       "devDependencies": {
+        "@types/bun": "^1.2.13",
         "@types/node": "^20.10.0",
         "@types/pg": "^8.15.1",
         "@typescript-eslint/eslint-plugin": "^6.13.0",
         "@typescript-eslint/parser": "^6.13.0",
+        "embedded-postgres": "^17.4.0-beta.15",
         "eslint": "^8.55.0",
         "prettier": "^3.5.3",
+        "tmp": "^0.2.3",
         "tsup": "^8.4.0",
         "typescript": "^5.3.0",
       },
@@ -18,7 +24,33 @@
       },
     },
   },
+  "trustedDependencies": [
+    "@embedded-postgres/darwin-x64",
+    "@embedded-postgres/darwin-arm64",
+    "@embedded-postgres/linux-x64",
+    "@embedded-postgres/linux-arm",
+    "@embedded-postgres/linux-ia32",
+    "@embedded-postgres/linux-ppc64",
+    "@embedded-postgres/linux-arm64",
+    "@embedded-postgres/windows-x64",
+  ],
   "packages": {
+    "@embedded-postgres/darwin-arm64": ["@embedded-postgres/darwin-arm64@17.4.0-beta.15", "", { "os": "darwin", "cpu": "arm64" }, "sha512-CjEMAttJ474CJ89UykNitPuQpmC02CRPHiv99FZUqsx5bZjFaYNgNQJFdC2tC1Es9kEBrhVf7WzINUP5ESNkpw=="],
+
+    "@embedded-postgres/darwin-x64": ["@embedded-postgres/darwin-x64@17.4.0-beta.15", "", { "os": "darwin", "cpu": "x64" }, "sha512-7Z7nS3u3kvcpmM5qeJCW+mguPc3vOBM/SJoOuABfAQUSOm19u9tIJMyiOMzVT0bZ1fg3vPRa6luvCH1RKFnE9w=="],
+
+    "@embedded-postgres/linux-arm": ["@embedded-postgres/linux-arm@17.4.0-beta.15", "", { "os": "linux", "cpu": "arm" }, "sha512-6OQ4666MDfy/zm7xsgCkhATfnZGnEBIwdYJL9Fn4v/nLMfm5ImiCdFL4+CAc2VfDxzZVXSPm/tF/DhrgQU7f5g=="],
+
+    "@embedded-postgres/linux-arm64": ["@embedded-postgres/linux-arm64@17.4.0-beta.15", "", { "os": "linux", "cpu": "arm64" }, "sha512-vpgc3i6eY5Ez6ijKp1EHkIWTxOiKTWlp/20CluUVS8xQdeK2q3muqC0G5YQfB1znFtbYlyxzUC6vL/dv3cXeQw=="],
+
+    "@embedded-postgres/linux-ia32": ["@embedded-postgres/linux-ia32@17.4.0-beta.15", "", { "os": "linux", "cpu": "ia32" }, "sha512-1BxZDrlu1K2w7ioRRSj00QpxsiLybnBeGsa0VVcmBwMp+onB+6fFPNdm7b95HJfZqNUyMhr1c/xOVPJrVJDh/g=="],
+
+    "@embedded-postgres/linux-ppc64": ["@embedded-postgres/linux-ppc64@17.4.0-beta.15", "", { "os": "linux", "cpu": "ppc64" }, "sha512-cIAilkG7c8URqP+8rkGD+Py0xAsxia4GJK+vWMgOkEXdftY7pYV4WxwGqnvV+9V3X/Uo5mu7vqpWcJaKU9YeIg=="],
+
+    "@embedded-postgres/linux-x64": ["@embedded-postgres/linux-x64@17.4.0-beta.15", "", { "os": "linux", "cpu": "x64" }, "sha512-6vIhk4wpQNTkE2Xw3aF+Kss3nYNNxILA+LAIifJ3rqNZfx6HleTKVP4wUylzj4aI2qKCvcEoLSwmOQBtoW8mTg=="],
+
+    "@embedded-postgres/windows-x64": ["@embedded-postgres/windows-x64@17.4.0-beta.15", "", { "os": "win32", "cpu": "x64" }, "sha512-TBLqq6joTQQgoRB86P339Rj/1EIG0BbdKsrmqci25Y88pwDWZ0vpgdkGExJJ7/u8onCT8tfgcSW3t7yN/WiT8w=="],
+
     "@esbuild/aix-ppc64": ["@esbuild/aix-ppc64@0.25.4", "", { "os": "aix", "cpu": "ppc64" }, "sha512-1VCICWypeQKhVbE9oW/sJaAmjLxhVqacdkvPLEjwlttjfwENRSClS8EjBz0KzRyFSCPDIkuXW34Je/vk7zdB7Q=="],
 
     "@esbuild/android-arm": ["@esbuild/android-arm@0.25.4", "", { "os": "android", "cpu": "arm" }, "sha512-QNdQEps7DfFwE3hXiU4BZeOV68HHzYwGd0Nthhd3uCkkEKK7/R6MTgM0P7H7FAs5pU/DIWsviMmEGxEoxIZ+ZQ=="],
@@ -143,6 +175,8 @@
 
     "@rollup/rollup-win32-x64-msvc": ["@rollup/rollup-win32-x64-msvc@4.40.2", "", { "os": "win32", "cpu": "x64" }, "sha512-bwspbWB04XJpeElvsp+DCylKfF4trJDa2Y9Go8O6A7YLX2LIKGcNK/CYImJN6ZP4DcuOHB4Utl3iCbnR62DudA=="],
 
+    "@types/bun": ["@types/bun@1.2.13", "", { "dependencies": { "bun-types": "1.2.13" } }, "sha512-u6vXep/i9VBxoJl3GjZsl/BFIsvML8DfVDO0RYLEwtSZSp981kEO1V5NwRcO1CPJ7AmvpbnDCiMKo3JvbDEjAg=="],
+
     "@types/estree": ["@types/estree@1.0.7", "", {}, "sha512-w28IoSUCJpidD/TGviZwwMJckNESJZXFu7NBZ5YJ4mEUnNraUn9Pm8HSZm/jDF1pDWYKspWE7oVphigUPRakIQ=="],
 
     "@types/json-schema": ["@types/json-schema@7.0.15", "", {}, "sha512-5+fP8P8MFNC+AyZCDxrB2pkZFPGzqQWUzpSeuuVLvm8VMcorNYavBqoFcxK8bQz4Qsbn4oUEEem4wDLfcysGHA=="],
@@ -152,6 +186,8 @@
     "@types/pg": ["@types/pg@8.15.1", "", { "dependencies": { "@types/node": "*", "pg-protocol": "*", "pg-types": "^4.0.1" } }, "sha512-YKHrkGWBX5+ivzvOQ66I0fdqsQTsvxqM0AGP2i0XrVZ9DP5VA/deEbTf7VuLPGpY7fJB9uGbkZ6KjVhuHcrTkQ=="],
 
     "@types/semver": ["@types/semver@7.7.0", "", {}, "sha512-k107IF4+Xr7UHjwDc7Cfd6PRQfbdkiRabXGRjo07b4WyPahFBZCZ1sE+BNxYIJPPg73UkfOsVOLwqVc/6ETrIA=="],
+
+    "@types/tmp": ["@types/tmp@0.2.6", "", {}, "sha512-chhaNf2oKHlRkDGt+tiKE2Z5aJ6qalm7Z9rlLdBwmOiAAf09YQvvoLXjWK4HWPF1xU/fqvMgfNfpVoBscA/tKA=="],
 
     "@typescript-eslint/eslint-plugin": ["@typescript-eslint/eslint-plugin@6.21.0", "", { "dependencies": { "@eslint-community/regexpp": "^4.5.1", "@typescript-eslint/scope-manager": "6.21.0", "@typescript-eslint/type-utils": "6.21.0", "@typescript-eslint/utils": "6.21.0", "@typescript-eslint/visitor-keys": "6.21.0", "debug": "^4.3.4", "graphemer": "^1.4.0", "ignore": "^5.2.4", "natural-compare": "^1.4.0", "semver": "^7.5.4", "ts-api-utils": "^1.0.1" }, "peerDependencies": { "@typescript-eslint/parser": "^6.0.0 || ^6.0.0-alpha", "eslint": "^7.0.0 || ^8.0.0" } }, "sha512-oy9+hTPCUFpngkEZUSzbf9MxI65wbKFoQYsgPdILTfbUldp5ovUuphZVe4i30emU9M/kP+T64Di0mxl7dSw3MA=="],
 
@@ -187,11 +223,15 @@
 
     "array-union": ["array-union@2.1.0", "", {}, "sha512-HGyxoOTYUyCM6stUe6EJgnd4EoewAI7zMdfqO+kGjnlZmBDz/cR5pf8r/cR4Wq60sL/p0IkcjUEEPwS3GFrIyw=="],
 
+    "async-exit-hook": ["async-exit-hook@2.0.1", "", {}, "sha512-NW2cX8m1Q7KPA7a5M2ULQeZ2wR5qI5PAbw5L0UOMxdioVk9PMZ0h1TmyZEkPYrCvYjDlFICusOu1dlEKAAeXBw=="],
+
     "balanced-match": ["balanced-match@1.0.2", "", {}, "sha512-3oSeUO0TMV67hN1AmbXsK4yaqU7tjiHlbxRDZOpH0KW9+CeX4bRAaX0Anxt0tx2MrpRpWwQaPwIlISEJhYU5Pw=="],
 
     "brace-expansion": ["brace-expansion@1.1.11", "", { "dependencies": { "balanced-match": "^1.0.0", "concat-map": "0.0.1" } }, "sha512-iCuPHDFgrHX7H2vEI/5xpz07zSHB00TpugqhmYtVmMO6518mCuRMoOYFldEBl0g187ufozdaHgWKcYFb61qGiA=="],
 
     "braces": ["braces@3.0.3", "", { "dependencies": { "fill-range": "^7.1.1" } }, "sha512-yQbXgO/OSZVD2IsiLlro+7Hf6Q18EJrKSEsdoMzKePKXct3gvD8oLcOQdIzGupr5Fj+EDe8gO/lxc1BzfMpxvA=="],
+
+    "bun-types": ["bun-types@1.2.13", "", { "dependencies": { "@types/node": "*" } }, "sha512-rRjA1T6n7wto4gxhAO/ErZEtOXyEZEmnIHQfl0Dt1QQSB4QV0iP6BZ9/YB5fZaHFQ2dwHFrmPaRQ9GGMX01k9Q=="],
 
     "bundle-require": ["bundle-require@5.1.0", "", { "dependencies": { "load-tsconfig": "^0.2.3" }, "peerDependencies": { "esbuild": ">=0.18" } }, "sha512-3WrrOuZiyaaZPWiEt4G3+IffISVC9HYlWueJEBWED4ZH4aIAC2PnkdnuRrR94M+w6yGWn4AglWtJtBI8YqvgoA=="],
 
@@ -224,6 +264,8 @@
     "doctrine": ["doctrine@3.0.0", "", { "dependencies": { "esutils": "^2.0.2" } }, "sha512-yS+Q5i3hBf7GBkd4KG8a7eBNNWNGLTaEwwYWUijIYM7zrlYDM0BFXHjjPWlWZ1Rg7UaddZeIDmi9jF3HmqiQ2w=="],
 
     "eastasianwidth": ["eastasianwidth@0.2.0", "", {}, "sha512-I88TYZWc9XiYHRQ4/3c5rjjfgkjhLyW2luGIheGERbNQ6OY7yTybanSpDXZa8y7VUP9YmDcYa+eyq4ca7iLqWA=="],
+
+    "embedded-postgres": ["embedded-postgres@17.4.0-beta.15", "", { "dependencies": { "async-exit-hook": "^2.0.1", "pg": "^8.7.3" }, "optionalDependencies": { "@embedded-postgres/darwin-arm64": "^17.4.0-beta.15", "@embedded-postgres/darwin-x64": "^17.4.0-beta.15", "@embedded-postgres/linux-arm": "^17.4.0-beta.15", "@embedded-postgres/linux-arm64": "^17.4.0-beta.15", "@embedded-postgres/linux-ia32": "^17.4.0-beta.15", "@embedded-postgres/linux-ppc64": "^17.4.0-beta.15", "@embedded-postgres/linux-x64": "^17.4.0-beta.15", "@embedded-postgres/windows-x64": "^17.4.0-beta.15" } }, "sha512-2Mot0cZ0lV09m1PXPTVkv3KRvYU/Nh6oMSLrTx6ryEqU1/wM0T7J4tPLUcnM77x8xGGsyifsnZNtOFyQnWGzGA=="],
 
     "emoji-regex": ["emoji-regex@9.2.2", "", {}, "sha512-L18DaJsXSUk2+42pv8mLs5jJT2hqFkFE4j21wOmgbUqsZ2hL72NsUU785g9RXgo3s0ZNgVl42TiHp3ZtOv/Vyg=="],
 
@@ -472,6 +514,8 @@
     "tinyexec": ["tinyexec@0.3.2", "", {}, "sha512-KQQR9yN7R5+OSwaK0XQoj22pwHoTlgYqmUscPYoknOoWCWfj/5/ABTMRi69FrKU5ffPVh5QcFikpWJI/P1ocHA=="],
 
     "tinyglobby": ["tinyglobby@0.2.13", "", { "dependencies": { "fdir": "^6.4.4", "picomatch": "^4.0.2" } }, "sha512-mEwzpUgrLySlveBwEVDMKk5B57bhLPYovRfPAXD5gA/98Opn0rCDj3GtLwFvCvH5RK9uPCExUROW5NjDwvqkxw=="],
+
+    "tmp": ["tmp@0.2.3", "", {}, "sha512-nZD7m9iCPC5g0pYmcaxogYKggSfLsdxl8of3Q/oIbqCqLLIO9IAF0GWjX1z9NZRHPiXv8Wex4yDCaZsgEw0Y8w=="],
 
     "to-regex-range": ["to-regex-range@5.0.1", "", { "dependencies": { "is-number": "^7.0.0" } }, "sha512-65P7iz6X5yEr1cwcgvQxbbIw7Uk3gOy5dIdtZ4rDveLqhrdJP+Li/Hx6tyK0NEb+2GCyneCMJiGqrADCSNk8sQ=="],
 

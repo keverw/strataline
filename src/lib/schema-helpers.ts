@@ -1,73 +1,5 @@
 import { type PoolClient } from "pg";
-
-/**
- * Log level type
- */
-export type LogLevel = "info" | "warn" | "error";
-
-/**
- * Log data input structure (without level, which is determined by the method called)
- */
-export interface LogDataInput {
-  task?: string;
-  stage?: string;
-  message: string;
-  error?: any;
-}
-
-/**
- * Complete log data structure (with level)
- */
-export interface LogData extends LogDataInput {
-  level: LogLevel;
-}
-
-/**
- * Logger interface for schema operations
- */
-export interface SchemaLogger {
-  log: (data: LogDataInput) => void;
-  error: (data: LogDataInput) => void;
-  warn?: (data: LogDataInput) => void;
-}
-
-/**
- * Default console logger implementation
- */
-export const consoleLogger: SchemaLogger = {
-  log: (data: LogDataInput) => {
-    const logData: LogData = { ...data, level: "info" };
-    const prefix = buildLogPrefix(logData);
-    console.log(`${prefix}${logData.message}`);
-  },
-  error: (data: LogDataInput) => {
-    const logData: LogData = { ...data, level: "error" };
-    const prefix = buildLogPrefix(logData);
-    console.error(`${prefix}${logData.message}`, logData.error);
-  },
-  warn: (data: LogDataInput) => {
-    const logData: LogData = { ...data, level: "warn" };
-    const prefix = buildLogPrefix(logData);
-    console.warn(`${prefix}${logData.message}`);
-  },
-};
-
-/**
- * Build a log prefix from structured log data
- */
-function buildLogPrefix(data: LogData): string {
-  const parts: string[] = [];
-
-  if (data.task) {
-    parts.push(`[${data.task}]`);
-  }
-
-  if (data.stage) {
-    parts.push(`[${data.stage}]`);
-  }
-
-  return parts.length > 0 ? `${parts.join(" ")} ` : "";
-}
+import { type Logger, consoleLogger, createPrefixedLogger } from "./logger";
 
 /**
  * Schema helpers interface
@@ -122,44 +54,10 @@ export interface SchemaHelpers {
 }
 
 /**
- * Create a task-specific logger that prefills task and stage information
- */
-export function createPrefixedLogger(
-  baseLogger: SchemaLogger,
-  prefix: { task?: string; stage?: string },
-): SchemaLogger {
-  return {
-    log: (data: LogDataInput) => {
-      baseLogger.log({
-        ...data,
-        task: data.task || prefix.task,
-        stage: data.stage || prefix.stage,
-      });
-    },
-    error: (data: LogDataInput) => {
-      baseLogger.error({
-        ...data,
-        task: data.task || prefix.task,
-        stage: data.stage || prefix.stage,
-      });
-    },
-    warn: baseLogger.warn
-      ? (data: LogDataInput) => {
-          baseLogger.warn!({
-            ...data,
-            task: data.task || prefix.task,
-            stage: data.stage || prefix.stage,
-          });
-        }
-      : undefined,
-  };
-}
-
-/**
  * Create schema helpers with the specified logger
  */
 export function createSchemaHelpers(
-  logger: SchemaLogger = consoleLogger,
+  logger: Logger = consoleLogger,
   prefix: { task?: string; stage?: string } = {},
 ): SchemaHelpers {
   // Create a prefixed logger for the schema helpers
@@ -249,10 +147,20 @@ export function createSchemaHelpers(
     columnName: string,
   ): Promise<void> {
     try {
+      // First, check if the table exists
+      const { rows: tableExistsRows } = await client.query(
+        `SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = $1)`,
+        [tableName],
+      );
+
+      if (!tableExistsRows[0]?.exists) {
+        throw new Error(`Table ${tableName} does not exist.`);
+      }
+
       // Check if column exists
       const { rows } = await client.query(
         `
-        SELECT column_name 
+        SELECT column_name
         FROM information_schema.columns 
         WHERE table_name = $1 AND column_name = $2
       `,
@@ -423,6 +331,16 @@ export function createSchemaHelpers(
     constraintName: string,
   ): Promise<void> {
     try {
+      // First, check if the table exists
+      const { rows: tableExistsRows } = await client.query(
+        `SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = $1)`,
+        [tableName],
+      );
+
+      if (!tableExistsRows[0]?.exists) {
+        throw new Error(`Table ${tableName} does not exist.`);
+      }
+
       // Check if constraint exists
       const { rows } = await client.query(
         `
