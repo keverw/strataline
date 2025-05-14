@@ -854,6 +854,148 @@ describe("MigrationManager", () => {
   );
 
   test(
+    "should run multiple schema migrations in sequence",
+    async () => {
+      // Create multiple migrations that build on each other
+      const firstMigration: Migration = {
+        id: "multi_migration_001",
+        description: "First migration in sequence",
+        beforeSchema: async (client) => {
+          await client.query(`
+            CREATE TABLE multi_test_table (
+              id SERIAL PRIMARY KEY,
+              name TEXT NOT NULL
+            );
+          `);
+        },
+        migration: async (pool, ctx) => {
+          await pool.query(`
+            INSERT INTO multi_test_table (name) VALUES ('Initial record');
+          `);
+          ctx.complete();
+        },
+      };
+
+      const secondMigration: Migration = {
+        id: "multi_migration_002",
+        description: "Second migration in sequence",
+        beforeSchema: async (client) => {
+          await client.query(`
+            ALTER TABLE multi_test_table ADD COLUMN description TEXT;
+          `);
+        },
+        migration: async (pool, ctx) => {
+          await pool.query(`
+            UPDATE multi_test_table SET description = 'Added by second migration';
+          `);
+          ctx.complete();
+        },
+      };
+
+      const thirdMigration: Migration = {
+        id: "multi_migration_003",
+        description: "Third migration in sequence",
+        beforeSchema: async (client) => {
+          await client.query(`
+            CREATE INDEX idx_multi_test_name ON multi_test_table (name);
+          `);
+        },
+        migration: async (pool, ctx) => {
+          await pool.query(`
+            INSERT INTO multi_test_table (name, description) 
+            VALUES ('Second record', 'Added by third migration');
+          `);
+          ctx.complete();
+        },
+        afterSchema: async (client) => {
+          await client.query(`
+            ALTER TABLE multi_test_table ADD COLUMN created_at TIMESTAMPTZ DEFAULT NOW();
+          `);
+        },
+      };
+
+      // Register all migrations
+      migrationManager.register([
+        firstMigration,
+        secondMigration,
+        thirdMigration,
+      ]);
+
+      // Run all migrations
+      const result = await migrationManager.runSchemaChanges("job");
+
+      // Verify the migrations were successful
+      expect(result.success).toBe(true);
+      expect(result.status).toBe("completed");
+      expect(result.completedMigrations).toContain("multi_migration_001");
+      expect(result.completedMigrations).toContain("multi_migration_002");
+      expect(result.completedMigrations).toContain("multi_migration_003");
+      expect(result.completedMigrations.length).toBe(3);
+      expect(result.pendingMigrations.length).toBe(0);
+
+      // Verify the database state after all migrations
+      const client = await pool.connect();
+      try {
+        // Check that the table exists with all columns
+        const { rows: columns } = await client.query(`
+          SELECT column_name 
+          FROM information_schema.columns 
+          WHERE table_name = 'multi_test_table'
+          ORDER BY column_name;
+        `);
+
+        const columnNames = columns.map((col) => col.column_name);
+        expect(columnNames).toContain("created_at");
+        expect(columnNames).toContain("description");
+        expect(columnNames).toContain("id");
+        expect(columnNames).toContain("name");
+        expect(columnNames.length).toBe(4);
+
+        // Check that the index exists
+        const { rows: indexExists } = await client.query(`
+          SELECT EXISTS (
+            SELECT FROM pg_indexes
+            WHERE indexname = 'idx_multi_test_name'
+          );
+        `);
+        expect(indexExists[0].exists).toBe(true);
+
+        // Check that the data was inserted and updated correctly
+        const { rows: tableData } = await client.query(`
+          SELECT * FROM multi_test_table ORDER BY id;
+        `);
+
+        expect(tableData.length).toBe(2);
+        expect(tableData[0].name).toBe("Initial record");
+        expect(tableData[0].description).toBe("Added by second migration");
+        expect(tableData[1].name).toBe("Second record");
+        expect(tableData[1].description).toBe("Added by third migration");
+
+        // Verify all migrations are marked as complete in the status table
+        const { rows: migrationStatus } = await client.query(`
+          SELECT id, before_schema_applied, migration_complete, after_schema_applied, completed_at
+          FROM migration_status
+          WHERE id IN ('multi_migration_001', 'multi_migration_002', 'multi_migration_003')
+          ORDER BY id;
+        `);
+
+        expect(migrationStatus.length).toBe(3);
+
+        // All migrations should be fully completed
+        for (const status of migrationStatus) {
+          expect(status.before_schema_applied).toBe(true);
+          expect(status.migration_complete).toBe(true);
+          expect(status.after_schema_applied).toBe(true);
+          expect(Number(status.completed_at)).toBeGreaterThan(0);
+        }
+      } finally {
+        client.release();
+      }
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
     "should run data migration job with a payload",
     async () => {
       type PayloadType = { item_id: number; new_value: string };
