@@ -26,14 +26,14 @@ export interface LogData extends LogDataInput {
 export interface Logger {
   log: (data: LogDataInput) => void;
   error: (data: LogDataInput) => void;
-  warn?: (data: LogDataInput) => void;
+  warn: (data: LogDataInput) => void;
 }
 
 /**
  * Build a log prefix from structured log data
  */
 
-function buildLogPrefix(data: LogData): string {
+export function buildLogPrefix(data: LogData): string {
   const parts: string[] = [];
 
   if (data.task) {
@@ -65,7 +65,7 @@ export abstract class BaseLogger implements Logger {
   /**
    * Log a warning message (optional)
    */
-  warn?(data: LogDataInput): void;
+  abstract warn(data: LogDataInput): void;
 
   /**
    * Create a prefixed logger that includes task and stage information
@@ -110,6 +110,79 @@ export class ConsoleLogger extends BaseLogger {
 }
 
 /**
+ * Mutable logger that can be toggled on/off for unit tests
+ */
+export class MutableLogger extends BaseLogger {
+  private baseLogger: Logger;
+  private verbose: boolean;
+
+  /**
+   * Create a new mutable logger
+   * @param baseLogger The underlying logger to use when verbose is true
+   * @param verbose Whether to output logs (defaults to true)
+   */
+  constructor(baseLogger: Logger, verbose: boolean = true) {
+    super();
+    this.baseLogger = baseLogger;
+    this.verbose = verbose;
+  }
+
+  /**
+   * Set the verbose flag to enable/disable logging
+   */
+  setVerbose(verbose: boolean): void {
+    this.verbose = verbose;
+  }
+
+  /**
+   * Get the current verbose setting
+   */
+  isVerbose(): boolean {
+    return this.verbose;
+  }
+
+  /**
+   * Log an informational message if verbose is enabled
+   */
+  log(data: LogDataInput): void {
+    if (this.verbose) {
+      const logData: LogData = { ...data, level: "info" };
+      const prefix = buildLogPrefix(logData);
+      // Assuming baseLogger handles the actual console logging or equivalent
+      this.baseLogger.log({ ...data, message: `${prefix}${logData.message}` });
+    }
+  }
+
+  /**
+   * Log an error message if verbose is enabled
+   */
+  error(data: LogDataInput): void {
+    if (this.verbose) {
+      const logData: LogData = { ...data, level: "error" };
+      const prefix = buildLogPrefix(logData);
+      // Assuming baseLogger handles the actual console logging or equivalent
+      this.baseLogger.error({
+        ...data,
+        message: `${prefix}${logData.message}`,
+        error: logData.error,
+      });
+    }
+  }
+
+  /**
+   * Log a warning message if verbose is enabled
+   */
+  warn(data: LogDataInput): void {
+    if (this.verbose) {
+      const logData: LogData = { ...data, level: "warn" };
+      const prefix = buildLogPrefix(logData);
+      // Assuming baseLogger handles the actual console logging or equivalent
+      this.baseLogger.warn({ ...data, message: `${prefix}${logData.message}` });
+    }
+  }
+}
+
+/**
  * Prefixed logger that adds task and stage information to log messages
  * @internal This class is intended for internal use only
  */
@@ -149,16 +222,14 @@ export class PrefixedLogger extends BaseLogger {
   }
 
   /**
-   * Log a warning message with prefix if supported by the base logger
+   * Log a warning message with prefix
    */
-  warn?(data: LogDataInput): void {
-    if (this.baseLogger.warn) {
-      this.baseLogger.warn({
-        ...data,
-        task: data.task || this.prefix.task,
-        stage: data.stage || this.prefix.stage,
-      });
-    }
+  warn(data: LogDataInput): void {
+    this.baseLogger.warn({
+      ...data,
+      task: data.task || this.prefix.task,
+      stage: data.stage || this.prefix.stage,
+    });
   }
 }
 

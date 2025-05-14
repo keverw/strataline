@@ -11,16 +11,23 @@ import EmbeddedPostgres from "embedded-postgres";
 import { Pool, type PoolClient } from "pg"; // Import PoolClient
 import { MigrationManager, type Migration } from "./migration-system";
 import * as tmp from "tmp";
-import { consoleLogger } from "./logger";
+import { consoleLogger, MutableLogger } from "./logger";
 import { createSchemaHelpers } from "./schema-helpers";
 
 // Set a longer timeout for tests that involve database operations
 const TEST_TIMEOUT = 30000;
 const TEST_DB_PORT = 5555;
 
+// Control whether to show logs during tests
+const MIGRATION_MANAGER_VERBOSE_LOGGING = false;
+// Control whether to show postgres logs
+const PG_VERBOSE_LOGGING = false;
+// Create a mutable logger that can be toggled
+
 describe("MigrationManager", () => {
   let postgres: EmbeddedPostgres;
   let pool: Pool;
+  let testLogger: MutableLogger;
   let migrationManager: MigrationManager;
   let isSetupComplete = false;
 
@@ -33,7 +40,9 @@ describe("MigrationManager", () => {
         prefix: "pg-test-",
       });
 
-      console.log(`Created temporary directory: ${tempDir.name}`);
+      if (PG_VERBOSE_LOGGING) {
+        console.log(`Created temporary directory: ${tempDir.name}`);
+      }
 
       // Create and start an embedded PostgreSQL server
       postgres = new EmbeddedPostgres({
@@ -43,8 +52,10 @@ describe("MigrationManager", () => {
         persistent: false, // Don't persist data between test runs
         databaseDir: tempDir.name, // Use the temporary directory for the database
         onLog: (message) => {
-          // todo: later do a pg verbose flag
-          // console.log(message);
+          // Only log postgres messages if PG_VERBOSE_LOGGING is enabled
+          if (PG_VERBOSE_LOGGING) {
+            console.log(message);
+          }
         },
       });
 
@@ -70,7 +81,10 @@ describe("MigrationManager", () => {
       client.release();
 
       isSetupComplete = true;
-      console.log("Embedded PostgreSQL started for testing");
+
+      if (PG_VERBOSE_LOGGING) {
+        console.log("Embedded PostgreSQL started for testing");
+      }
     } catch (error) {
       console.error("Failed to set up test database:", error);
       // Clean up if setup failed
@@ -102,7 +116,10 @@ describe("MigrationManager", () => {
 
         try {
           await postgres.stop();
-          console.log("Embedded PostgreSQL stopped");
+
+          if (PG_VERBOSE_LOGGING) {
+            console.log("Embedded PostgreSQL stopped");
+          }
         } catch (err) {
           console.error("Error stopping PostgreSQL:", err);
         }
@@ -126,8 +143,14 @@ describe("MigrationManager", () => {
       console.error("Error cleaning up tables:", err);
     }
 
+    // Create a fresh logger for each test
+    testLogger = new MutableLogger(
+      consoleLogger,
+      MIGRATION_MANAGER_VERBOSE_LOGGING,
+    );
+
     // Create a fresh migration manager for each test
-    migrationManager = new MigrationManager(pool);
+    migrationManager = new MigrationManager(pool, testLogger);
   });
 
   afterEach(async () => {
@@ -308,29 +331,54 @@ describe("MigrationManager", () => {
         `);
         },
         migration: async (pool, ctx) => {
-          // Process the data
-          await pool.query(`
-          UPDATE data_migration_table 
-          SET processed = TRUE, value = value || '_processed'
-        `);
+          if (ctx.mode === "distributed") {
+            // pretend we schedule a job elsewhere
+            // Then run just the data migration job
+            const result =
+              await migrationManager.runDataMigrationJobOnly(
+                "data_migration_001",
+              );
 
-          // Mark as complete
-          ctx.complete();
+            // Verify the data migration was successful
+            expect(result.status).toBe("success");
+
+            // Mark as complete (real implementation would do this more robustly)
+            ctx.complete(result); // Pass data if any
+          } else {
+            // Process the data
+            // In a real scenario, this would be more complex and use a payload to work on only a
+            // subset of data
+
+            await pool.query(`
+              UPDATE data_migration_table 
+              SET processed = TRUE, value = value || '_processed'
+            `);
+
+            // Mark as complete
+            ctx.complete("Ran data migration job on all data");
+          }
         },
       };
 
       // Register and run the migration
       migrationManager.register([dataMigrationTest]);
 
-      // Run just the schema part first
-      await migrationManager.runSchemaChanges("job");
+      // Run the schema part changes in distributed mode
+      const migrationManagerResult =
+        await migrationManager.runSchemaChanges("distributed");
 
-      // Then run just the data migration job
-      const result =
-        await migrationManager.runDataMigrationJobOnly("data_migration_001");
-
-      // Verify the data migration was successful
-      expect(result).toBe(true);
+      expect(migrationManagerResult).toMatchObject({
+        success: true,
+        status: "completed",
+        completedMigrations: ["data_migration_001"],
+        pendingMigrations: [],
+        migrationData: {
+          data_migration_001: {
+            status: "success",
+            data: "Ran data migration job on all data",
+          },
+        },
+      });
 
       // Check that the data was processed
       const client = await pool.connect();
@@ -348,6 +396,57 @@ describe("MigrationManager", () => {
       } finally {
         client.release();
       }
+
+      // if we try to run the data migration job only again, it should fail
+      const result =
+        await migrationManager.runDataMigrationJobOnly("data_migration_001");
+
+      // Should be 'already_complete' as the migration (including its data part) was completed by runSchemaChanges
+      expect(result.status).toBe("already_complete");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "should handle deferred migrations with data",
+    async () => {
+      const deferredWithDataMigration: Migration<
+        Record<string, never>,
+        { checkpoint: number }
+      > = {
+        id: "deferred_with_data_001",
+        description: "Migration that defers with data",
+        beforeSchema: async (client) => {
+          await client.query(
+            `CREATE TABLE IF NOT EXISTS deferred_data_table (id INT);`,
+          );
+        },
+        migration: async (pool, ctx) => {
+          ctx.defer("Checkpointing", { checkpoint: 123 });
+        },
+      };
+
+      migrationManager.register([deferredWithDataMigration]);
+
+      // First, run via runSchemaChanges to simulate a scenario where it's part of a larger run
+      const schemaChangesResult =
+        await migrationManager.runSchemaChanges("job");
+      expect(schemaChangesResult.success).toBe(false);
+      expect(schemaChangesResult.status).toBe("deferred");
+      expect(schemaChangesResult.reason).toContain(
+        "Migration deferred_with_data_001 was deferred: Checkpointing",
+      );
+      // Data from defer is not directly in schemaChangesResult.migrationData,
+      // as that's for successfully completed migrations.
+      // The primary way to get this data is via runDataMigrationJobOnly.
+
+      // Now, run it as a job to get the deferred data
+      const jobResult = await migrationManager.runDataMigrationJobOnly(
+        "deferred_with_data_001",
+      );
+      expect(jobResult.status).toBe("deferred");
+      expect(jobResult.reason).toBe("Checkpointing");
+      expect(jobResult.data).toEqual({ checkpoint: 123 });
     },
     TEST_TIMEOUT,
   );
@@ -393,8 +492,6 @@ describe("MigrationManager", () => {
 
       migrationManager.register([errorInMigrationFunc]);
       const result = await migrationManager.runSchemaChanges("job");
-
-      console.log("result.reason", result.reason);
 
       expect(result.success).toBe(false);
       expect(result.status).toBe("error");
@@ -594,7 +691,7 @@ describe("MigrationManager", () => {
     "should renew lock during long-running migrations",
     async () => {
       // Create a migration manager with a very short lock renewal time (1 second)
-      const shortRenewalManager = new MigrationManager(pool, consoleLogger, {
+      const shortRenewalManager = new MigrationManager(pool, testLogger, {
         lockRenewalSeconds: 1, // Set to 1 second to ensure renewals happen quickly
       });
 
@@ -756,6 +853,121 @@ describe("MigrationManager", () => {
     TEST_TIMEOUT,
   );
 
+  test(
+    "should run data migration job with a payload",
+    async () => {
+      type PayloadType = { item_id: number; new_value: string };
+      type ReturnType = { processed_item_id: number; status: string };
+
+      const payloadMigration: Migration<PayloadType, ReturnType> = {
+        id: "payload_migration_001",
+        description: "Migration that uses a payload for a data job",
+        beforeSchema: async (client) => {
+          await client.query(`
+            CREATE TABLE payload_test_table (
+              id INT PRIMARY KEY,
+              value TEXT
+            );
+            INSERT INTO payload_test_table (id, value) VALUES (1, 'initial_value_1'), (2, 'initial_value_2');
+          `);
+        },
+        migration: async (pool, ctx) => {
+          // This migration should only be run as a job with a payload
+          if (ctx.mode !== "job" || !ctx.payload) {
+            ctx.defer("Requires job mode and payload");
+            return;
+          }
+
+          const { item_id, new_value } = ctx.payload;
+
+          const result = await pool.query(
+            `UPDATE payload_test_table SET value = $1 WHERE id = $2 RETURNING id`,
+            [new_value, item_id],
+          );
+
+          if (result.rowCount === 1) {
+            ctx.complete({
+              processed_item_id: result.rows[0].id,
+              status: "updated",
+            });
+          } else {
+            ctx.complete({
+              processed_item_id: item_id,
+              status: "not_found",
+            });
+          }
+        },
+      };
+
+      migrationManager.register([payloadMigration]);
+
+      // Run beforeSchema part first (e.g., via runSchemaChanges or manually setting status)
+      // For simplicity in this test, we'll run schema changes in a mode that defers the data part
+      // if it's not designed for it, or just ensure beforeSchema runs.
+      // A quick way to ensure beforeSchema runs is to attempt a runSchemaChanges
+      // that we expect to defer or error if the migration isn't set up for 'distributed'
+      // or if it tries to run the data part without payload.
+      // Let's make it simple: run schema changes which will apply beforeSchema.
+      // The migration itself will defer if not in 'job' mode with payload.
+      const initialRun = await migrationManager.runSchemaChanges("distributed");
+      // We expect this to defer because the migration logic defers if mode is not 'job' or no payload
+      expect(initialRun.status).toBe("deferred");
+      expect(initialRun.reason).toContain("Requires job mode and payload");
+
+      // Now run the data migration job with a specific payload
+      const jobPayload: PayloadType = {
+        item_id: 1,
+        new_value: "updated_via_payload",
+      };
+      const jobResult = await migrationManager.runDataMigrationJobOnly<
+        PayloadType,
+        ReturnType
+      >("payload_migration_001", jobPayload);
+
+      expect(jobResult.status).toBe("success");
+      expect(jobResult.data).toEqual({
+        processed_item_id: 1,
+        status: "updated",
+      });
+
+      // Verify the data in the table
+      const client = await pool.connect();
+      try {
+        const { rows } = await client.query(
+          `SELECT value FROM payload_test_table WHERE id = 1`,
+        );
+        expect(rows.length).toBe(1);
+        expect(rows[0].value).toBe("updated_via_payload");
+
+        // Verify other data wasn't touched
+        const { rows: otherRows } = await client.query(
+          `SELECT value FROM payload_test_table WHERE id = 2`,
+        );
+        expect(otherRows.length).toBe(1);
+        expect(otherRows[0].value).toBe("initial_value_2");
+      } finally {
+        client.release();
+      }
+
+      // Test with a payload for an item that doesn't exist
+      const nonExistentPayload: PayloadType = {
+        item_id: 99,
+        new_value: "wont_be_written",
+      };
+      const nonExistentJobResult =
+        await migrationManager.runDataMigrationJobOnly<PayloadType, ReturnType>(
+          "payload_migration_001",
+          nonExistentPayload,
+        );
+      expect(nonExistentJobResult.status).toBe("success"); // complete is called
+      expect(nonExistentJobResult.data).toEqual({
+        processed_item_id: 99,
+        status: "not_found",
+      });
+    },
+    TEST_TIMEOUT,
+  );
+
   // Add a new describe block for schema helpers
   describe("SchemaHelpers", () => {
     let helpers: ReturnType<typeof createSchemaHelpers>;
@@ -764,7 +976,7 @@ describe("MigrationManager", () => {
     beforeEach(async () => {
       // Get a client from the pool for schema operations
       client = await pool.connect();
-      helpers = createSchemaHelpers(consoleLogger, { task: "schema-test" });
+      helpers = createSchemaHelpers(testLogger, { task: "schema-test" });
 
       // Ensure a base table exists for testing modifications
       await client.query(`

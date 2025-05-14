@@ -112,11 +112,13 @@ migrationManager.register([
         // Mark migration as complete
         ctx.complete();
       } else if (ctx.mode === "distributed") {
-        // In distributed mode, we would expect a specific payload
-        // and would typically only process a subset of data
+        // In distributed mode, we would route/schedule this as a job across multiple workers
+        // and monitor when it has successfully been completed
+        // If you don't plan to support this, you could provide an error message like below
         ctx.logger.error({
           message: "This migration is not designed to run in distributed mode",
         });
+
         ctx.defer("Migration not configured for distributed execution");
       }
     },
@@ -140,6 +142,9 @@ async function runMigrations() {
 
   if (result.success) {
     console.log("Migrations completed successfully!");
+    if (result.migrationData && Object.keys(result.migrationData).length > 0) {
+      console.log("Data returned from migrations:", result.migrationData);
+    }
   } else {
     console.error("Migration failed:", result.reason);
   }
@@ -154,10 +159,19 @@ In distributed mode, your infrastructure acts as a router, scheduler, and monito
 
 **How it works:**
 
-1. Call `runSchemaChanges('distributed')` to apply schema changes and get a list of pending migrations.
-2. For each migration, call the migration function. In distributed mode, the batching and job scheduling logic can happen inside the migration function itself.
-   - If no payload is provided, the migration function discovers the data to process, splits it into batches, schedules jobs for each batch (using your job system), and then calls `ctx.defer('Batches scheduled')`.
-   - If a payload is provided, the migration function processes just that batch and then calls `ctx.complete()`.
+- **When `distributed` mode is active** (you called `runSchemaChanges('distributed')`):
+
+  1. The migration function _only_ orchestrates.
+     - Discover the total work to do (row ranges, IDs, etc.).
+     - Split that work into payload-sized batches.
+     - Schedule each batch as its own `job` by invoking your queue / worker system (which will in turn call `runDataMigrationJobOnly`).
+  2. Call `ctx.defer('batches scheduled')` so Strataline pauses, letting your jobs run in parallel.
+  3. Once all jobs report success, rerun the `runSchemaChanges` migration function (still in distributed mode) and call `ctx.complete()` to let `afterSchema` and subsequent migrations proceed, officially marking the migration as being complete. The second run will find beforeSchema done, skip it, and jump straight to the data migration function.
+
+- **When `job` mode is active** (local run **or** a worker processing a batch):
+
+  - **No payload provided** → you’re on a single machine (dev/CI), so process the _entire_ dataset, then `ctx.complete()`.
+  - **Payload provided** → you’re a worker handling a single batch that the distributed orchestrator created; process just that slice and call `ctx.complete(data)` (or `ctx.defer(reason, data)` to retry later).
 
 Example:
 
@@ -168,20 +182,24 @@ migration: async (pool, ctx) => {
     const { rows } = await pool.query(
       "SELECT MIN(id) AS min_id, MAX(id) AS max_id FROM legacy_users",
     );
+
     const minId = rows[0].min_id;
     const maxId = rows[0].max_id;
     const batchSize = 1000;
     const batches = [];
+
     for (let start = minId; start <= maxId; start += batchSize) {
       batches.push({
         startId: start,
         endId: Math.min(start + batchSize - 1, maxId),
       });
     }
+
     // Schedule jobs for each batch if not already (pseudo-code, replace with your job system)
     for (const batch of batches) {
       await scheduleJob("001-add-users-table", batch); // e.g., enqueue or trigger a 'job'
     }
+
     ctx.logger.log({ message: `Scheduled ${batches.length} batch jobs` });
 
     // Monitor jobs and ensure successful completion (pseudo-code, replace with your own job monitoring logic)
@@ -189,6 +207,7 @@ migration: async (pool, ctx) => {
       "001-add-users-table",
       batches,
     );
+
     if (!allJobsDone) {
       ctx.defer("Waiting for all jobs to finish");
     } else {
@@ -197,33 +216,179 @@ migration: async (pool, ctx) => {
   } else if (ctx.mode === "job") {
     // Do the actual work for this batch (or all data if no payload)
     const { startId = 0, endId = Number.MAX_SAFE_INTEGER } = ctx.payload || {};
+
     ctx.logger.log({
       message: `Processing users from ID ${startId} to ${endId}`,
     });
+
     // ... process all or the specified range ...
-    ctx.complete();
+    // Example: return number of processed items
+    const processedCount = 150; // Replace with actual count
+    ctx.complete({ processed: processedCount });
   }
 };
 ```
 
 > **Important:**
 >
-> - In this pattern, `distributed` mode is for orchestration only: it discovers data, splits into batches, schedules jobs (each as a `job`), and monitors job completion. It never processes data directly.
-> - After scheduling jobs, the distributed mode should check if all jobs are complete. If not, call `ctx.defer()` to pause and retry later. Only call `ctx.complete()` when all jobs are finished—this allows afterSchema and subsequent migrations to proceed.
+> - In `distributed` mode, the migration function is for orchestration only: it discovers data, splits into batches, schedules jobs (each as a `job`), and monitors job completion. It never processes data directly.
+> - After scheduling jobs in distributed mode, check if all jobs are complete. If not, call `ctx.defer()` to pause and indicate to retry later. Only call `ctx.complete()` when all jobs are finished—this allows afterSchema and subsequent migrations to proceed.
 > - All actual data processing happens in `job` mode, which can process all data or just a batch (if a payload is provided).
-> - If you call `ctx.defer()`, the migration will be paused: `afterSchema` and any subsequent migrations will not run until you rerun the job and it calls `ctx.complete()`. This enables staged rollouts, retries, or background processing.
+> - The migration function should always check `ctx.mode` and process accordingly:
+>   - In `distributed` mode, orchestrate the work and use `ctx.defer('reason', data?)` to pause, retry, or indicate that jobs were scheduled for background work, potentially passing back relevant data.
+>   - In `job` mode, process all data at once, or a specific range if a payload is provided. You can also use `ctx.defer(reason, data?)` to implement staged rollouts or pause for backpressure.
+> - If you call `ctx.defer(reason, data?)`, the migration will be paused: `afterSchema` and any subsequent migrations will not run until you rerun the job and it calls `ctx.complete()`. This enables staged rollouts, retries, or background processing. The optional `data` can be used to pass structured information back to the orchestrator.
 > - Strataline is backend-agnostic: you can use any job scheduler, queue system, thread pool, or orchestration framework to schedule and monitor jobs as needed.
 
-````
+## Creating a Migration Script
 
-> **Important:**
-> - The migration function is called once per batch. Splitting into batches and scheduling jobs is handled by your orchestration code, not inside the migration function.
-> - If you call `ctx.defer()`, the migration will be paused: `afterSchema` and any subsequent migrations will not run until you rerun the job and it calls `ctx.complete()`. This allows for staged rollouts, retries, or background processing.
-> - The migration function should always check `ctx.mode` and process accordingly:
->   - In `distributed` mode, only process the batch described by the payload. Use `ctx.defer('reason')` to pause, retry, or indicate that a job was scheduled for background work (e.g., via a job queue, thread pool, or cloud task).
->   - In `job` mode, you can process all data at once, or a specific range if a payload is provided. You can also use `ctx.defer()` to implement staged rollouts or pause for backpressure.
->
-> Strataline is backend-agnostic: you can use it with any job scheduler, queue system, thread pool, or orchestration framework.
+Since Strataline is designed as a library rather than a CLI tool, you can easily create your own migration script to run migrations from the command line. This gives you full control over how migrations are executed while providing a familiar CLI-like experience.
+
+Here's an example of a simple migration script that you can add to your project:
+
+```typescript
+// migrate.ts
+import { Pool } from "pg";
+import { MigrationManager } from "strataline";
+
+// Import your migrations directly to ensure correct ordering
+import { migration001 } from "./migrations/001-add-users-table";
+import { migration002 } from "./migrations/002-add-posts-table";
+// ... import additional migrations as needed
+
+async function main() {
+  // Parse command line arguments
+  const args = process.argv.slice(2);
+  const mode = args.includes("--distributed") ? "distributed" : "job";
+  const verbose = args.includes("--verbose");
+
+  // Create database connection
+  const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+  });
+
+  // Set up migration manager
+  const migrationManager = new MigrationManager(pool);
+
+  try {
+    // Register migrations in the order you want them to run
+    migrationManager.register([
+      migration001,
+      migration002,
+      // ... add additional migrations in order
+    ]);
+
+    // Run migrations
+    console.log(`Running migrations in ${mode} mode...`);
+    const result = await migrationManager.runSchemaChanges(mode);
+
+    if (result.success) {
+      console.log("✅ Migrations completed successfully!");
+      console.log(
+        `Completed migrations: ${result.completedMigrations.join(", ") || "none"}`,
+      );
+
+      if (
+        verbose &&
+        result.migrationData &&
+        Object.keys(result.migrationData).length > 0
+      ) {
+        console.log(
+          "Migration data:",
+          JSON.stringify(result.migrationData, null, 2),
+        );
+      }
+    } else {
+      console.error(`❌ Migration failed: ${result.reason}`);
+      console.log(
+        `Completed migrations: ${result.completedMigrations.join(", ") || "none"}`,
+      );
+      console.log(
+        `Pending migrations: ${result.pendingMigrations.join(", ") || "none"}`,
+      );
+
+      if (result.lastAttemptedMigration) {
+        console.log(
+          `Last attempted migration: ${result.lastAttemptedMigration}`,
+        );
+      }
+
+      process.exit(1);
+    }
+  } catch (error) {
+    console.error("Error running migrations:", error);
+    process.exit(1);
+  } finally {
+    await pool.end();
+  }
+}
+
+main().catch(console.error);
+```
+
+Alternatively, you can create an index file that exports all migrations in the correct order:
+
+```typescript
+// migrations/index.ts
+import { migration001 } from "./001-add-users-table";
+import { migration002 } from "./002-add-posts-table";
+// ... import additional migrations
+
+// Export migrations in the order they should run
+export const migrations = [
+  migration001,
+  migration002,
+  // ... add additional migrations
+];
+```
+
+Then your migration script becomes simpler:
+
+```typescript
+// migrate.ts
+import { Pool } from "pg";
+import { MigrationManager } from "strataline";
+import { migrations } from "./migrations";
+
+async function main() {
+  // ... same setup code as above
+
+  // Register migrations from the imported array
+  migrationManager.register(migrations);
+
+  // ... rest of the script
+}
+
+main().catch(console.error);
+```
+
+You can then add scripts to your `package.json`:
+
+```json
+{
+  "scripts": {
+    "migrate": "bun run migrate.ts",
+    "migrate:distributed": "bun run migrate.ts --distributed"
+  }
+}
+```
+
+This allows you to run migrations using:
+
+```bash
+# Run migrations in job mode
+npm run migrate
+
+# Run migrations in distributed mode
+npm run migrate:distributed
+
+# Run with verbose output
+npm run migrate -- --verbose
+```
+
+You can also use `ts-node` instead of Bun if you prefer: just replace `bun run` with `ts-node` in your package.json scripts.
+
+This approach ensures your migrations run in the exact order you specify, rather than relying on filesystem ordering.
 
 ## Architecture
 
@@ -232,6 +397,7 @@ Strataline is designed with flexibility in mind, allowing you to choose the exec
 ### Job Mode
 
 In `job` mode, migrations run inline on a single machine. This is useful for:
+
 - Development environments
 - Small projects with manageable data volumes
 - CI/CD pipelines where migrations run before deployment
@@ -241,19 +407,24 @@ The job mode runs all migrations in sequence on a single machine, with each migr
 ### Distributed Mode
 
 In `distributed` mode, your infrastructure acts as a router/scheduler/monitor, while the actual work is done by calling `runDataMigrationJobOnly` as jobs. This is ideal for:
+
 - Large-scale production systems
 - Migrations that process millions of records
 - Systems where you need fine-grained control over resource usage
 - Environments where you want to limit the blast radius of migrations
 
 The distributed mode works like this:
-1. You run `runSchemaChanges('distributed')` to apply schema changes
-2. Your infrastructure determines how to split the data (e.g., by user ID ranges)
-3. For each batch, you call `runDataMigrationJobOnly(migrationId, payload)`
-4. Each batch runs as a separate job, processing just its portion of the data
-5. Your infrastructure handles scheduling, retries, and monitoring
+
+1. You run `runSchemaChanges('distributed')` to apply schema changes. The result may contain `migrationData` from any migrations that completed during this run, which could include data returned by migrations that ran inline that called `ctx.complete(data)` or `ctx.defer(reason, data)`.
+2. Your infrastructure determines how to split the data (e.g., by user ID ranges).
+3. For each batch, you call `runDataMigrationJobOnly(migrationId, payload)`. This function executes the `migration` part of your defined migration for that specific `migrationId` and `payload`.
+   - If the migration calls `ctx.complete(data)` or `ctx.defer(reason, data)`, the `data` provided there will be returned in the `data` field of the `DataMigrationJobResult`.
+   - The overall result will be an object like `{ status: 'success', reason?: string, data?: TReturn }`.
+4. Each batch runs as a separate job, processing just its portion of the data. The `data` returned in the `DataMigrationJobResult` can be used for logging, monitoring, or further orchestration.
+5. Your infrastructure handles scheduling, retries, and monitoring based on the `status`, `reason`, and `data` from `runDataMigrationJobOnly`.
 
 This approach allows you to:
+
 - Process data in parallel across multiple machines
 - Limit the impact of any single migration job
 - Implement sophisticated retry and monitoring logic
@@ -261,27 +432,29 @@ This approach allows you to:
 
 ## Backpressure Handling
 
-The `defer()` function can be called from within a migration to pause work and retry later. This is useful for:
+Inside a migration you can call `ctx.defer(reason?: string, data?: TReturn)` to pause work and retry later. This is useful for:
+
 - Handling backpressure when the system is under load
 - Implementing staged rollouts of data changes
 - Pausing when rate limits are reached
 - Recovering from temporary failures
-- Spawning background tasks in distributed mode and exiting to check status later
+- Spawning background tasks in distributed mode and exiting to check status later, potentially returning data like a task ID or checkpoint.
 
-When a migration calls `defer()`, the current execution stops and should be retried later by your orchestration system. This is particularly powerful in distributed mode, where you might:
+When a migration calls `defer(reason, data?)`, the current execution stops and should be retried later by your orchestration system. The `data` returned by `defer` (if provided) will be available in the `DataMigrationJobResult` when using `runDataMigrationJobOnly`. This is particularly powerful in distributed mode, where you might:
 
 1. **Spawn Background Tasks**: Start a long-running process and defer the migration to check its status later
 2. **Implement Circuit Breakers**: Detect system load and defer processing during peak times
 3. **Create Staged Rollouts**: Process data in waves, deferring between each wave to monitor system health
 4. **Handle External Dependencies**: Defer when dependent systems are unavailable or rate-limited
 
-The `defer()` function accepts an optional reason parameter that can be used to provide context for why the migration was paused, which can be useful for monitoring and debugging.
+The `defer()` function accepts an optional `reason` parameter and an optional `data` parameter. The `reason` provides context for why the migration was paused, useful for monitoring and debugging. The `data` allows for returning structured information to the calling orchestrator.
 
 ## Logging & Schema Helpers
 
 Strataline provides robust logging and schema helper utilities to make migrations safer and more traceable:
 
 ### Logging
+
 - All migration phases and helpers use a `Logger` interface for structured logs and errors.
 - By default, logs are sent to the console, but you can provide your own logger by passing it to the `MigrationManager`.
 - The migration system automatically adds contextual information to logs:
@@ -290,14 +463,15 @@ Strataline provides robust logging and schema helper utilities to make migration
   - This provides built-in traceability without manual configuration
 
 Example:
+
 ```typescript
 migration: async (pool, ctx) => {
   // The logger already has the migration ID as the task
-  ctx.logger.log({ message: 'Starting migration batch' });
+  ctx.logger.log({ message: "Starting migration batch" });
   // ...
-  ctx.logger.error({ message: 'Something went wrong', error: err });
+  ctx.logger.error({ message: "Something went wrong", error: err });
   // Output includes: [migration-id] [dataMigration] Something went wrong
-}
+};
 ```
 
 #### Logger Module
@@ -318,44 +492,44 @@ The logger system automatically formats messages with task and stage prefixes, m
 You can create your own logger by extending the `BaseLogger` class:
 
 ```typescript
-import { BaseLogger, LogDataInput } from 'strataline';
+import { BaseLogger, LogDataInput } from "strataline";
 
 // Create a custom logger that sends logs to a service
 class ApiLogger extends BaseLogger {
   log(data: LogDataInput): void {
     // Send log to your logging service
     apiClient.sendLog({
-      level: 'info',
+      level: "info",
       message: data.message,
       context: {
         task: data.task,
-        stage: data.stage
-      }
+        stage: data.stage,
+      },
     });
   }
 
   error(data: LogDataInput): void {
     // Send error to your logging service
     apiClient.sendLog({
-      level: 'error',
+      level: "error",
       message: data.message,
       error: data.error,
       context: {
         task: data.task,
-        stage: data.stage
-      }
+        stage: data.stage,
+      },
     });
   }
 
   warn(data: LogDataInput): void {
     // Send warning to your logging service
     apiClient.sendLog({
-      level: 'warn',
+      level: "warn",
       message: data.message,
       context: {
         task: data.task,
-        stage: data.stage
-      }
+        stage: data.stage,
+      },
     });
   }
 }
@@ -370,12 +544,12 @@ You can also create prefixed loggers easily with the `createPrefixed` method:
 ```typescript
 // Create a logger with prefilled task/stage information
 const prefixedLogger = apiLogger.createPrefixed({
-  task: 'my-task',
-  stage: 'initialization'
+  task: "my-task",
+  stage: "initialization",
 });
 
 // All logs will include the prefixes
-prefixedLogger.log({ message: 'Starting process' });
+prefixedLogger.log({ message: "Starting process" });
 // Output includes: [my-task] [initialization] Starting process
 ```
 
@@ -385,19 +559,19 @@ The `helpers` object, passed as the second argument to `beforeSchema` and `after
 
 **Available Helpers:**
 
--   **`createTable(client, tableName, columns, constraints?)`**: Creates a table if it doesn't exist.
-    -   `columns`: An object mapping column names to their types (e.g., `{ id: "SERIAL PRIMARY KEY", name: "TEXT NOT NULL" }`).
-    -   `constraints` (optional): An array of strings defining table constraints (e.g., `["CONSTRAINT uq_email UNIQUE (email)"]`).
--   **`addColumn(client, tableName, columnName, columnType, defaultValue?)`**: Adds a column to a table if it doesn't exist. Throws an error if the table does not exist.
-    -   `defaultValue` (optional): A default value for the new column.
--   **`removeColumn(client, tableName, columnName)`**: Removes a column from a table if it exists. Throws an error if the table does not exist. Logs a message if the column doesn't exist.
--   **`addIndex(client, tableName, indexName, columns, unique?)`**: Adds an index to a table if it doesn't exist. Throws an error if the table does not exist.
-    -   `columns`: An array of column names to include in the index.
-    -   `unique` (optional, default `false`): Whether to create a unique index.
--   **`removeIndex(client, indexName)`**: Removes an index if it exists. Logs a message if the index doesn't exist.
--   **`addForeignKey(client, tableName, constraintName, columnName, referencedTable, referencedColumn, onDelete?)`**: Adds a foreign key constraint if it doesn't exist. Throws an error if the table or referenced table does not exist.
-    -   `onDelete` (optional, default `'NO ACTION'`): Action to take on delete (`CASCADE`, `SET NULL`, `RESTRICT`, `NO ACTION`).
--   **`removeConstraint(client, tableName, constraintName)`**: Removes a constraint (like a foreign key or check constraint) if it exists. Throws an error if the table does not exist. Logs a message if the constraint doesn't exist.
+- **`createTable(client, tableName, columns, constraints?)`**: Creates a table if it doesn't exist.
+  - `columns`: An object mapping column names to their types (e.g., `{ id: "SERIAL PRIMARY KEY", name: "TEXT NOT NULL" }`).
+  - `constraints` (optional): An array of strings defining table constraints (e.g., `["CONSTRAINT uq_email UNIQUE (email)"]`).
+- **`addColumn(client, tableName, columnName, columnType, defaultValue?)`**: Adds a column to a table if it doesn't exist. Throws an error if the table does not exist.
+  - `defaultValue` (optional): A default value for the new column.
+- **`removeColumn(client, tableName, columnName)`**: Removes a column from a table if it exists. Throws an error if the table does not exist. Logs a message if the column doesn't exist.
+- **`addIndex(client, tableName, indexName, columns, unique?)`**: Adds an index to a table if it doesn't exist. Throws an error if the table does not exist.
+  - `columns`: An array of column names to include in the index.
+  - `unique` (optional, default `false`): Whether to create a unique index.
+- **`removeIndex(client, indexName)`**: Removes an index if it exists. Logs a message if the index doesn't exist.
+- **`addForeignKey(client, tableName, constraintName, columnName, referencedTable, referencedColumn, onDelete?)`**: Adds a foreign key constraint if it doesn't exist. Throws an error if the table or referenced table does not exist.
+  - `onDelete` (optional, default `'NO ACTION'`): Action to take on delete (`CASCADE`, `SET NULL`, `RESTRICT`, `NO ACTION`).
+- **`removeConstraint(client, tableName, constraintName)`**: Removes a constraint (like a foreign key or check constraint) if it exists. Throws an error if the table does not exist. Logs a message if the constraint doesn't exist.
 
 **Example Usage:**
 
@@ -489,12 +663,11 @@ Strataline is built with TypeScript and uses modern JavaScript features.
 
 ```bash
 # Install dependencies
-npm install
+bun install
 
 # Build the project
-npm run build
+bun run build
 
 # Run tests
-npm test
+bun test
 ```
-````

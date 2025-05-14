@@ -20,8 +20,8 @@ export type MigrationMode = "job" | "distributed";
 export type MigrationCompletionCallback = () => void;
 export type MigrationDeferCallback = (reason?: string) => void;
 
-// Migration interface with generic payload type
-export interface Migration<P = Record<string, any>> {
+// Migration interface with generic payload and return types
+export interface Migration<TPayload = Record<string, any>, TReturn = any> {
   id: string;
   description: string;
 
@@ -33,16 +33,17 @@ export interface Migration<P = Record<string, any>> {
   // Only one of complete() or defer() can be called, not both
   // The logger is task-specific and will prefix all messages with the task ID
   // Mode is required and payload is always passed (empty object if not provided)
+  // Data can be passed to ctx.complete(data)
   migration?: (
     pool: Pool,
     ctx: {
       logger: Logger;
-      complete(): void;
-      defer(reason?: string): void;
+      complete(data?: TReturn): void;
+      defer(reason?: string, data?: TReturn): void;
       mode: MigrationMode;
-      payload: P;
+      payload: TPayload;
     },
-  ) => Promise<void>;
+  ) => Promise<void>; // Migration function itself still returns Promise<void>, data is passed via complete()
 
   // Schema changes after data migration - runs in a transaction
   afterSchema?: (client: PoolClient, helpers?: SchemaHelpers) => Promise<void>;
@@ -59,10 +60,31 @@ export interface MigrationStatus {
   lastUpdated: number;
 }
 
+// For runDataMigrationJobOnly and internal phase results
+export type DataMigrationJobStatus =
+  | "success"
+  | "error"
+  | "already_complete"
+  | "deferred"
+  | "not_found"
+  | "invalid_state";
+
+export interface DataMigrationJobResult<D = any> {
+  status: DataMigrationJobStatus;
+  reason?: string;
+  data?: D;
+}
+
+export interface DataMigrationPhaseResult<D = any> {
+  status: "success" | "deferred" | "error";
+  reason?: string;
+  data?: D;
+}
+
 /**
  * Result of running schema changes
  */
-export interface MigrationResult {
+export interface MigrationResult<D_ALL = Record<string, any>> {
   // Whether all migrations completed successfully
   success: boolean;
 
@@ -83,6 +105,9 @@ export interface MigrationResult {
 
   // Error details if status is "error"
   error?: any;
+
+  // Data returned by successful migrations in this run
+  migrationData?: D_ALL;
 }
 
 /**
@@ -98,7 +123,7 @@ export class MigrationManager {
   private static readonly LOCK_NAME = "database_migrations";
 
   private pool: Pool;
-  private migrations: Migration<any>[] = [];
+  private migrations: Migration<any, any>[] = [];
   private lockId: string | null = null;
   private lockRenewalInterval: NodeJS.Timeout | null = null;
   private lockRenewalSeconds: number; // Configurable lock renewal interval in seconds
@@ -230,7 +255,9 @@ export class MigrationManager {
    * @throws Error if duplicate migration IDs are detected
    */
 
-  register<P = Record<string, any>>(migrations: Migration<P>[]): void {
+  register<TPayload = Record<string, any>, TReturn = any>(
+    migrations: Migration<TPayload, TReturn>[],
+  ): void {
     // Check for duplicate migration IDs
     const ids = new Set<string>();
     const duplicates: string[] = [];
@@ -285,6 +312,8 @@ export class MigrationManager {
   async runSchemaChanges(mode: MigrationMode): Promise<MigrationResult> {
     await this.ensureInitialized();
 
+    const migrationData: Record<string, any> = {}; // To store data from successful migrations
+
     // Try to acquire the lock
     const lockAcquired = await this.acquireMigrationLock();
     if (!lockAcquired) {
@@ -298,6 +327,7 @@ export class MigrationManager {
         reason: "Another process is running migrations",
         completedMigrations: [],
         pendingMigrations: this.migrations.map((m) => m.id),
+        migrationData,
       };
     }
 
@@ -342,6 +372,7 @@ export class MigrationManager {
           status: "completed",
           completedMigrations: appliedIds,
           pendingMigrations: [],
+          migrationData, // Empty, as no migrations from *this run*
         };
       }
 
@@ -361,7 +392,11 @@ export class MigrationManager {
             message: `Starting migration ${migration.id} (${migration.description})`,
           });
 
-          const result = await this.runSingleMigration(migration, mode);
+          // P_Payload and P_Return will be 'any' here as runSchemaChanges doesn't know specific types
+          const result = await this.runSingleMigration<any, any>(
+            migration,
+            mode,
+          );
 
           if (result.status !== "success") {
             this.logger.log({
@@ -392,11 +427,16 @@ export class MigrationManager {
               lastAttemptedMigration,
               // Optionally, include the original error if it's an error status and available
               ...(result.status === "error" && { error: result.reason }),
+              migrationData, // Include data from migrations completed so far
             };
           }
 
           // Migration completed successfully
           completedMigrations.push(migration.id);
+
+          if (result.data !== undefined) {
+            migrationData[migration.id] = result.data;
+          }
 
           remainingPendingMigrations.splice(
             remainingPendingMigrations.indexOf(migration.id),
@@ -432,6 +472,7 @@ export class MigrationManager {
             pendingMigrations: remainingPendingMigrations,
             lastAttemptedMigration,
             error,
+            migrationData, // Include data from migrations completed so far
           };
         }
       }
@@ -442,6 +483,7 @@ export class MigrationManager {
         status: "completed",
         completedMigrations,
         pendingMigrations: [],
+        migrationData,
       };
     } finally {
       // Always release the lock when done
@@ -453,15 +495,19 @@ export class MigrationManager {
    * Run a single migration's schema changes
    * @param migration The migration to run
    * @param mode Optional migration mode to pass to data migration
-   * @returns A promise that resolves to a status object
+   * @returns A promise that resolves to a status object with optional data
    */
 
-  private async runSingleMigration<P = Record<string, any>>(
-    migration: Migration<P>,
+  private async runSingleMigration<
+    TPayload = Record<string, any>,
+    TReturn = any,
+  >(
+    migration: Migration<TPayload, TReturn>,
     mode: MigrationMode,
-  ): Promise<{ status: "success" | "deferred" | "error"; reason?: string }> {
+  ): Promise<DataMigrationPhaseResult<TReturn>> {
     // Create a task-specific logger for this migration
     const taskLogger = this.createTaskLogger(migration.id);
+    let migrationOutputData: TReturn | undefined = undefined;
 
     taskLogger.log({
       message: `Running migration: ${migration.description}`,
@@ -525,19 +571,19 @@ export class MigrationManager {
 
     // Step 2: Run data migration if provided
     if (migration.migration) {
-      const dataMigrationResult = await this.runDataMigration(
-        migration,
-        taskLogger,
-        mode,
-      );
+      const dataMigrationResult = await this.runDataMigration<
+        TPayload,
+        TReturn
+      >(migration, taskLogger, mode, {} as TPayload); // Pass default payload
 
       if (dataMigrationResult.status !== "success") {
         taskLogger.log({
           message: `[dataMigration] Data migration for ${migration.id} did not complete successfully (status: ${dataMigrationResult.status}). Reason: ${dataMigrationResult.reason || "N/A"}`,
         });
-
-        return dataMigrationResult; // Propagate status and reason
+        return dataMigrationResult; // Propagate status, reason, and potentially data (if provided by either complete or defer)
       }
+
+      migrationOutputData = dataMigrationResult.data; // Capture data from successful migration
     } else {
       // If there's no data migration, mark it as complete and log
       taskLogger.log({
@@ -590,7 +636,7 @@ export class MigrationManager {
       message: `Migration ${migration.id} completed successfully`,
     });
 
-    return { status: "success" };
+    return { status: "success", data: migrationOutputData };
   }
 
   /**
@@ -663,25 +709,26 @@ export class MigrationManager {
   /**
    * Run the data migration phase for a single migration.
    * Assumes migration.migration is defined.
-   * Returns a promise that resolves to a status object
+   * Returns a promise that resolves to a status object with optional data
    */
 
-  private async runDataMigration<P = Record<string, any>>(
-    migration: Migration<P>,
+  private async runDataMigration<TPayload = Record<string, any>, TReturn = any>(
+    migration: Migration<TPayload, TReturn>,
     logger: Logger,
     mode: MigrationMode,
-    payload: P = {} as P,
-  ): Promise<{ status: "success" | "deferred" | "error"; reason?: string }> {
+    payload: TPayload = {} as TPayload,
+  ): Promise<DataMigrationPhaseResult<TReturn>> {
     // Pre-condition: migration.migration is guaranteed to be non-null by the caller.
 
-    return new Promise<{
-      status: "success" | "deferred" | "error";
-      reason?: string;
-    }>((resolve, reject) => {
+    return new Promise<DataMigrationPhaseResult<TReturn>>((resolve) => {
       let callbackCalled = false;
 
-      const completeCallback = () => {
-        if (callbackCalled) return; // Prevent multiple calls
+      const completeCallback = (data?: TReturn) => {
+        if (callbackCalled) {
+          logger.error({ message: "complete()/defer() called twice" });
+          throw new Error("complete() or defer() already called");
+        }
+
         callbackCalled = true;
 
         this.markStatus(migration.id, { migrationComplete: true })
@@ -690,7 +737,7 @@ export class MigrationManager {
               message: `[dataMigration] Data migration marked as complete via callback.`,
             });
 
-            resolve({ status: "success" }); // "Truly done"
+            resolve({ status: "success", data }); // "Truly done"
           })
           .catch((dbError: any) => {
             logger.error({
@@ -707,8 +754,12 @@ export class MigrationManager {
           });
       };
 
-      const deferCallback = (reason?: string) => {
-        if (callbackCalled) return; // Prevent multiple calls
+      const deferCallback = (reason?: string, data?: TReturn) => {
+        if (callbackCalled) {
+          logger.error({ message: "complete()/defer() called twice" });
+          throw new Error("complete() or defer() already called");
+        }
+
         callbackCalled = true;
 
         const logMessage = reason
@@ -719,8 +770,8 @@ export class MigrationManager {
           message: logMessage,
         });
 
-        // Resolve to deferred status
-        resolve({ status: "deferred", reason: reason });
+        // Resolve to deferred status, include data
+        resolve({ status: "deferred", reason: reason, data });
       };
 
       (async () => {
@@ -967,21 +1018,28 @@ export class MigrationManager {
    * Run only the data migration phase for a specific migration as a job
    * @param migrationId The ID of the migration to run
    * @param payload Optional payload to pass to the data migration
-   * @returns A boolean indicating whether the migration was successful
+   * @returns A DataMigrationJobResult object indicating status and any returned data
    */
-  async runDataMigrationJobOnly<P = Record<string, any>>(
+  async runDataMigrationJobOnly<TPayload = Record<string, any>, TReturn = any>(
     migrationId: string,
-    payload?: P,
-  ): Promise<boolean> {
+    payload?: TPayload,
+  ): Promise<DataMigrationJobResult<TReturn>> {
     await this.ensureInitialized();
 
     // Find the migration by ID
-    const migration = this.migrations.find((m) => m.id === migrationId);
+    const migration = this.migrations.find((m) => m.id === migrationId) as
+      | Migration<TPayload, TReturn>
+      | undefined; // Cast for type safety
+
     if (!migration) {
       this.logger.error({
         message: `Migration with ID ${migrationId} not found`,
       });
-      return false;
+
+      return {
+        status: "not_found",
+        reason: `Migration with ID ${migrationId} not found`,
+      };
     }
 
     // Create a task-specific logger for this migration
@@ -1005,7 +1063,11 @@ export class MigrationManager {
       taskLogger.error({
         message: `Migration ${migrationId} not found in status table. Before schema must be applied first.`,
       });
-      return false;
+
+      return {
+        status: "invalid_state",
+        reason: `Migration ${migrationId} not found in status table. Before schema must be applied first.`,
+      };
     }
 
     const status = rows[0];
@@ -1013,7 +1075,11 @@ export class MigrationManager {
       taskLogger.error({
         message: `Cannot run data migration for ${migrationId} - before schema has not been applied yet`,
       });
-      return false;
+
+      return {
+        status: "invalid_state",
+        reason: `Cannot run data migration for ${migrationId} - before schema has not been applied yet.`,
+      };
     }
 
     // Check if migration is already complete (migration_complete flag is true and completed_at > 0)
@@ -1021,14 +1087,20 @@ export class MigrationManager {
       taskLogger.log({
         message: `Data migration for ${migrationId} has already been completed`,
       });
-      return true;
+
+      // If already complete, no new data is generated by this call.
+      return { status: "already_complete" };
     }
 
     if (status.after_schema_applied) {
       taskLogger.error({
         message: `Invalid state for migration ${migrationId} - after schema is applied but data migration is not complete`,
       });
-      return false;
+
+      return {
+        status: "invalid_state",
+        reason: `Invalid state for migration ${migrationId} - after schema is applied but data migration is not complete.`,
+      };
     }
 
     // If there's no data migration function, mark it as complete and return
@@ -1038,7 +1110,8 @@ export class MigrationManager {
       });
 
       await this.markStatus(migration.id, { migrationComplete: true });
-      return true;
+
+      return { status: "success" }; // Successfully did nothing, no data.
     }
 
     // Run the data migration
@@ -1050,11 +1123,11 @@ export class MigrationManager {
         message: `Running data migration for ${migration.id} with mode: ${mode}`,
       });
 
-      const result = await this.runDataMigration(
+      const result = await this.runDataMigration<TPayload, TReturn>(
         migration,
         taskLogger,
         mode,
-        payload || ({} as P),
+        payload || ({} as TPayload),
       );
 
       if (result.status === "success") {
@@ -1062,20 +1135,30 @@ export class MigrationManager {
           message: `Data migration for ${migration.id} completed successfully`,
         });
 
-        return true;
-      } else {
+        return { status: "success", data: result.data };
+      } else if (result.status === "deferred") {
         taskLogger.log({
-          message: `Data migration for ${migration.id} was deferred or did not complete (status: ${result.status}, reason: ${result.reason || "N/A"})`,
+          message: `Data migration for ${migration.id} was deferred (reason: ${result.reason || "N/A"})`,
+          ...(result.data !== undefined && { deferredData: result.data }),
         });
-
-        return false;
+        // Propagate status, reason, and data for deferred
+        return { status: "deferred", reason: result.reason, data: result.data };
+      } else {
+        // error
+        taskLogger.log({
+          message: `Data migration for ${migration.id} failed (reason: ${result.reason || "N/A"})`,
+          // Error case typically doesn't carry data from the migration function itself,
+          // but if runDataMigration somehow attached it, it would be in result.data
+        });
+        return { status: "error", reason: result.reason, data: result.data };
       }
-    } catch (err) {
+    } catch (err: any) {
       taskLogger.error({
         message: `Error in data migration:`,
         error: err,
       });
-      return false;
+
+      return { status: "error", reason: err.message || String(err) };
     }
   }
 
