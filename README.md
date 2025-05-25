@@ -1,4 +1,4 @@
-# Strataline v1.0.0
+# Strataline v1.1.0
 
 [![npm version](https://badge.fury.io/js/strataline.svg)](https://badge.fury.io/js/strataline)
 
@@ -170,8 +170,8 @@ In distributed mode, your infrastructure acts as a router, scheduler, and monito
 
 - **When `job` mode is active** (local run **or** a worker processing a batch):
 
-  - **No payload provided** → you’re on a single machine (dev/CI), so process the _entire_ dataset, then `ctx.complete()`.
-  - **Payload provided** → you’re a worker handling a single batch that the distributed orchestrator created; process just that slice and call `ctx.complete(data)` (or `ctx.defer(reason, data)` to retry later).
+  - **No payload provided** → you're on a single machine (dev/CI), so process the _entire_ dataset, then `ctx.complete()`.
+  - **Payload provided** → you're a worker handling a single batch that the distributed orchestrator created; process just that slice and call `ctx.complete(data)` (or `ctx.defer(reason, data)` to retry later).
 
 Example:
 
@@ -571,6 +571,9 @@ The `helpers` object, passed as the second argument to `beforeSchema` and `after
 - **`removeIndex(client, indexName)`**: Removes an index if it exists. Logs a message if the index doesn't exist.
 - **`addForeignKey(client, tableName, constraintName, columnName, referencedTable, referencedColumn, onDelete?)`**: Adds a foreign key constraint if it doesn't exist. Throws an error if the table or referenced table does not exist.
   - `onDelete` (optional, default `'NO ACTION'`): Action to take on delete (`CASCADE`, `SET NULL`, `RESTRICT`, `NO ACTION`).
+- **`addDeferrableForeignKey(client, tableName, constraintName, columnName, referencedTable, referencedColumn, onDelete?, initiallyDeferred?)`**: Adds a deferrable foreign key constraint if it doesn't exist. This allows for circular references to be created in a single transaction. Throws an error if the table or referenced table does not exist.
+  - `onDelete` (optional, default `'NO ACTION'`): Action to take on delete (`CASCADE`, `SET NULL`, `RESTRICT`, `NO ACTION`).
+  - `initiallyDeferred` (optional, default `true`): Whether the constraint should be initially deferred (`INITIALLY DEFERRED`) or not (`INITIALLY IMMEDIATE`).
 - **`removeConstraint(client, tableName, constraintName)`**: Removes a constraint (like a foreign key or check constraint) if it exists. Throws an error if the table does not exist. Logs a message if the constraint doesn't exist.
 
 **Example Usage:**
@@ -671,3 +674,22 @@ bun run build
 # Run tests
 bun test
 ```
+
+When preparing a new release:
+
+1. Update the version in `package.json`
+2. Run the build command, which will automatically update the README version
+
+```bash
+# Build the project (includes README version update)
+bun run build
+```
+
+The build process uses the `update-readme` script defined in package.json, which runs `scripts/update-readme-version.ts`. This script synchronizes the version number in the README with the one in package.json. Afterwards, you can publish the package to npm:
+
+```bash
+# Publish to npm
+bun publish
+```
+
+Make sure to commit the new version back to GIT

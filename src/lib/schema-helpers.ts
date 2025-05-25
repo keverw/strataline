@@ -46,6 +46,17 @@ export interface SchemaHelpers {
     onDelete?: "CASCADE" | "SET NULL" | "RESTRICT" | "NO ACTION",
   ) => Promise<void>;
 
+  addDeferrableForeignKey: (
+    client: PoolClient,
+    tableName: string,
+    constraintName: string,
+    columnName: string,
+    referencedTable: string,
+    referencedColumn: string,
+    onDelete?: "CASCADE" | "SET NULL" | "RESTRICT" | "NO ACTION",
+    initiallyDeferred?: boolean,
+  ) => Promise<void>;
+
   removeConstraint: (
     client: PoolClient,
     tableName: string,
@@ -323,6 +334,61 @@ export function createSchemaHelpers(
   }
 
   /**
+   * Add a deferrable foreign key constraint if it doesn't exist
+   * This allows for circular references to be created in a single transaction
+   */
+  async function addDeferrableForeignKey(
+    client: PoolClient,
+    tableName: string,
+    constraintName: string,
+    columnName: string,
+    referencedTable: string,
+    referencedColumn: string,
+    onDelete: "CASCADE" | "SET NULL" | "RESTRICT" | "NO ACTION" = "NO ACTION",
+    initiallyDeferred: boolean = true,
+  ): Promise<void> {
+    try {
+      // Check if constraint exists
+      const { rows } = await client.query(
+        `
+        SELECT constraint_name
+        FROM information_schema.table_constraints
+        WHERE table_name = $1 AND constraint_name = $2
+      `,
+        [tableName, constraintName],
+      );
+
+      if (rows.length === 0) {
+        // Constraint doesn't exist, add it
+        const deferredClause = initiallyDeferred
+          ? "INITIALLY DEFERRED"
+          : "INITIALLY IMMEDIATE";
+        await client.query(`
+          ALTER TABLE ${tableName}
+          ADD CONSTRAINT ${constraintName}
+          FOREIGN KEY (${columnName})
+          REFERENCES ${referencedTable} (${referencedColumn})
+          ON DELETE ${onDelete}
+          DEFERRABLE ${deferredClause}
+        `);
+        prefixedLogger.log({
+          message: `Added deferrable foreign key ${constraintName} to table ${tableName}`,
+        });
+      } else {
+        prefixedLogger.log({
+          message: `Foreign key ${constraintName} already exists on table ${tableName}`,
+        });
+      }
+    } catch (error) {
+      prefixedLogger.error({
+        message: `Error adding deferrable foreign key ${constraintName} to table ${tableName}:`,
+        error,
+      });
+      throw error;
+    }
+  }
+
+  /**
    * Remove a constraint if it exists
    */
   async function removeConstraint(
@@ -381,6 +447,7 @@ export function createSchemaHelpers(
     addIndex,
     removeIndex,
     addForeignKey,
+    addDeferrableForeignKey,
     removeConstraint,
   };
 }

@@ -1368,6 +1368,107 @@ describe("MigrationManager", () => {
       // Verify ON DELETE CASCADE (optional, more complex check)
     });
 
+    // --- Tests for addDeferrableForeignKey ---
+    test("addDeferrableForeignKey should add a deferrable foreign key constraint", async () => {
+      const constraintName = "fk_helper_deferrable";
+      // Add column to reference the other table
+      await client.query(
+        `ALTER TABLE helper_test_table ADD COLUMN ref_col_deferrable INT;`,
+      );
+
+      await helpers.addDeferrableForeignKey(
+        client,
+        "helper_test_table",
+        constraintName,
+        "ref_col_deferrable",
+        "helper_test_table_ref",
+        "ref_id",
+        "SET NULL",
+        true, // initiallyDeferred = true
+      );
+
+      // Verify constraint exists
+      const { rows: constraintRows } = await client.query(
+        `SELECT constraint_name FROM information_schema.table_constraints 
+         WHERE table_name = 'helper_test_table' 
+         AND constraint_name = $1 
+         AND constraint_type = 'FOREIGN KEY';`,
+        [constraintName],
+      );
+      expect(constraintRows.length).toBe(1);
+      expect(constraintRows[0].constraint_name).toBe(constraintName);
+
+      // Verify constraint is deferrable and initially deferred
+      const { rows: deferRows } = await client.query(
+        `SELECT c.conname, c.condeferrable, c.condeferred
+         FROM pg_constraint c
+         JOIN pg_class t ON c.conrelid = t.oid
+         WHERE c.conname = $1
+         AND t.relname = 'helper_test_table';`,
+        [constraintName],
+      );
+
+      expect(deferRows.length).toBe(1);
+      expect(deferRows[0].condeferrable).toBe(true);
+      expect(deferRows[0].condeferred).toBe(true);
+
+      // Test with initiallyDeferred = false
+      const constraintName2 = "fk_helper_deferrable_immediate";
+      await client.query(
+        `ALTER TABLE helper_test_table ADD COLUMN ref_col_deferrable2 INT;`,
+      );
+
+      await helpers.addDeferrableForeignKey(
+        client,
+        "helper_test_table",
+        constraintName2,
+        "ref_col_deferrable2",
+        "helper_test_table_ref",
+        "ref_id",
+        "SET NULL",
+        false, // initiallyDeferred = false
+      );
+
+      const { rows: deferRows2 } = await client.query(
+        `SELECT c.conname, c.condeferrable, c.condeferred
+         FROM pg_constraint c
+         JOIN pg_class t ON c.conrelid = t.oid
+         WHERE c.conname = $1
+         AND t.relname = 'helper_test_table';`,
+        [constraintName2],
+      );
+
+      expect(deferRows2.length).toBe(1);
+      expect(deferRows2[0].condeferrable).toBe(true);
+      expect(deferRows2[0].condeferred).toBe(false);
+    });
+
+    test("addDeferrableForeignKey should not fail if constraint already exists", async () => {
+      const constraintName = "fk_helper_deferrable_existing";
+      await client.query(
+        `ALTER TABLE helper_test_table ADD COLUMN ref_col_deferrable_existing INT;`,
+      );
+
+      await client.query(`
+        ALTER TABLE helper_test_table 
+        ADD CONSTRAINT ${constraintName} 
+        FOREIGN KEY (ref_col_deferrable_existing) 
+        REFERENCES helper_test_table_ref(ref_id)
+        DEFERRABLE INITIALLY DEFERRED;
+      `);
+
+      expect(
+        helpers.addDeferrableForeignKey(
+          client,
+          "helper_test_table",
+          constraintName,
+          "ref_col_deferrable_existing",
+          "helper_test_table_ref",
+          "ref_id",
+        ),
+      ).resolves.toBeUndefined();
+    });
+
     test("addForeignKey should not fail if constraint already exists", async () => {
       const constraintName = "fk_helper_ref_existing";
       await client.query(
