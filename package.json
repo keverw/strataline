@@ -42,7 +42,6 @@
     "@types/pg": "^8.15.1",
     "@typescript-eslint/eslint-plugin": "^6.13.0",
     "@typescript-eslint/parser": "^6.13.0",
-    "embedded-postgres": "^17.4.0-beta.15",
     "eslint": "^8.55.0",
     "prettier": "^3.5.3",
     "tmp": "^0.2.3",
@@ -65,5 +64,9 @@
     "@embedded-postgres/linux-ppc64",
     "@embedded-postgres/linux-x64",
     "@embedded-postgres/windows-x64"
-  ]
+  ],
+  "dependencies": {
+    "get-port": "^7.1.0",
+    "embedded-postgres": "^17.4.0-beta.15"
+  }
 }

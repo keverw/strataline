@@ -660,6 +660,194 @@ CREATE TABLE IF NOT EXISTS migration_lock (
 
 The lock system ensures that only one `runSchemaChanges` process can execute at a time, preventing concurrent runs of the overall migration sequence and protecting schema integrity. Individual `runDataMigrationJobOnly` calls (used for batch processing in distributed mode) do **not** acquire this global lock, allowing multiple data migration jobs for the same migration ID to run in parallel.
 
+## Development and Test Database Instances Utilities
+
+Strataline provides utilities to spin up local PostgreSQL instances for development and testing.
+
+### Note for Bun Users (using `embedded-postgres`)
+
+Strataline's development and test database utilities leverage `embedded-postgres`. When using these utilities with Bun, you may encounter issues with native module resolution. To address this, Bun requires explicit trust for packages that use lifecycle scripts. Add the following to your `package.json`:
+
+```json
+"trustedDependencies": [
+  "@embedded-postgres/darwin-arm64",
+  "@embedded-postgres/darwin-x64",
+  "@embedded-postgres/linux-arm",
+  "@embedded-postgres/linux-arm64",
+  "@embedded-postgres/linux-ia32",
+  "@embedded-postgres/linux-ppc64",
+  "@embedded-postgres/linux-x64",
+  "@embedded-postgres/windows-x64"
+]
+```
+
+This ensures that Bun can correctly execute the necessary setup scripts for `embedded-postgres`.
+
+For more context, you can refer to this [GitHub issue](https://github.com/leinelissen/embedded-postgres/issues/13).
+
+### Test DB Instance
+
+This helper is intended for short-lived, non-persistent Postgres clusters used during integration or unit tests. It's fully disposable and automatically shuts down when your test script exits, making it ideal for isolated test environments.
+
+#### Overview
+
+This utility provides a simple way to spin up isolated PostgreSQL database instances for testing, with optional automatic migration application. It uses `embedded-postgres` to run PostgreSQL directly in your tests without external dependencies.
+
+#### Features
+
+- Creates temporary, isolated PostgreSQL instances
+- Optionally applies database migrations (Strataline compatible)
+- Provides connection pools and credentials
+- Supports database resets between tests
+- Configurable logging for both PostgreSQL and Strataline migrations
+- Works with or without migrations for maximum flexibility
+
+#### Usage
+
+```typescript
+import { TestDatabaseInstance, createTestDBConsoleLogger } from "strataline";
+import { migrations } from "./path/to/your/migrations";
+
+// Create a test database with migrations
+const testDb = new TestDatabaseInstance({
+  migrations, // Optional: provide your Strataline migrations
+});
+
+// Or create a database without migrations (just PostgreSQL)
+const testDbNoMigrations = new TestDatabaseInstance();
+
+// Or with all custom options
+const testDb = new TestDatabaseInstance({
+  port: 5432, // Optional: specific port (default: auto-assigned)
+  logger: customLogger, // Optional: custom logger function
+  user: "custom_user", // Optional: database username (default: 'test_user')
+  password: "custom_pwd", // Optional: database password (default: 'test_password')
+  databaseName: "custom", // Optional: database name (default: 'test_database')
+  migrations, // Optional: your Strataline migrations array
+});
+
+// Start the database (will create, start PostgreSQL, and apply migrations if provided)
+await testDb.start();
+
+// Get the database pool for queries
+const pool = testDb.getPool();
+
+// Or get connection credentials for direct connection
+const credentials = testDb.getCredentials();
+
+// Reset the database (drops all tables and reapplies migrations if provided)
+await testDb.reset();
+
+// Stop the database and clean up resources
+await testDb.stop();
+```
+
+#### Logging
+
+You can use the built-in console logger or implement your own:
+
+```typescript
+// Use the built-in console logger with options
+const testDb = new TestDatabaseInstance({
+  logger: createTestDBConsoleLogger(
+    true, // true enables verbose PostgreSQL logs
+    true, // true enables verbose migration logs
+  ),
+});
+
+// Or implement a custom logger
+const customLogger = (
+  type: "info" | "error" | "warn" | "pg" | "migrate",
+  message: string,
+) => {
+  // Custom logging implementation
+};
+```
+
+##### Migration Logging
+
+The TestDatabaseInstance automatically creates a Strataline-compatible logger adapter that works with or without a provided logger:
+
+- If you provide a logger, migration logs will be sent through your logger with the type 'migrate'
+- If you don't provide a logger, migrations will run silently with no logs
+
+When you provide a logger to TestDatabaseInstance, it will:
+
+1. Use that logger for its own operation logs (info, error, warn)
+2. Use that logger for PostgreSQL logs (pg)
+3. Automatically create an adapter to send Strataline migration logs through the same logger (migrate)
+
+This ensures all logs flow through a single logging interface, making it easy to direct logs to your preferred destination.
+
+#### Example in tests
+
+```typescript
+import { TestDatabaseInstance } from "strataline";
+import { migrations } from "./path/to/your/migrations";
+
+describe("Database Tests", () => {
+  let testDb: TestDatabaseInstance;
+
+  beforeAll(async () => {
+    testDb = new TestDatabaseInstance({
+      migrations, // Include your migrations
+    });
+
+    await testDb.start();
+  });
+
+  afterAll(async () => {
+    await testDb.stop();
+  });
+
+  beforeEach(async () => {
+    // Reset database before each test (reapplies migrations)
+    await testDb.reset();
+  });
+
+  it("should execute a query", async () => {
+    const pool = testDb.getPool();
+    const result = await pool.query("SELECT 1 as value");
+    expect(result.rows[0].value).toBe(1);
+  });
+});
+
+// Example without migrations (just PostgreSQL)
+describe("Simple Database Tests", () => {
+  let testDb: TestDatabaseInstance;
+
+  beforeAll(async () => {
+    testDb = new TestDatabaseInstance(); // No migrations
+    await testDb.start();
+  });
+
+  afterAll(async () => {
+    await testDb.stop();
+  });
+
+  it("should work without migrations", async () => {
+    const pool = testDb.getPool();
+    const result = await pool.query("SELECT 1 as value");
+    expect(result.rows[0].value).toBe(1);
+  });
+});
+```
+
+### Local Dev Server
+
+This helper runs a **persistent local PostgreSQL server** in a standalone script, perfect for development environments where you want a real database running alongside your app.
+
+It uses the same embedded PostgreSQL binaries as Strataline's Test DB Instance, so there's **no need to install Postgres manually** or run Docker. No `brew`, no `apt`, no containers, just run `bun run dev:db` and go.
+
+Unlike test instances, the dev server is designed to **persist data between restarts**. That means you can keep your seeded content, local accounts, and data intact between sessions—making it especially useful when developing or demoing your app.
+
+This setup is great for:
+
+- Running your app locally with a real, stateful database
+- Testing workflows without needing to re-seed every time
+- Building or demoing features against consistent local data
+
+The server handles startup, cleanup, and optional role/database creation automatically.
 ## Development
 
 Strataline is built with TypeScript and uses modern JavaScript features.
