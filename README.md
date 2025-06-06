@@ -1,4 +1,4 @@
-# Strataline v1.1.0
+# Strataline v1.2.0
 
 [![npm version](https://badge.fury.io/js/strataline.svg)](https://badge.fury.io/js/strataline)
 
@@ -13,6 +13,7 @@ The name **Strataline** comes from:
 
 <!-- toc -->
 
+- [Table of Contents](#table-of-contents)
 - [Key Features](#key-features)
 - [Installation](#installation)
 - [Basic Usage](#basic-usage)
