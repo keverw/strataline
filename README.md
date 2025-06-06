@@ -9,6 +9,49 @@ The name **Strataline** comes from:
 - **Strata**: representing the _layers_ of a database migration—schema changes, data backfills, and cleanup steps
 - **Line**: reflecting the _path or flow_ each migration takes, whether inline or across distributed systems
 
+## Table of Contents
+
+<!-- toc -->
+
+- [Key Features](#key-features)
+- [Installation](#installation)
+- [Basic Usage](#basic-usage)
+  - [Job Mode (Single Machine)](#job-mode-single-machine)
+  - [Distributed Mode (Orchestrated)](#distributed-mode-orchestrated)
+- [Creating a Migration Script](#creating-a-migration-script)
+- [Architecture](#architecture)
+  - [Job Mode](#job-mode)
+  - [Distributed Mode](#distributed-mode)
+- [Backpressure Handling](#backpressure-handling)
+- [Logging & Schema Helpers](#logging--schema-helpers)
+  - [Logging](#logging)
+    - [Logger Module](#logger-module)
+      - [Creating Custom Loggers](#creating-custom-loggers)
+  - [Schema Helpers](#schema-helpers)
+- [Database Tables](#database-tables)
+  - [migration_status](#migration_status)
+  - [migration_lock](#migration_lock)
+- [Development and Test Database Instances Utilities](#development-and-test-database-instances-utilities)
+  - [Note for Bun Users (using `embedded-postgres`)](#note-for-bun-users-using-embedded-postgres)
+  - [Test DB Instance](#test-db-instance)
+    - [Overview](#overview)
+    - [Features](#features)
+    - [Usage](#usage)
+    - [Logging](#logging-1)
+      - [Migration Logging](#migration-logging)
+    - [Example in tests](#example-in-tests)
+  - [Local Dev DB Server](#local-dev-db-server)
+    - [Setting Up a Dev Database Script](#setting-up-a-dev-database-script)
+    - [Configuration Options](#configuration-options)
+    - [Logging](#logging-2)
+    - [Data Persistence](#data-persistence)
+    - [Process Management](#process-management)
+    - [Using with Your Application](#using-with-your-application)
+    - [Git Configuration](#git-configuration)
+- [Development](#development)
+
+<!-- tocstop -->
+
 ## Key Features
 
 - **Phased Migration Approach**: Each migration is separated into three distinct phases:
