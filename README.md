@@ -1,4 +1,4 @@
-# Strataline v1.2.0
+# Strataline v1.2.1
 
 [![npm version](https://badge.fury.io/js/strataline.svg)](https://badge.fury.io/js/strataline)
 
@@ -35,7 +35,6 @@ The name **Strataline** comes from:
 - [Development and Test Database Instances Utilities](#development-and-test-database-instances-utilities)
   - [Note for Bun Users (using `embedded-postgres`)](#note-for-bun-users-using-embedded-postgres)
   - [Test DB Instance](#test-db-instance)
-    - [Overview](#overview)
     - [Features](#features)
     - [Usage](#usage)
     - [Logging](#logging-1)
@@ -731,11 +730,7 @@ For more context, you can refer to this [GitHub issue](https://github.com/leinel
 
 ### Test DB Instance
 
-This helper is intended for short-lived, non-persistent Postgres clusters used during integration or unit tests. It's fully disposable and automatically shuts down when your test script exits, making it ideal for isolated test environments.
-
-#### Overview
-
-This utility provides a simple way to spin up isolated PostgreSQL database instances for testing, with optional automatic migration application. It uses `embedded-postgres` to run PostgreSQL directly in your tests without external dependencies.
+This helper creates short-lived, non-persistent Postgres clusters for testing purposes. It provides isolated database instances that automatically shut down when tests complete, with optional migration application. Using `embedded-postgres`, it runs PostgreSQL directly in your test environment without external dependencies, making it ideal for integration and unit tests.
 
 #### Features
 
