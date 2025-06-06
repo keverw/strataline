@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { TestDatabaseInstance } from "./test-db-instance";
+import {
+  TestDatabaseInstance,
+  createTestDBConsoleLogger,
+} from "./test-db-instance";
 import { Migration } from "strataline";
 
 describe("TestDatabaseInstance", () => {
@@ -204,6 +207,135 @@ describe("TestDatabaseInstance", () => {
       `);
       expect(result.rows.length).toBe(1);
       expect(result.rows[0].table_name).toBe("test_table");
+    }
+  });
+});
+
+describe("createTestDBConsoleLogger", () => {
+  it("should create a logger function", () => {
+    const logger = createTestDBConsoleLogger();
+    expect(typeof logger).toBe("function");
+  });
+
+  it("should handle different log types with console output captured", () => {
+    // Capture console output to prevent test noise
+    const originalLog = console.log;
+    const originalError = console.error;
+    const originalWarn = console.warn;
+
+    const logCalls: string[] = [];
+    const errorCalls: string[] = [];
+    const warnCalls: string[] = [];
+
+    // Replace console methods to capture output silently
+    console.log = (message: string) => logCalls.push(message);
+    console.error = (message: string) => errorCalls.push(message);
+    console.warn = (message: string) => warnCalls.push(message);
+
+    try {
+      const logger = createTestDBConsoleLogger(false, false); // Silent mode for pg and migrate
+
+      // Test all log types
+      logger("info", "Test info message");
+      logger("error", "Test error message");
+      logger("warn", "Test warning message");
+      logger("pg", "Test PostgreSQL message");
+      logger("migrate", "Test migration message");
+
+      // Verify the console methods were called appropriately
+      expect(logCalls).toContain("Test info message");
+      expect(errorCalls).toContain("Test error message");
+      expect(warnCalls).toContain("Test warning message");
+      // pg and migrate messages should not be logged in silent mode
+      expect(logCalls).not.toContain("[PG] Test PostgreSQL message");
+      expect(logCalls).not.toContain("[MIGRATE] Test migration message");
+    } finally {
+      // Restore original console methods
+      console.log = originalLog;
+      console.error = originalError;
+      console.warn = originalWarn;
+    }
+  });
+
+  it("should log pg messages when pgVerbose is true", () => {
+    // Capture console output
+    const originalLog = console.log;
+    const logCalls: string[] = [];
+    console.log = (message: string) => logCalls.push(message);
+
+    try {
+      const logger = createTestDBConsoleLogger(true, false); // pg verbose, migrate silent
+
+      logger("pg", "Test PostgreSQL message");
+      logger("migrate", "Test migration message");
+
+      // pg message should be logged with prefix
+      expect(logCalls).toContain("[PG] Test PostgreSQL message");
+      // migrate message should not be logged
+      expect(logCalls).not.toContain("[MIGRATE] Test migration message");
+    } finally {
+      console.log = originalLog;
+    }
+  });
+
+  it("should log migrate messages when migrateVerbose is true", () => {
+    // Capture console output
+    const originalLog = console.log;
+    const logCalls: string[] = [];
+    console.log = (message: string) => logCalls.push(message);
+
+    try {
+      const logger = createTestDBConsoleLogger(false, true); // pg silent, migrate verbose
+
+      logger("pg", "Test PostgreSQL message");
+      logger("migrate", "Test migration message");
+
+      // pg message should not be logged
+      expect(logCalls).not.toContain("[PG] Test PostgreSQL message");
+      // migrate message should be logged with prefix
+      expect(logCalls).toContain("[MIGRATE] Test migration message");
+    } finally {
+      console.log = originalLog;
+    }
+  });
+
+  it("should log both pg and migrate messages when both verbose flags are true", () => {
+    // Capture console output
+    const originalLog = console.log;
+    const logCalls: string[] = [];
+    console.log = (message: string) => logCalls.push(message);
+
+    try {
+      const logger = createTestDBConsoleLogger(true, true); // both verbose
+
+      logger("pg", "Test PostgreSQL message");
+      logger("migrate", "Test migration message");
+
+      // Both messages should be logged with prefixes
+      expect(logCalls).toContain("[PG] Test PostgreSQL message");
+      expect(logCalls).toContain("[MIGRATE] Test migration message");
+    } finally {
+      console.log = originalLog;
+    }
+  });
+
+  it("should use default verbose settings when no parameters provided", () => {
+    // Capture console output
+    const originalLog = console.log;
+    const logCalls: string[] = [];
+    console.log = (message: string) => logCalls.push(message);
+
+    try {
+      const logger = createTestDBConsoleLogger(); // defaults: pgVerbose=false, migrateVerbose=true
+
+      logger("pg", "Test PostgreSQL message");
+      logger("migrate", "Test migration message");
+
+      // pg should not be logged (default false), migrate should be logged (default true)
+      expect(logCalls).not.toContain("[PG] Test PostgreSQL message");
+      expect(logCalls).toContain("[MIGRATE] Test migration message");
+    } finally {
+      console.log = originalLog;
     }
   });
 });

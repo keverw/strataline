@@ -44,7 +44,6 @@
     "@typescript-eslint/parser": "^6.13.0",
     "eslint": "^8.55.0",
     "prettier": "^3.5.3",
-    "tmp": "^0.2.3",
     "@types/tmp": "^0.2.6",
     "tsup": "^8.4.0",
     "typescript": "^5.3.0"
@@ -67,6 +66,7 @@
   ],
   "dependencies": {
     "get-port": "^7.1.0",
-    "embedded-postgres": "^17.4.0-beta.15"
+    "embedded-postgres": "^17.4.0-beta.15",
+    "tmp": "^0.2.3"
   }
 }

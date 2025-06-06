@@ -26,7 +26,7 @@ export interface Migration<TPayload = Record<string, any>, TReturn = any> {
   description: string;
 
   // Schema changes before data migration - runs in a transaction
-  beforeSchema?: (client: PoolClient, helpers?: SchemaHelpers) => Promise<void>;
+  beforeSchema?: (client: PoolClient, helpers: SchemaHelpers) => Promise<void>;
 
   // Data migration - runs separately with explicit completion and defer callbacks
   // The migration should call ctx.complete() when it's done, or ctx.defer() if it needs to be paused
@@ -46,7 +46,7 @@ export interface Migration<TPayload = Record<string, any>, TReturn = any> {
   ) => Promise<void>; // Migration function itself still returns Promise<void>, data is passed via complete()
 
   // Schema changes after data migration - runs in a transaction
-  afterSchema?: (client: PoolClient, helpers?: SchemaHelpers) => Promise<void>;
+  afterSchema?: (client: PoolClient, helpers: SchemaHelpers) => Promise<void>;
 }
 
 // Migration status tracking

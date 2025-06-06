@@ -5,6 +5,7 @@ import {
   BaseLogger,
   LogDataInput,
 } from "../logger";
+// @ts-ignore - moduleResolution setting prevents TypeScript from finding embedded-postgres types
 import EmbeddedPostgres from "embedded-postgres";
 import * as tmp from "tmp";
 import getPort from "get-port";
@@ -16,9 +17,9 @@ const DEFAULT_DB_PASSWORD = "test_password";
 const DEFAULT_DB_NAME = "test_database";
 
 /**
- * Logger function type
+ * Logger function type for TestDatabaseInstance
  */
-export type LoggerFunction = (
+export type TestDBLoggerFunction = (
   type: "info" | "error" | "warn" | "pg" | "migrate",
   message: string,
 ) => void;
@@ -31,7 +32,7 @@ export type LoggerFunction = (
 export const createTestDBConsoleLogger = (
   pgVerbose: boolean = false,
   migrateVerbose: boolean = true,
-): LoggerFunction => {
+): TestDBLoggerFunction => {
   return (type, message) => {
     switch (type) {
       case "info":
@@ -58,14 +59,14 @@ export const createTestDBConsoleLogger = (
 };
 
 /**
- * Adapter that converts our LoggerFunction to a Strataline Logger
+ * Adapter that converts our TestDBLoggerFunction to a Strataline Logger
  * This is used internally by TestDatabaseInstance
  * @internal
  */
 class TestDBStratalineLogger extends BaseLogger implements StratalineLogger {
-  private testDbLogger?: LoggerFunction;
+  private testDbLogger?: TestDBLoggerFunction;
 
-  constructor(logger?: LoggerFunction) {
+  constructor(logger?: TestDBLoggerFunction) {
     super();
     this.testDbLogger = logger;
   }
@@ -109,7 +110,7 @@ class TestDBStratalineLogger extends BaseLogger implements StratalineLogger {
  */
 interface TestDatabaseOptions {
   port?: number;
-  logger?: LoggerFunction;
+  logger?: TestDBLoggerFunction;
   user?: string;
   password?: string;
   databaseName?: string;
@@ -125,7 +126,7 @@ export class TestDatabaseInstance {
   private migrationsApplied: boolean = false;
   private tempDir?: string;
   private port: number;
-  private logger?: LoggerFunction;
+  private logger?: TestDBLoggerFunction;
   private user: string;
   private password: string;
   private databaseName: string;
@@ -210,7 +211,7 @@ export class TestDatabaseInstance {
         password: this.password,
         persistent: false, // Don't persist data between test runs
         databaseDir: this.tempDir,
-        onLog: (message) => {
+        onLog: (message: string) => {
           this.log("pg", message);
         },
       });

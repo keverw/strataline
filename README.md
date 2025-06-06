@@ -755,12 +755,13 @@ const testDb = new TestDatabaseInstance({
   ),
 });
 
-// Or implement a custom logger
+// Or implement your own logger
 const customLogger = (
   type: "info" | "error" | "warn" | "pg" | "migrate",
   message: string,
 ) => {
-  // Custom logging implementation
+  // Types: info/error/warn (general), pg (PostgreSQL server), migrate (Strataline migrations)
+  console.log(`[${type.toUpperCase()}] ${message}`);
 };
 ```
 
@@ -833,11 +834,16 @@ describe("Simple Database Tests", () => {
 });
 ```
 
-### Local Dev Server
+### Local Dev DB Server
 
 This helper runs a **persistent local PostgreSQL server** in a standalone script, perfect for development environments where you want a real database running alongside your app.
 
 It uses the same embedded PostgreSQL binaries as Strataline's Test DB Instance, so there's **no need to install Postgres manually** or run Docker. No `brew`, no `apt`, no containers, just run `bun run dev:db` and go.
+
+- **For local development, you do _not_ need to install PostgreSQL manually.**
+- The dev database server (`bun run dev:db`) uses [@embedded-postgres](https://www.npmjs.com/package/@embedded-postgres) to provide platform-specific PostgreSQL 17 binaries via npm.
+- _Note: The embedded dev database does **not** bundle `pg_upgrade`. If we bump the embedded version in the future, you may need to delete your local data directory (`pgdata/`) and let it reinitialize. This is usually fine for dev/test workflows._
+- **Production deployments** still require a managed PostgreSQL 17+ instance, and upgrades must be handled manually by your ops team.
 
 Unlike test instances, the dev server is designed to **persist data between restarts**. That means you can keep your seeded content, local accounts, and data intact between sessions—making it especially useful when developing or demoing your app.
 
@@ -847,7 +853,163 @@ This setup is great for:
 - Testing workflows without needing to re-seed every time
 - Building or demoing features against consistent local data
 
-The server handles startup, cleanup, and optional role/database creation automatically.
+The server handles startup, cleanup, and automatically creates the specified user, password, and database combination for you.
+
+#### Setting Up a Dev Database Script
+
+Create a script to run your local development database server:
+
+```typescript
+// scripts/dev-db.ts
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
+import { LocalDevDBServer, createDevDBConsoleLogger } from "strataline";
+
+// Calculate paths relative to the current script
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const DATA_DIR = join(__dirname, "..", "pgdata");
+const PID_FILE = join(__dirname, "..", ".pg_pid");
+
+// Create and start the PostgreSQL server
+const server = new LocalDevDBServer({
+  port: 5433,
+  user: "myapp_user",
+  password: "myapp_pass",
+  database: "myapp_dev",
+  dataDir: DATA_DIR,
+  pidFile: PID_FILE,
+  logger: createDevDBConsoleLogger(), // Optional: remove this line to run silently
+});
+
+server.start().catch((error) => {
+  console.error(`Fatal error: ${error}`);
+  server.cleanup(1);
+});
+```
+
+Add the script to your `package.json`:
+
+```json
+{
+  "scripts": {
+    "dev:db": "bun run scripts/dev-db.ts"
+  }
+}
+```
+
+Then start your development database:
+
+```bash
+bun run dev:db
+```
+
+#### Configuration Options
+
+The `LocalDevDBServer` accepts the following configuration:
+
+```typescript
+const server = new LocalDevDBServer({
+  port: 5433, // PostgreSQL port (default: 5432)
+  user: "myapp_user", // Database user to create automatically
+  password: "myapp_pass", // Password for the database user
+  database: "myapp_dev", // Database name to create automatically
+  dataDir: "./pgdata", // Directory to store PostgreSQL data
+  pidFile: "./.pg_pid", // File to store the PostgreSQL process ID
+  logger: customLogger, // Optional: custom logger function
+  onExit: (exitCode) => process.exit(exitCode), // Optional: custom exit handler
+});
+```
+
+**Note:** The server automatically creates the specified user, password, and database during startup. You don't need to create these manually - just specify the credentials you want to use and the server will set them up for you.
+
+**Exit Handling:** By default, the server calls `process.exit()` when it needs to terminate (e.g., when the PostgreSQL process exits or during cleanup). For testing or custom scenarios, you can provide an `onExit` callback to handle termination differently.
+
+#### Logging
+
+You can customize logging behavior using the built-in console logger:
+
+```typescript
+import { createDevDBConsoleLogger } from "strataline";
+
+// Create a logger with custom verbosity settings
+const logger = createDevDBConsoleLogger(
+  true, // pgVerbose: show PostgreSQL server logs
+  true, // setupVerbose: show setup/initialization logs
+);
+
+// Or implement your own logger
+const customLogger = (
+  type: "info" | "error" | "warn" | "pg" | "setup",
+  message: string,
+) => {
+  // Types: info/error/warn (general), pg (PostgreSQL server), setup (initialization)
+  console.log(`[${type.toUpperCase()}] ${message}`);
+};
+```
+
+#### Data Persistence
+
+The dev server creates a persistent data directory (e.g., `pgdata/`) that maintains your database state between restarts. This means:
+
+- Your tables, data, and schema changes persist across server restarts
+- You can seed data once and keep it for development sessions
+- Database migrations applied during development remain in place
+
+To start fresh, simply delete the data directory and restart the server:
+
+```bash
+rm -rf pgdata/
+bun run dev:db
+```
+
+#### Process Management
+
+The dev server includes robust process management:
+
+- **Automatic cleanup**: Handles graceful shutdown on `Ctrl+C` or process termination
+- **Stale process detection**: Automatically cleans up any existing PostgreSQL processes on startup
+- **PID file management**: Tracks the server process ID for reliable cleanup
+- **Signal handling**: Responds to `SIGINT`, `SIGTERM`, and `SIGHUP` signals
+
+#### Using with Your Application
+
+Once the dev server is running, configure your application to connect to it:
+
+```typescript
+// In your application code
+import { Pool } from "pg";
+
+const pool = new Pool({
+  host: "localhost",
+  port: 5433, // Match your dev server port
+  user: "myapp_user", // Match your dev server user
+  password: "myapp_pass", // Match your dev server password
+  database: "myapp_dev", // Match your dev server database
+});
+```
+
+Or using a connection string:
+
+```typescript
+const pool = new Pool({
+  connectionString:
+    "postgresql://myapp_user:myapp_pass@localhost:5433/myapp_dev",
+});
+```
+
+This approach gives you a real PostgreSQL instance for development without the overhead of Docker or manual PostgreSQL installation, while maintaining data persistence for a smooth development experience.
+
+#### Git Configuration
+
+Add the following to your `.gitignore` to exclude the PostgreSQL data directory and PID file from version control:
+
+```gitignore
+# PostgreSQL data directory and PID file - for local development
+/pgdata
+.pg_pid
+```
+
 ## Development
 
 Strataline is built with TypeScript and uses modern JavaScript features.
