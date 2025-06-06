@@ -1,6 +1,6 @@
 {
   "name": "strataline",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "A structured migration runner for PostgreSQL that treats database changes as layered, resumable operations",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -51,9 +51,6 @@
   },
   "peerDependencies": {
     "pg": "^8.15.6"
-  },
-  "engines": {
-    "bun": ">=1.0.0"
   },
   "trustedDependencies": [
     "@embedded-postgres/darwin-arm64",
