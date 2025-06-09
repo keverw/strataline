@@ -1,6 +1,4 @@
 import { spawn } from "child_process";
-// Note: Keep sync fs operations for cleanup/exit scenarios where async operations might not complete
-import { existsSync, unlinkSync } from "fs";
 import { access, writeFile, readFile, unlink, mkdir } from "fs/promises";
 import { constants } from "fs";
 import { join } from "path";
@@ -90,6 +88,12 @@ export class LocalDevDBServer {
   // Track if we're in a graceful shutdown to avoid exit code conflicts
   private isGracefulShutdown: boolean = false;
 
+  // Track if cleanup is already in progress to prevent multiple cleanup calls
+  private isCleaningUp: boolean = false;
+
+  // Keep-alive interval to prevent Node.js from exiting while we wait for PostgreSQL
+  private keepAliveInterval: NodeJS.Timeout | null = null;
+
   /**
    * Creates a new PostgresDevServer instance.
    *
@@ -146,29 +150,82 @@ export class LocalDevDBServer {
   }
 
   /**
+   * Clean up keep-alive interval and exit
+   * @param exitCode Exit code to use
+   */
+  private cleanupAndExit(exitCode: number): void {
+    if (this.keepAliveInterval) {
+      clearInterval(this.keepAliveInterval);
+      this.keepAliveInterval = null;
+    }
+
+    this.handleExit(exitCode);
+  }
+
+  /**
+   * Handle graceful shutdown by forwarding the signal to PostgreSQL
+   */
+  private handleGracefulShutdown(): void {
+    if (this.isCleaningUp) return;
+    this.isCleaningUp = true;
+
+    this.log("info", "\nShutting down PostgreSQL server...");
+
+    if (this.pgProcess && this.pgProcess.pid) {
+      // Start keep-alive interval to prevent Node.js from exiting
+      this.keepAliveInterval = setInterval(() => {
+        // This keeps the event loop alive while we wait for PostgreSQL
+      }, 1000);
+
+      // Forward SIGTERM to PostgreSQL for graceful shutdown
+      this.pgProcess.kill("SIGTERM");
+
+      // Set a reasonable timeout to prevent hanging forever
+      setTimeout(() => {
+        if (this.pgProcess && this.pgProcess.pid) {
+          this.pgProcess.kill("SIGKILL");
+        }
+
+        // Give it a moment to die, then exit
+        setTimeout(() => {
+          this.cleanupAndExit(0);
+        }, 1000);
+      }, 10000); // 10 second timeout
+
+      // PostgreSQL will exit gracefully, and our close handler will call cleanupAndExit(0)
+    } else {
+      // No PostgreSQL process, exit immediately
+      this.cleanupAndExit(0);
+    }
+  }
+
+  /**
    * Registers process signal handlers to ensure proper cleanup.
    */
   private registerSignalHandlers(): void {
+    // Remove any existing SIGINT handlers to ensure we have full control
+    process.removeAllListeners("SIGINT");
+
     // Set up signal handlers for graceful shutdown
-    // User-initiated shutdowns (SIGINT/Ctrl+C, SIGTERM, SIGHUP) should exit with success code
     process.on("SIGINT", () => {
       this.isGracefulShutdown = true;
-      this.cleanup(0);
+      this.handleGracefulShutdown();
     });
 
     process.on("SIGTERM", () => {
       this.isGracefulShutdown = true;
-      this.cleanup(0);
+      this.handleGracefulShutdown();
     });
 
     process.on("SIGHUP", () => {
       this.isGracefulShutdown = true;
-      this.cleanup(0);
+      this.handleGracefulShutdown();
     });
 
     process.on("uncaughtException", (err) => {
+      if (this.isCleaningUp) return;
       this.log("error", `Uncaught exception: ${err}`);
-      this.cleanup(1);
+      process.exit(1);
     });
 
     // Additional handlers to ensure cleanup when process exits
@@ -186,8 +243,6 @@ export class LocalDevDBServer {
         }
       }
     });
-
-    process.on("beforeExit", () => this.cleanup());
   }
 
   /**
@@ -319,66 +374,11 @@ export class LocalDevDBServer {
   }
 
   /**
-   * Handles graceful shutdown of the PostgreSQL server.
-   *
-   * Note: This method is intentionally synchronous and uses sync fs operations
-   * because it's called during process exit where async operations might not complete.
-   *
-   * @param exitCode Exit code to use when terminating the process (default: 0)
+   * Stops the PostgreSQL server gracefully.
    */
 
-  public cleanup(exitCode = 0): void {
-    this.log("info", "\nShutting down PostgreSQL server...");
-
-    if (this.pgProcess) {
-      const pid = this.pgProcess.pid;
-
-      // Try graceful shutdown first
-      this.pgProcess.kill("SIGTERM");
-
-      // Give it a moment to shut down
-      setTimeout(() => {
-        // Force kill if still running
-        if (this.pgProcess && pid && this.isProcessRunning(pid)) {
-          try {
-            this.log(
-              "setup",
-              "PostgreSQL server still running, force killing...",
-            );
-            this.pgProcess.kill("SIGKILL");
-
-            // Double-check with direct process kill
-            if (pid && this.isProcessRunning(pid)) {
-              this.killProcess(pid, "SIGKILL");
-            }
-          } catch (e) {
-            // Process might already be gone
-          }
-        }
-
-        // Clean up PID file
-        if (existsSync(this.pidFile)) {
-          try {
-            unlinkSync(this.pidFile);
-          } catch (e) {
-            // File might already be gone
-          }
-        }
-
-        this.handleExit(exitCode);
-      }, 3000);
-    } else {
-      // Clean up PID file
-      if (existsSync(this.pidFile)) {
-        try {
-          unlinkSync(this.pidFile);
-        } catch (e) {
-          // File might already be gone
-        }
-      }
-
-      this.handleExit(exitCode);
-    }
+  public async stop(): Promise<void> {
+    this.handleGracefulShutdown();
   }
 
   /**
@@ -541,17 +541,13 @@ export class LocalDevDBServer {
   private async startPostgresServer(): Promise<void> {
     this.log("setup", "Starting PostgreSQL server...");
 
-    // Use setsid with negative value to ensure the process is in the same process group
-    // This ensures it will be terminated when the parent process exits
+    // Start PostgreSQL as a proper child process
     this.pgProcess = spawn(
-      "bash",
-      [
-        "-c",
-        `exec "${this.pgBinaries!.postgres}" -D "${this.pgDataDir}" -p ${this.pgPort}`,
-      ],
+      this.pgBinaries!.postgres,
+      ["-D", this.pgDataDir, "-p", this.pgPort.toString()],
       {
         stdio: "pipe", // Always use pipe to capture output
-        detached: false, // Ensure process is not detached
+        detached: false, // Keep as child process so it dies when parent dies
       },
     );
 
@@ -583,25 +579,20 @@ export class LocalDevDBServer {
     }
 
     // Set up process close handler
-    this.pgProcess.on("close", (code) => {
+    this.pgProcess.on("close", async (code) => {
       this.log("setup", `PostgreSQL server process exited with code ${code}`);
 
-      // Clean up PID file (using sync operations since this is a process exit callback)
-      if (existsSync(this.pidFile)) {
-        try {
-          unlinkSync(this.pidFile);
-        } catch (e) {
-          // File might already be gone
-        }
+      // Clean up PID file
+      try {
+        await unlink(this.pidFile);
+      } catch (e) {
+        // File might already be gone, ignore error
       }
 
       this.pgProcess = null;
 
-      // If we're in a graceful shutdown and PostgreSQL exited with 130 (SIGINT),
-      // convert it to success code 0. This prevents user-initiated shutdowns (Ctrl+C)
-      // from reporting error codes while preserving other actual error codes.
-      const exitCode = this.isGracefulShutdown && code === 130 ? 0 : code || 0;
-      this.handleExit(exitCode);
+      // Forward the exit code from PG
+      this.cleanupAndExit(code as number);
     });
   }
 
@@ -779,15 +770,7 @@ export class LocalDevDBServer {
       this.log("info", "Press Ctrl+C to stop the server");
     } catch (error) {
       this.log("error", `Error starting PostgreSQL server: ${error}`);
-      this.cleanup(1);
+      process.exit(1);
     }
-  }
-
-  /**
-   * Stops the PostgreSQL server.
-   */
-  public async stop(): Promise<void> {
-    this.isGracefulShutdown = true;
-    this.cleanup(0);
   }
 }

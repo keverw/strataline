@@ -18,6 +18,7 @@
   "scripts": {
     "build": "bun run update-readme && tsup",
     "dev": "tsup --watch",
+    "dev:db": "bun run scripts/dev-db.ts",
     "test": "bun test",
     "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,css,scss,md,html}\"",
     "lint": "eslint src --ext .ts",

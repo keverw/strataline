@@ -923,7 +923,7 @@ const server = new LocalDevDBServer({
 
 server.start().catch((error) => {
   console.error(`Fatal error: ${error}`);
-  server.cleanup(1);
+  process.exit(1);
 });
 ```
 
