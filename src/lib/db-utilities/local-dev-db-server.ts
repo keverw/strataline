@@ -56,10 +56,6 @@ export const createDevDBConsoleLogger = (
 };
 
 /**
- * PostgresDevServer class for managing a local PostgreSQL server for development.
- * This class handles initialization, starting, and proper termination of a PostgreSQL server.
- */
-/**
  * Helper function to check if a file exists (async equivalent of existsSync)
  */
 async function fileExists(path: string): Promise<boolean> {
@@ -70,6 +66,11 @@ async function fileExists(path: string): Promise<boolean> {
     return false;
   }
 }
+
+/**
+ * LocalDevDBServer class for managing a local PostgreSQL server for development.
+ * This class handles initialization, starting, and proper termination of a PostgreSQL server.
+ */
 
 export class LocalDevDBServer {
   // Configuration properties
@@ -85,6 +86,9 @@ export class LocalDevDBServer {
 
   // Process reference
   private pgProcess: ReturnType<typeof spawn> | null = null;
+
+  // Track if we're in a graceful shutdown to avoid exit code conflicts
+  private isGracefulShutdown: boolean = false;
 
   /**
    * Creates a new PostgresDevServer instance.
@@ -146,9 +150,22 @@ export class LocalDevDBServer {
    */
   private registerSignalHandlers(): void {
     // Set up signal handlers for graceful shutdown
-    process.on("SIGINT", () => this.cleanup());
-    process.on("SIGTERM", () => this.cleanup());
-    process.on("SIGHUP", () => this.cleanup()); // Add SIGHUP handler for terminal close
+    // User-initiated shutdowns (SIGINT/Ctrl+C, SIGTERM, SIGHUP) should exit with success code
+    process.on("SIGINT", () => {
+      this.isGracefulShutdown = true;
+      this.cleanup(0);
+    });
+
+    process.on("SIGTERM", () => {
+      this.isGracefulShutdown = true;
+      this.cleanup(0);
+    });
+
+    process.on("SIGHUP", () => {
+      this.isGracefulShutdown = true;
+      this.cleanup(0);
+    });
+
     process.on("uncaughtException", (err) => {
       this.log("error", `Uncaught exception: ${err}`);
       this.cleanup(1);
@@ -579,7 +596,12 @@ export class LocalDevDBServer {
       }
 
       this.pgProcess = null;
-      this.handleExit(code || 0);
+
+      // If we're in a graceful shutdown and PostgreSQL exited with 130 (SIGINT),
+      // convert it to success code 0. This prevents user-initiated shutdowns (Ctrl+C)
+      // from reporting error codes while preserving other actual error codes.
+      const exitCode = this.isGracefulShutdown && code === 130 ? 0 : code || 0;
+      this.handleExit(exitCode);
     });
   }
 
@@ -765,6 +787,7 @@ export class LocalDevDBServer {
    * Stops the PostgreSQL server.
    */
   public async stop(): Promise<void> {
+    this.isGracefulShutdown = true;
     this.cleanup(0);
   }
 }

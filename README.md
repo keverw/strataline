@@ -1,4 +1,4 @@
-# Strataline v1.2.2
+# Strataline v1.2.3
 
 [![npm version](https://badge.fury.io/js/strataline.svg)](https://badge.fury.io/js/strataline)
 
