@@ -591,8 +591,9 @@ export class LocalDevDBServer {
 
       this.pgProcess = null;
 
-      // Forward the exit code from PG
-      this.cleanupAndExit(code as number);
+      // Forward the exit code from PG, default to 1 if not a number
+      const exitCode = typeof code === "number" ? code : 1;
+      this.cleanupAndExit(exitCode);
     });
   }
 
