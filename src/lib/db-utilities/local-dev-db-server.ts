@@ -2,6 +2,7 @@ import { spawn } from "child_process";
 import { access, writeFile, readFile, unlink, mkdir } from "fs/promises";
 import { constants } from "fs";
 import { join } from "path";
+import { userInfo } from "os";
 import { Client } from "pg";
 import { PostgresBinaries, getBinaries } from "./pg-bin-helper";
 
@@ -66,6 +67,29 @@ async function fileExists(path: string): Promise<boolean> {
 }
 
 /**
+ * Get current OS user in a cross-platform way
+ */
+function getCurrentUser(): string {
+  // on Unix: USER, on Windows: USERNAME, else os.userInfo()
+  const candidates = [
+    process.env.USER,
+    process.env.USERNAME,
+    userInfo().username,
+    "postgres", // final fallback
+  ];
+
+  // pick the first non-empty value
+  for (const name of candidates) {
+    if (name) {
+      return name;
+    }
+  }
+
+  // should never get here, but TS wants a return
+  return "postgres";
+}
+
+/**
  * LocalDevDBServer class for managing a local PostgreSQL server for development.
  * This class handles initialization, starting, and proper termination of a PostgreSQL server.
  */
@@ -82,6 +106,7 @@ export class LocalDevDBServer {
   private logger?: DevDBLoggerFunction;
   private onExit?: DevDBExitHandler;
   private logConnections: boolean;
+  private currentUser: string;
 
   // Process reference
   private pgProcess: ReturnType<typeof spawn> | null = null;
@@ -118,6 +143,7 @@ export class LocalDevDBServer {
     this.logger = config.logger;
     this.onExit = config.onExit;
     this.logConnections = config.logConnections ?? false;
+    this.currentUser = getCurrentUser();
 
     // Register signal handlers
     this.registerSignalHandlers();
@@ -617,7 +643,7 @@ export class LocalDevDBServer {
     while (!serverReady && attempts < maxAttempts) {
       try {
         // Try to make a single connection test using our optimized client method
-        const currentUser = process.env.USER || "postgres";
+        const currentUser = this.currentUser;
         const client = await this.createClient(currentUser, "postgres");
 
         await client.query("SELECT 1");
@@ -654,7 +680,7 @@ export class LocalDevDBServer {
    */
   private async setupUsersAndDatabases(): Promise<void> {
     // Get the current system user
-    const currentUser = process.env.USER || "postgres";
+    const currentUser = this.currentUser;
 
     // Connect as the current system user initially to set up postgres superuser
     let client = await this.createClient(currentUser, "postgres");
@@ -735,6 +761,11 @@ export class LocalDevDBServer {
    * Starts the PostgreSQL server and sets up users and databases.
    */
   public async start(): Promise<void> {
+    if (this.pgProcess) {
+      this.log("warn", "PostgreSQL is already running, skipping start()");
+      return;
+    }
+
     this.pgBinaries = await getBinaries();
 
     this.log("setup", `Using PostgreSQL binaries: ${this.pgBinaries.postgres}`);
