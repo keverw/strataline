@@ -957,6 +957,7 @@ const server = new LocalDevDBServer({
   pidFile: "./.pg_pid", // File to store the PostgreSQL process ID
   logger: customLogger, // Optional: custom logger function
   onExit: (exitCode) => process.exit(exitCode), // Optional: custom exit handler
+  logConnections: false, // Optional: enable PostgreSQL connection logging (default: false)
 });
 ```
 

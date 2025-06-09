@@ -2,7 +2,7 @@ import { spawn } from "child_process";
 import { access, writeFile, readFile, unlink, mkdir } from "fs/promises";
 import { constants } from "fs";
 import { join } from "path";
-import { Pool, Client } from "pg";
+import { Client } from "pg";
 import { PostgresBinaries, getBinaries } from "./pg-bin-helper";
 
 /**
@@ -81,12 +81,10 @@ export class LocalDevDBServer {
   private pidFile: string;
   private logger?: DevDBLoggerFunction;
   private onExit?: DevDBExitHandler;
+  private logConnections: boolean;
 
   // Process reference
   private pgProcess: ReturnType<typeof spawn> | null = null;
-
-  // Track if we're in a graceful shutdown to avoid exit code conflicts
-  private isGracefulShutdown: boolean = false;
 
   // Track if cleanup is already in progress to prevent multiple cleanup calls
   private isCleaningUp: boolean = false;
@@ -108,6 +106,7 @@ export class LocalDevDBServer {
     pidFile: string;
     logger?: DevDBLoggerFunction;
     onExit?: DevDBExitHandler;
+    logConnections?: boolean;
   }) {
     // Initialize with provided config
     this.pgPort = config.port;
@@ -118,6 +117,7 @@ export class LocalDevDBServer {
     this.pidFile = config.pidFile;
     this.logger = config.logger;
     this.onExit = config.onExit;
+    this.logConnections = config.logConnections ?? false;
 
     // Register signal handlers
     this.registerSignalHandlers();
@@ -208,17 +208,14 @@ export class LocalDevDBServer {
 
     // Set up signal handlers for graceful shutdown
     process.on("SIGINT", () => {
-      this.isGracefulShutdown = true;
       this.handleGracefulShutdown();
     });
 
     process.on("SIGTERM", () => {
-      this.isGracefulShutdown = true;
       this.handleGracefulShutdown();
     });
 
     process.on("SIGHUP", () => {
-      this.isGracefulShutdown = true;
       this.handleGracefulShutdown();
     });
 
@@ -434,70 +431,33 @@ export class LocalDevDBServer {
   }
 
   /**
-   * Checks if a PostgreSQL role exists.
-   *
-   * @param roleName Role name to check
-   * @param user User to connect as (default: 'postgres')
-   * @returns True if the role exists, false otherwise
+   * Creates a PostgreSQL client with connection options optimized for local development
+   * @param user User to connect as
+   * @param database Database to connect to
+   * @returns Connected PostgreSQL client
    */
-  private async roleExists(
-    roleName: string,
-    user = "postgres",
-  ): Promise<boolean> {
-    try {
-      const client = new Client({
-        host: "localhost",
-        port: this.pgPort,
-        user: user,
-        password: user === "postgres" ? "postgres" : this.pgPass,
-        database: "postgres",
-      });
+  private async createClient(
+    user: string = "postgres",
+    database: string = "postgres",
+  ): Promise<Client> {
+    const password = user === "postgres" ? "postgres" : this.pgPass;
 
-      try {
-        await client.connect();
-        const result = await client.query(
-          "SELECT 1 FROM pg_roles WHERE rolname=$1",
-          [roleName],
-        );
-        return result.rows.length > 0;
-      } finally {
-        await client.end();
-      }
-    } catch (e) {
-      return false;
-    }
-  }
+    const client = new Client({
+      host: "127.0.0.1", // Force IPv4 instead of localhost (which might resolve to IPv6)
+      port: this.pgPort,
+      user: user,
+      password: password,
+      database: database,
+      // Increase timeouts to be more forgiving during startup
+      connectionTimeoutMillis: 10000,
+      query_timeout: 15000,
+      // Add keepalive settings to match server configuration
+      keepAlive: true,
+      keepAliveInitialDelayMillis: 10000,
+    });
 
-  /**
-   * Checks if a PostgreSQL database exists.
-   *
-   * @param dbName Database name to check
-   * @param user User to connect as (default: 'postgres')
-   * @returns True if the database exists, false otherwise
-   */
-  private async dbExists(dbName: string, user = "postgres"): Promise<boolean> {
-    try {
-      const client = new Client({
-        host: "localhost",
-        port: this.pgPort,
-        user: user,
-        password: user === "postgres" ? "postgres" : this.pgPass,
-        database: "postgres",
-      });
-
-      try {
-        await client.connect();
-        const result = await client.query(
-          "SELECT 1 FROM pg_database WHERE datname=$1",
-          [dbName],
-        );
-        return result.rows.length > 0;
-      } finally {
-        await client.end();
-      }
-    } catch (e) {
-      return false;
-    }
+    await client.connect();
+    return client;
   }
 
   /**
@@ -541,10 +501,53 @@ export class LocalDevDBServer {
   private async startPostgresServer(): Promise<void> {
     this.log("setup", "Starting PostgreSQL server...");
 
-    // Start PostgreSQL as a proper child process
+    // Start PostgreSQL with optimized configuration
+    //
+    // IMPORTANT: We force IPv4-only connections to avoid TCP_NODELAY errors.
+    //
+    // Background: PostgreSQL on some systems (particularly with IPv6) can encounter
+    // "setsockopt(TCP_NODELAY) failed: Invalid argument" errors when child processes
+    // attempt to configure TCP socket options. This manifests as FATAL errors in logs
+    // but doesn't prevent successful connections. However, these errors can indicate
+    // real issues and may cause PostgreSQL to crash in some cases.
+    //
+    // Root cause: The issue occurs when PostgreSQL forks child processes to handle
+    // connections, and these child processes fail to set TCP_NODELAY on IPv6 sockets
+    // due to platform-specific socket handling differences.
+    //
+    // Solution: By forcing IPv4-only listening (listen_addresses=127.0.0.1) and
+    // connecting via 127.0.0.1 instead of localhost, we avoid IPv6 entirely and
+    // eliminate these socket configuration errors.
     this.pgProcess = spawn(
       this.pgBinaries!.postgres,
-      ["-D", this.pgDataDir, "-p", this.pgPort.toString()],
+      [
+        "-D",
+        this.pgDataDir,
+        "-p",
+        this.pgPort.toString(),
+        // Force IPv4 only to avoid TCP_NODELAY socket errors
+        "-c",
+        "listen_addresses=127.0.0.1",
+        // Add TCP configuration for better connection handling
+        "-c",
+        "tcp_keepalives_idle=600",
+        "-c",
+        "tcp_keepalives_interval=30",
+        "-c",
+        "tcp_keepalives_count=3",
+        // Increase connection limits to handle rapid connections better
+        "-c",
+        "max_connections=100",
+        "-c",
+        "superuser_reserved_connections=3",
+        // Reduce authentication timeout to fail faster on bad connections
+        "-c",
+        "authentication_timeout=10s",
+        // Optional connection logging (disabled by default for cleaner output)
+        ...(this.logConnections
+          ? ["-c", "log_connections=on", "-c", "log_disconnections=on"]
+          : []),
+      ],
       {
         stdio: "pipe", // Always use pipe to capture output
         detached: false, // Keep as child process so it dies when parent dies
@@ -607,30 +610,35 @@ export class LocalDevDBServer {
 
   private async waitForServerReady(maxAttempts = 30): Promise<boolean> {
     this.log("setup", "Waiting for PostgreSQL server to start...");
+
     let serverReady = false;
     let attempts = 0;
 
     while (!serverReady && attempts < maxAttempts) {
       try {
-        // Try to connect using pg_ctl status
-        const result = await this.runPgCommand(
-          this.pgBinaries!.pg_ctl,
-          ["status", "-D", this.pgDataDir],
-          { silent: true },
-        );
+        // Try to make a single connection test using our optimized client method
+        const currentUser = process.env.USER || "postgres";
+        const client = await this.createClient(currentUser, "postgres");
 
-        if (result.code === 0) {
-          this.log("setup", "PostgreSQL server is ready to accept connections");
-          serverReady = true;
-        } else {
-          // Wait a bit before trying again
-          await new Promise((resolve) => setTimeout(resolve, 1000));
-          attempts++;
-        }
+        await client.query("SELECT 1");
+        await client.end();
+
+        this.log("setup", "PostgreSQL server is ready to accept connections");
+        serverReady = true;
       } catch (e) {
-        // Wait a bit before trying again
-        await new Promise((resolve) => setTimeout(resolve, 1000));
         attempts++;
+
+        if (attempts % 5 === 0) {
+          this.log(
+            "setup",
+            `Still waiting for PostgreSQL server... (attempt ${attempts}/${maxAttempts})`,
+          );
+        }
+
+        // Only wait if we're going to try again
+        if (attempts < maxAttempts) {
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
       }
     }
 
@@ -642,25 +650,23 @@ export class LocalDevDBServer {
   }
 
   /**
-   * Sets up PostgreSQL users.
+   * Sets up PostgreSQL users and databases
    */
-
-  private async setupUsers(): Promise<void> {
+  private async setupUsersAndDatabases(): Promise<void> {
     // Get the current system user
     const currentUser = process.env.USER || "postgres";
 
-    // Connect as the current system user initially
-    let client = new Client({
-      host: "localhost",
-      port: this.pgPort,
-      user: currentUser,
-      database: "postgres",
-    });
+    // Connect as the current system user initially to set up postgres superuser
+    let client = await this.createClient(currentUser, "postgres");
 
     try {
-      await client.connect();
-      // Ensure 'postgres' superuser exists with password 'postgres' for portability
-      if (!(await this.roleExists("postgres", currentUser))) {
+      // Check if postgres role exists using the current connection
+      const postgresRoleResult = await client.query(
+        "SELECT 1 FROM pg_roles WHERE rolname=$1",
+        ["postgres"],
+      );
+
+      if (postgresRoleResult.rows.length === 0) {
         this.log(
           "setup",
           "Creating superuser 'postgres' with password 'postgres'...",
@@ -679,19 +685,17 @@ export class LocalDevDBServer {
       await client.end();
     }
 
-    // Now connect as postgres user to create the app user
-    client = new Client({
-      host: "localhost",
-      port: this.pgPort,
-      user: "postgres",
-      password: "postgres",
-      database: "postgres",
-    });
+    // Now connect as postgres user to create the app user and database
+    client = await this.createClient("postgres", "postgres");
 
     try {
-      await client.connect();
-      // Create app user if not exists
-      if (!(await this.roleExists(this.pgUser))) {
+      // Check if app user exists
+      const appUserResult = await client.query(
+        "SELECT 1 FROM pg_roles WHERE rolname=$1",
+        [this.pgUser],
+      );
+
+      if (appUserResult.rows.length === 0) {
         this.log("setup", `Creating user ${this.pgUser}...`);
         // Note: User names and passwords cannot be parameterized in DDL statements
         // We need to escape the password value manually
@@ -702,27 +706,14 @@ export class LocalDevDBServer {
       } else {
         this.log("setup", `User ${this.pgUser} already exists.`);
       }
-    } finally {
-      await client.end();
-    }
-  }
 
-  /**
-   * Sets up PostgreSQL databases.
-   */
-  private async setupDatabases(): Promise<void> {
-    const client = new Client({
-      host: "localhost",
-      port: this.pgPort,
-      user: "postgres",
-      password: "postgres",
-      database: "postgres",
-    });
+      // Check if database exists using the same connection
+      const dbResult = await client.query(
+        "SELECT 1 FROM pg_database WHERE datname=$1",
+        [this.pgDb],
+      );
 
-    try {
-      await client.connect();
-      // Create database if not exists
-      if (!(await this.dbExists(this.pgDb))) {
+      if (dbResult.rows.length === 0) {
         this.log(
           "setup",
           `Creating database ${this.pgDb} owned by ${this.pgUser}...`,
@@ -761,8 +752,7 @@ export class LocalDevDBServer {
       await this.waitForServerReady();
 
       // Set up users and databases
-      await this.setupUsers();
-      await this.setupDatabases();
+      await this.setupUsersAndDatabases();
 
       this.log("info", `PostgreSQL server is running on port ${this.pgPort}`);
       this.log("info", `Database: ${this.pgDb}`);
