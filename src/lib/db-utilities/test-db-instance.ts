@@ -20,7 +20,14 @@ const DEFAULT_DB_NAME = "test_database";
  * Logger function type for TestDatabaseInstance
  */
 export type TestDBLoggerFunction = (
-  type: "info" | "error" | "warn" | "pg" | "migrate",
+  type:
+    | "info"
+    | "error"
+    | "warn"
+    | "pg"
+    | "migrate-info"
+    | "migrate-error"
+    | "migrate-warn",
   message: string,
 ) => void;
 
@@ -49,19 +56,24 @@ export const createTestDBConsoleLogger = (
           console.log(`[PG] ${message}`);
         }
         break;
-      case "migrate":
+      case "migrate-info":
         if (migrateVerbose) {
-          console.log(`[MIGRATE] ${message}`);
+          console.log(`[MIGRATE-INFO] ${message}`);
         }
+        break;
+      case "migrate-error":
+        console.error(`[MIGRATE-ERROR] ${message}`);
+        break;
+      case "migrate-warn":
+        console.warn(`[MIGRATE-WARN] ${message}`);
         break;
     }
   };
 };
 
 /**
- * Adapter that converts our TestDBLoggerFunction to a Strataline Logger
- * This is used internally by TestDatabaseInstance
- * @internal
+ * Adapter that converts between the Strataline Logger interface and our TestDB logger
+ * This separates test DB logs from migration system logs while preserving severity levels
  */
 class TestDBStratalineLogger extends BaseLogger implements StratalineLogger {
   private testDbLogger?: TestDBLoggerFunction;
@@ -78,7 +90,9 @@ class TestDBStratalineLogger extends BaseLogger implements StratalineLogger {
     const stagePrefix = data.stage ? `[${data.stage}]` : "";
     const prefix = `${taskPrefix} ${stagePrefix}`.trim();
     const message = prefix ? `${prefix} ${data.message}` : data.message;
-    this.testDbLogger("migrate", message);
+
+    // All logs through this adapter are migration-related
+    this.testDbLogger("migrate-info", message);
   }
 
   error(data: LogDataInput): void {
@@ -91,7 +105,9 @@ class TestDBStratalineLogger extends BaseLogger implements StratalineLogger {
       ? `${data.message}: ${data.error.message || String(data.error)}`
       : data.message;
     const message = prefix ? `${prefix} ${errorMsg}` : errorMsg;
-    this.testDbLogger("error", message);
+
+    // All errors through this adapter are migration-related
+    this.testDbLogger("migrate-error", message);
   }
 
   warn(data: LogDataInput): void {
@@ -101,7 +117,9 @@ class TestDBStratalineLogger extends BaseLogger implements StratalineLogger {
     const stagePrefix = data.stage ? `[${data.stage}]` : "";
     const prefix = `${taskPrefix} ${stagePrefix}`.trim();
     const message = prefix ? `${prefix} ${data.message}` : data.message;
-    this.testDbLogger("warn", message);
+
+    // All warnings through this adapter are migration-related
+    this.testDbLogger("migrate-warn", message);
   }
 }
 
@@ -118,7 +136,22 @@ interface TestDatabaseOptions {
 }
 
 /**
- * TestDatabase class for managing an embedded PostgreSQL instance for testing
+ * A class for managing an embedded PostgreSQL instance for testing
+ *
+ * This class allows you to start an embedded PostgreSQL server, apply migrations, and reset the database
+ * between test runs. It also provides a connection pool and credentials for direct connection.
+ *
+ * @example
+ * import {TestDatabaseInstance} from 'test-database';
+ *
+ * const testDB = new TestDatabaseInstance();
+ * await testDB.start();
+ * const pool = testDB.getPool();
+ * const credentials = testDB.getCredentials();
+ *
+ * // Run your tests here
+ *
+ * await testDB.stop();
  */
 export class TestDatabaseInstance {
   private db?: EmbeddedPostgres;
@@ -147,12 +180,19 @@ export class TestDatabaseInstance {
   }
 
   /**
-   * Log a message if a logger is configured
+   * Internal logging helper
    * @param type Message type
    * @param message Message content
    */
   private log(
-    type: "info" | "error" | "warn" | "pg" | "migrate",
+    type:
+      | "info"
+      | "error"
+      | "warn"
+      | "pg"
+      | "migrate-info"
+      | "migrate-error"
+      | "migrate-warn",
     message: string,
   ): void {
     if (this.logger) {
@@ -334,9 +374,10 @@ export class TestDatabaseInstance {
     // Skip migrations if none are provided
     if (!this.migrations || this.migrations.length === 0) {
       this.log(
-        "info",
+        "migrate-info",
         "No migrations provided, skipping migration application",
       );
+
       this.migrationsApplied = true;
       return;
     }
@@ -349,7 +390,7 @@ export class TestDatabaseInstance {
     const stratalineLogger = new TestDBStratalineLogger(this.logger);
     const migrationManager = new MigrationManager(this.pool, stratalineLogger);
 
-    this.log("info", "Applying migrations to test database...");
+    this.log("migrate-info", "Applying migrations to test database...");
 
     try {
       // Register migrations
@@ -359,17 +400,20 @@ export class TestDatabaseInstance {
       const result = await migrationManager.runSchemaChanges("job");
 
       if (result.success) {
-        this.log("info", "Migrations applied successfully");
+        this.log("migrate-info", "Migrations applied successfully");
         this.migrationsApplied = true;
       } else {
-        this.log("error", `Migration failed: ${result.reason}`);
+        this.log("migrate-error", `Migration failed: ${result.reason}`);
+        // migrationsApplied is already false by default
         throw new Error(`Failed to apply migrations: ${result.reason}`);
       }
     } catch (error) {
       this.log(
-        "error",
+        "migrate-error",
         `Error applying migrations: ${(error as Error).message}`,
       );
+
+      // migrationsApplied is already false by default
       throw error;
     }
   }

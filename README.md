@@ -796,10 +796,17 @@ const testDb = new TestDatabaseInstance({
 
 // Or implement your own logger
 const customLogger = (
-  type: "info" | "error" | "warn" | "pg" | "migrate",
+  type:
+    | "info"
+    | "error"
+    | "warn"
+    | "pg"
+    | "migrate-info"
+    | "migrate-error"
+    | "migrate-warn",
   message: string,
 ) => {
-  // Types: info/error/warn (general), pg (PostgreSQL server), migrate (Strataline migrations)
+  // Types: info/error/warn (general), pg (PostgreSQL server), migrate-info/migrate-error/migrate-warn (Strataline migrations)
   console.log(`[${type.toUpperCase()}] ${message}`);
 };
 ```
@@ -808,14 +815,17 @@ const customLogger = (
 
 The TestDatabaseInstance automatically creates a Strataline-compatible logger adapter that works with or without a provided logger:
 
-- If you provide a logger, migration logs will be sent through your logger with the type 'migrate'
+- If you provide a logger, migration logs will be sent through your logger with the appropriate type:
+  - `migrate-info`: For informational migration logs
+  - `migrate-error`: For migration errors
+  - `migrate-warn`: For migration warnings
 - If you don't provide a logger, migrations will run silently with no logs
 
 When you provide a logger to TestDatabaseInstance, it will:
 
 1. Use that logger for its own operation logs (info, error, warn)
 2. Use that logger for PostgreSQL logs (pg)
-3. Automatically create an adapter to send Strataline migration logs through the same logger (migrate)
+3. Automatically create an adapter to send Strataline migration logs through the same logger (migrate-info, migrate-error, migrate-warn)
 
 This ensures all logs flow through a single logging interface, making it easy to direct logs to your preferred destination.
 
