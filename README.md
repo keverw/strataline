@@ -131,7 +131,7 @@ migrationManager.register([
           endId: Number.MAX_SAFE_INTEGER,
         };
 
-        ctx.logger.log({
+        ctx.logger.info({
           message: `Processing users from ID ${startId} to ${endId}`,
         });
 
@@ -148,7 +148,7 @@ migrationManager.register([
           ]);
         }
 
-        ctx.logger.log({
+        ctx.logger.info({
           message: `Successfully processed ${rows.length} users`,
         });
 
@@ -185,6 +185,7 @@ async function runMigrations() {
 
   if (result.success) {
     console.log("Migrations completed successfully!");
+
     if (result.migrationData && Object.keys(result.migrationData).length > 0) {
       console.log("Data returned from migrations:", result.migrationData);
     }
@@ -243,7 +244,7 @@ migration: async (pool, ctx) => {
       await scheduleJob("001-add-users-table", batch); // e.g., enqueue or trigger a 'job'
     }
 
-    ctx.logger.log({ message: `Scheduled ${batches.length} batch jobs` });
+    ctx.logger.info({ message: `Scheduled ${batches.length} batch jobs` });
 
     // Monitor jobs and ensure successful completion (pseudo-code, replace with your own job monitoring logic)
     const allJobsDone = await checkAllJobsComplete(
@@ -260,7 +261,7 @@ migration: async (pool, ctx) => {
     // Do the actual work for this batch (or all data if no payload)
     const { startId = 0, endId = Number.MAX_SAFE_INTEGER } = ctx.payload || {};
 
-    ctx.logger.log({
+    ctx.logger.info({
       message: `Processing users from ID ${startId} to ${endId}`,
     });
 
@@ -283,9 +284,107 @@ migration: async (pool, ctx) => {
 > - If you call `ctx.defer(reason, data?)`, the migration will be paused: `afterSchema` and any subsequent migrations will not run until you rerun the job and it calls `ctx.complete()`. This enables staged rollouts, retries, or background processing. The optional `data` can be used to pass structured information back to the orchestrator.
 > - Strataline is backend-agnostic: you can use any job scheduler, queue system, thread pool, or orchestration framework to schedule and monitor jobs as needed.
 
-## Creating a Migration Script
+## Running Migrations
 
-Since Strataline is designed as a library rather than a CLI tool, you can easily create your own migration script to run migrations from the command line. This gives you full control over how migrations are executed while providing a familiar CLI-like experience.
+Strataline provides flexible options for running database migrations. Since it's designed as a library rather than a CLI tool, you have complete control over how migrations are executed. You can either use our convenient built-in CLI helper to get started quickly or create a custom migration script for more advanced scenarios.
+
+### Using the Built-in CLI Helper
+
+For quick development or simpler use cases, Strataline provides a convenient CLI helper function called `RunStratalineCLI`. This function handles command parsing and execution for you with minimal setup.
+
+#### Basic Setup
+
+Create a script file to run your migrations:
+
+```typescript
+// scripts/db-migrate.ts
+
+// Load environment variables - this is only needed if you are using Node.js, Bun does not need it
+// import 'dotenv/config'
+
+import { RunStratalineCLI, createCLIConsoleLogger } from "strataline";
+import { migrations } from "../path/to/your/migrations";
+
+// Use the built-in CLI console logger
+// You can customize this or implement your own logger if needed
+const logger = createCLIConsoleLogger(true);
+
+// Run the CLI with environment variables
+RunStratalineCLI({
+  migrations,
+  loadFrom: "env", // Use environment variables for database connection
+  logger,
+}).catch((error) => {
+  console.error(`Failed to run CLI: ${error.message}`);
+  process.exit(1);
+});
+```
+
+#### Configuration Options
+
+The `RunStratalineCLI` function accepts several configuration options:
+
+- **migrations**: An array of your migration objects
+- **loadFrom**: How to load the database connection
+  - `"env"`: Use environment variables (requires PostgreSQL environment variables)
+  - `"pool"`: Use a provided PostgreSQL pool
+- **envPrefix** (optional): Prefix for environment variables (e.g., "APP\_" would look for APP_POSTGRES_USER)
+- **pool** (optional): A PostgreSQL pool instance (required when loadFrom is "pool")
+- **logger**: A function to handle logging
+
+#### Environment Variables
+
+When using `loadFrom: "env"`, the following environment variables are required:
+
+- `POSTGRES_USER`: Database username
+- `POSTGRES_HOST`: Database host
+- `POSTGRES_DATABASE`: Database name
+- `POSTGRES_PASSWORD`: Database password
+- `POSTGRES_PORT`: Database port
+
+Optional environment variables for pool configuration:
+
+- `POSTGRES_MAX_CONNECTIONS`: Maximum number of connections in the pool
+- `POSTGRES_IDLE_TIMEOUT`: Idle timeout in milliseconds
+- `POSTGRES_CONNECTION_TIMEOUT`: Connection timeout in milliseconds
+
+#### Available Commands
+
+The CLI supports the following commands:
+
+- `run`: Run pending migrations
+  - Option: `--distributed` to run in distributed mode
+- `status`: Show migration status
+- `help`: Display help information (default if no command is provided)
+
+#### Pool Management
+
+**Note**: The CLI automatically manages the PostgreSQL pool lifecycle. It will create a pool if using environment variables or use your provided pool, and will properly end the pool when the operation completes. You do not need to end the pool yourself after calling `RunStratalineCLI`.
+
+#### Package.json Scripts
+
+Add these scripts to your package.json for convenient access:
+
+```json
+{
+  "scripts": {
+    "db:migrate": "bun run scripts/db-migrate.ts run",
+    "db:migrate:distributed": "bun run scripts/db-migrate.ts run --distributed",
+    "db:status": "bun run scripts/db-migrate.ts status"
+  }
+}
+```
+
+#### Node.js vs Bun
+
+The example above works with both Node.js and Bun, with one difference:
+
+- **Bun**: Environment variables are automatically loaded from .env files
+- **Node.js**: You need to add `import 'dotenv/config'` to load environment variables from .env files
+
+### Creating a Custom Migration Script
+
+For more control over the migration process, you can create your own custom migration script. This approach gives you complete flexibility in how migrations are executed, logged, and managed.
 
 Here's an example of a simple migration script that you can add to your project:
 
@@ -510,7 +609,7 @@ Example:
 ```typescript
 migration: async (pool, ctx) => {
   // The logger already has the migration ID as the task
-  ctx.logger.log({ message: "Starting migration batch" });
+  ctx.logger.info({ message: "Starting migration batch" });
   // ...
   ctx.logger.error({ message: "Something went wrong", error: err });
   // Output includes: [migration-id] [dataMigration] Something went wrong
@@ -539,7 +638,7 @@ import { BaseLogger, LogDataInput } from "strataline";
 
 // Create a custom logger that sends logs to a service
 class ApiLogger extends BaseLogger {
-  log(data: LogDataInput): void {
+  info(data: LogDataInput): void {
     // Send log to your logging service
     apiClient.sendLog({
       level: "info",
@@ -592,7 +691,7 @@ const prefixedLogger = apiLogger.createPrefixed({
 });
 
 // All logs will include the prefixes
-prefixedLogger.log({ message: "Starting process" });
+prefixedLogger.info({ message: "Starting process" });
 // Output includes: [my-task] [initialization] Starting process
 ```
 

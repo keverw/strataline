@@ -83,7 +83,7 @@ class TestDBStratalineLogger extends BaseLogger implements StratalineLogger {
     this.testDbLogger = logger;
   }
 
-  log(data: LogDataInput): void {
+  info(data: LogDataInput): void {
     if (!this.testDbLogger) return;
 
     const taskPrefix = data.task ? `[${data.task}]` : "";
@@ -91,7 +91,7 @@ class TestDBStratalineLogger extends BaseLogger implements StratalineLogger {
     const prefix = `${taskPrefix} ${stagePrefix}`.trim();
     const message = prefix ? `${prefix} ${data.message}` : data.message;
 
-    // All logs through this adapter are migration-related
+    // All info logs through this adapter are migration-related
     this.testDbLogger("migrate-info", message);
   }
 

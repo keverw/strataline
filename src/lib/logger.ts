@@ -24,7 +24,7 @@ export interface LogData extends LogDataInput {
  * Logger interface for operations
  */
 export interface Logger {
-  log: (data: LogDataInput) => void;
+  info: (data: LogDataInput) => void;
   error: (data: LogDataInput) => void;
   warn: (data: LogDataInput) => void;
 }
@@ -55,7 +55,7 @@ export abstract class BaseLogger implements Logger {
   /**
    * Log an informational message
    */
-  abstract log(data: LogDataInput): void;
+  abstract info(data: LogDataInput): void;
 
   /**
    * Log an error message
@@ -83,7 +83,7 @@ export class ConsoleLogger extends BaseLogger {
    * Log an informational message to the console
    */
 
-  log(data: LogDataInput): void {
+  info(data: LogDataInput): void {
     const logData: LogData = { ...data, level: "info" };
     const prefix = buildLogPrefix(logData);
     console.log(`${prefix}${logData.message}`);
@@ -144,12 +144,12 @@ export class MutableLogger extends BaseLogger {
   /**
    * Log an informational message if verbose is enabled
    */
-  log(data: LogDataInput): void {
+  info(data: LogDataInput): void {
     if (this.verbose) {
       const logData: LogData = { ...data, level: "info" };
       const prefix = buildLogPrefix(logData);
       // Assuming baseLogger handles the actual console logging or equivalent
-      this.baseLogger.log({ ...data, message: `${prefix}${logData.message}` });
+      this.baseLogger.info({ ...data, message: `${prefix}${logData.message}` });
     }
   }
 
@@ -202,8 +202,8 @@ export class PrefixedLogger extends BaseLogger {
   /**
    * Log an informational message with prefix
    */
-  log(data: LogDataInput): void {
-    this.baseLogger.log({
+  info(data: LogDataInput): void {
+    this.baseLogger.info({
       ...data,
       task: data.task || this.prefix.task,
       stage: data.stage || this.prefix.stage,

@@ -78,7 +78,7 @@ describe("Logger Utilities", () => {
     it("should log info messages with prefix", () => {
       const logger = new ConsoleLogger();
       const logInput: LogDataInput = { task: "TaskA", message: "Info message" };
-      logger.log(logInput);
+      logger.info(logInput);
 
       expect(consoleLogMock).toHaveBeenCalledWith("[TaskA] Info message");
     });
@@ -125,7 +125,7 @@ describe("Logger Utilities", () => {
       warnSpy = mock(() => {});
       errorSpy = mock(() => {});
       baseLoggerMock = {
-        log: logSpy,
+        info: logSpy,
         warn: warnSpy,
         error: errorSpy,
       };
@@ -134,7 +134,7 @@ describe("Logger Utilities", () => {
     it("should log messages when verbose is true", () => {
       const mutableLogger = new MutableLogger(baseLoggerMock, true);
       const logInput: LogDataInput = { task: "MTask", message: "Verbose on" };
-      mutableLogger.log(logInput);
+      mutableLogger.info(logInput);
 
       expect(logSpy).toHaveBeenCalledWith({
         ...logInput,
@@ -144,7 +144,7 @@ describe("Logger Utilities", () => {
 
     it("should not log messages when verbose is false", () => {
       const mutableLogger = new MutableLogger(baseLoggerMock, false);
-      mutableLogger.log({ message: "Verbose off" });
+      mutableLogger.info({ message: "Verbose off" });
 
       expect(logSpy).not.toHaveBeenCalled();
     });
@@ -192,12 +192,12 @@ describe("Logger Utilities", () => {
 
     it("setVerbose should toggle logging", () => {
       const mutableLogger = new MutableLogger(baseLoggerMock, false);
-      mutableLogger.log({ message: "Initial" });
+      mutableLogger.info({ message: "Initial" });
       expect(logSpy).not.toHaveBeenCalled();
 
       mutableLogger.setVerbose(true);
       const logInput: LogDataInput = { task: "MSet", message: "Now logging" };
-      mutableLogger.log(logInput);
+      mutableLogger.info(logInput);
       expect(logSpy).toHaveBeenCalledWith({
         ...logInput,
         message: "[MSet] Now logging",
@@ -205,7 +205,7 @@ describe("Logger Utilities", () => {
 
       mutableLogger.setVerbose(false);
       logSpy.mockClear(); // Clear previous calls
-      mutableLogger.log({ message: "Not logging again" });
+      mutableLogger.info({ message: "Not logging again" });
       expect(logSpy).not.toHaveBeenCalled();
     });
 
@@ -228,7 +228,7 @@ describe("Logger Utilities", () => {
       warnSpy = mock(() => {});
       errorSpy = mock(() => {});
       baseLoggerMock = {
-        log: logSpy,
+        info: logSpy,
         warn: warnSpy,
         error: errorSpy,
       };
@@ -239,7 +239,7 @@ describe("Logger Utilities", () => {
         task: "PTask",
       });
 
-      prefixedLogger.log({ message: "Prefixed log" });
+      prefixedLogger.info({ message: "Prefixed log" });
 
       expect(logSpy).toHaveBeenCalledWith({
         task: "PTask",
@@ -253,7 +253,7 @@ describe("Logger Utilities", () => {
         stage: "PStage",
       });
 
-      prefixedLogger.log({
+      prefixedLogger.info({
         task: "OriginalTask",
         message: "Original task log",
       });
@@ -265,7 +265,7 @@ describe("Logger Utilities", () => {
       });
 
       logSpy.mockClear();
-      prefixedLogger.log({
+      prefixedLogger.info({
         stage: "OriginalStage",
         message: "Original stage log",
       });

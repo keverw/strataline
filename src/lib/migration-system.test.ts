@@ -791,7 +791,7 @@ describe("MigrationManager", () => {
         },
         migration: async (pool, ctx) => {
           // Use all three logger methods
-          ctx.logger.log({
+          ctx.logger.info({
             message: "This is a regular log message",
           });
 

@@ -1,10 +1,5 @@
 import { type Pool, type PoolClient } from "pg";
-import {
-  type Logger,
-  type LogDataInput,
-  consoleLogger,
-  createPrefixedLogger,
-} from "./logger";
+import { type Logger, consoleLogger, createPrefixedLogger } from "./logger";
 import { type SchemaHelpers, createSchemaHelpers } from "./schema-helpers";
 
 /**
@@ -317,7 +312,7 @@ export class MigrationManager {
     // Try to acquire the lock
     const lockAcquired = await this.acquireMigrationLock();
     if (!lockAcquired) {
-      this.logger.log({
+      this.logger.info({
         message: "Another process is running migrations, skipping",
       });
 
@@ -388,7 +383,7 @@ export class MigrationManager {
         lastAttemptedMigration = migration.id;
 
         try {
-          this.logger.log({
+          this.logger.info({
             message: `Starting migration ${migration.id} (${migration.description})`,
           });
 
@@ -399,7 +394,7 @@ export class MigrationManager {
           );
 
           if (result.status !== "success") {
-            this.logger.log({
+            this.logger.info({
               message: `Migration ${migration.id} did not complete successfully - stopping migration process to prevent out-of-order migrations. Status: ${result.status}, Reason: ${result.reason || "N/A"}`,
             });
 
@@ -443,7 +438,7 @@ export class MigrationManager {
             1,
           );
 
-          this.logger.log({
+          this.logger.info({
             message: `Successfully completed migration ${migration.id}`,
           });
         } catch (error: any) {
@@ -509,7 +504,7 @@ export class MigrationManager {
     const taskLogger = this.createTaskLogger(migration.id);
     let migrationOutputData: TReturn | undefined = undefined;
 
-    taskLogger.log({
+    taskLogger.info({
       message: `Running migration: ${migration.description}`,
     });
 
@@ -535,7 +530,7 @@ export class MigrationManager {
         [migration.id, migration.description, now],
       );
 
-      taskLogger.log({
+      taskLogger.info({
         message: `Created migration record for ${migration.id}`,
       });
     }
@@ -561,7 +556,7 @@ export class MigrationManager {
         };
       }
     } else {
-      taskLogger.log({
+      taskLogger.info({
         message: `No beforeSchema phase provided for migration ${migration.id}`,
       });
 
@@ -577,7 +572,7 @@ export class MigrationManager {
       >(migration, taskLogger, mode, {} as TPayload); // Pass default payload
 
       if (dataMigrationResult.status !== "success") {
-        taskLogger.log({
+        taskLogger.info({
           message: `[dataMigration] Data migration for ${migration.id} did not complete successfully (status: ${dataMigrationResult.status}). Reason: ${dataMigrationResult.reason || "N/A"}`,
         });
         return dataMigrationResult; // Propagate status, reason, and potentially data (if provided by either complete or defer)
@@ -586,7 +581,7 @@ export class MigrationManager {
       migrationOutputData = dataMigrationResult.data; // Capture data from successful migration
     } else {
       // If there's no data migration, mark it as complete and log
-      taskLogger.log({
+      taskLogger.info({
         message: `No data migration provided for migration ${migration.id}`,
       });
 
@@ -614,7 +609,7 @@ export class MigrationManager {
         };
       }
     } else {
-      taskLogger.log({
+      taskLogger.info({
         message: `No afterSchema phase provided for migration ${migration.id}`,
       });
 
@@ -627,12 +622,12 @@ export class MigrationManager {
     await this.markStatus(migration.id, { completedAt: completionTime });
 
     // Log that the migration is fully completed with the timestamp
-    taskLogger.log({
+    taskLogger.info({
       message: `Marked migration ${migration.id} as fully completed (completed_at = ${completionTime})`,
     });
 
     // Log successful completion of the entire migration
-    taskLogger.log({
+    taskLogger.info({
       message: `Migration ${migration.id} completed successfully`,
     });
 
@@ -666,7 +661,7 @@ export class MigrationManager {
 
       // Skip if already applied
       if (rows.length > 0 && rows[0][statusField]) {
-        logger.log({
+        logger.info({
           message: `[${phase}] Skipping ${phase} phase - already applied`,
         });
         await client.query("COMMIT");
@@ -691,7 +686,7 @@ export class MigrationManager {
       );
 
       await client.query("COMMIT");
-      logger.log({
+      logger.info({
         message: `[${phase}] Completed ${phase} phase`,
       });
     } catch (error) {
@@ -733,7 +728,7 @@ export class MigrationManager {
 
         this.markStatus(migration.id, { migrationComplete: true })
           .then(() => {
-            logger.log({
+            logger.info({
               message: `[dataMigration] Data migration marked as complete via callback.`,
             });
 
@@ -766,7 +761,7 @@ export class MigrationManager {
           ? `[dataMigration] Data migration deferred: ${reason}`
           : `[dataMigration] Data migration deferred`;
 
-        logger.log({
+        logger.info({
           message: logMessage,
         });
 
@@ -776,7 +771,7 @@ export class MigrationManager {
 
       (async () => {
         try {
-          logger.log({
+          logger.info({
             message: `[dataMigration] Executing data migration function. Waiting for complete() or defer() callback...`,
           });
 
@@ -802,7 +797,7 @@ export class MigrationManager {
           // After the migration function itself has finished (either sync or async execution path),
           // if neither callback was called by then, it means for this run, it's not "truly done".
           if (!callbackCalled) {
-            logger.log({
+            logger.info({
               message: `[dataMigration] Data migration function finished without calling complete() or defer().`,
             });
 
@@ -893,7 +888,7 @@ export class MigrationManager {
           const lockInfo = rows[0];
           const expiresIn =
             new Date(lockInfo.lock_expires_at).getTime() - now.getTime();
-          this.logger.log({
+          this.logger.info({
             message: `Migration lock is held by ${lockInfo.locked_by} and will expire in ${Math.round(expiresIn / 1000)} seconds`,
           });
         }
@@ -904,7 +899,7 @@ export class MigrationManager {
       // We've got the lock
       this.lockId = lockResult.rows[0].locked_by;
 
-      this.logger.log({
+      this.logger.info({
         message: `Acquired migration lock (${this.lockId}), expires at ${lockResult.rows[0].lock_expires_at}`,
       });
 
@@ -976,7 +971,7 @@ export class MigrationManager {
       );
 
       if (result.rowCount && result.rowCount > 0) {
-        this.logger.log({
+        this.logger.info({
           message: `Renewed migration lock until ${expiresAt.toISOString()}`,
         });
       } else {
@@ -986,7 +981,7 @@ export class MigrationManager {
               "Failed to renew migration lock - it may have been taken by another process",
           });
         } else {
-          this.logger.log({
+          this.logger.info({
             message:
               "Failed to renew migration lock - it may have been taken by another process",
           });
@@ -1084,7 +1079,7 @@ export class MigrationManager {
 
     // Check if migration is already complete (migration_complete flag is true and completed_at > 0)
     if (status.migration_complete && status.completed_at > 0) {
-      taskLogger.log({
+      taskLogger.info({
         message: `Data migration for ${migrationId} has already been completed`,
       });
 
@@ -1105,7 +1100,7 @@ export class MigrationManager {
 
     // If there's no data migration function, mark it as complete and return
     if (!migration.migration) {
-      taskLogger.log({
+      taskLogger.info({
         message: `No data migration provided for migration ${migration.id}, marking as complete`,
       });
 
@@ -1119,7 +1114,7 @@ export class MigrationManager {
       // Always use 'job' mode for this method
       const mode: MigrationMode = "job";
 
-      taskLogger.log({
+      taskLogger.info({
         message: `Running data migration for ${migration.id} with mode: ${mode}`,
       });
 
@@ -1131,13 +1126,13 @@ export class MigrationManager {
       );
 
       if (result.status === "success") {
-        taskLogger.log({
+        taskLogger.info({
           message: `Data migration for ${migration.id} completed successfully`,
         });
 
         return { status: "success", data: result.data };
       } else if (result.status === "deferred") {
-        taskLogger.log({
+        taskLogger.info({
           message: `Data migration for ${migration.id} was deferred (reason: ${result.reason || "N/A"})`,
           ...(result.data !== undefined && { deferredData: result.data }),
         });
@@ -1145,7 +1140,7 @@ export class MigrationManager {
         return { status: "deferred", reason: result.reason, data: result.data };
       } else {
         // error
-        taskLogger.log({
+        taskLogger.info({
           message: `Data migration for ${migration.id} failed (reason: ${result.reason || "N/A"})`,
           // Error case typically doesn't carry data from the migration function itself,
           // but if runDataMigration somehow attached it, it would be in result.data
@@ -1186,11 +1181,11 @@ export class MigrationManager {
       );
 
       if (result.rowCount && result.rowCount > 0) {
-        this.logger.log({
+        this.logger.info({
           message: "Released and deleted migration lock",
         });
       } else {
-        this.logger.log({
+        this.logger.info({
           message:
             "Could not release migration lock - it may have been acquired by another process",
         });

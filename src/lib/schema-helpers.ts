@@ -99,7 +99,7 @@ export function createSchemaHelpers(
       )
     `);
 
-    prefixedLogger.log({
+    prefixedLogger.info({
       message: `Ensured table ${tableName} exists`,
     });
   }
@@ -132,11 +132,11 @@ export function createSchemaHelpers(
           ALTER TABLE ${tableName} 
           ADD COLUMN ${columnName} ${columnType}${defaultClause}
         `);
-        prefixedLogger.log({
+        prefixedLogger.info({
           message: `Added column ${columnName} to table ${tableName}`,
         });
       } else {
-        prefixedLogger.log({
+        prefixedLogger.info({
           message: `Column ${columnName} already exists in table ${tableName}`,
         });
       }
@@ -184,11 +184,11 @@ export function createSchemaHelpers(
           ALTER TABLE ${tableName} 
           DROP COLUMN ${columnName}
         `);
-        prefixedLogger.log({
+        prefixedLogger.info({
           message: `Removed column ${columnName} from table ${tableName}`,
         });
       } else {
-        prefixedLogger.log({
+        prefixedLogger.info({
           message: `Column ${columnName} doesn't exist in table ${tableName}, nothing to remove`,
         });
       }
@@ -229,11 +229,11 @@ export function createSchemaHelpers(
           CREATE ${uniqueClause}INDEX ${indexName} 
           ON ${tableName} (${columns.join(", ")})
         `);
-        prefixedLogger.log({
+        prefixedLogger.info({
           message: `Created index ${indexName} on table ${tableName}`,
         });
       } else {
-        prefixedLogger.log({
+        prefixedLogger.info({
           message: `Index ${indexName} already exists on table ${tableName}`,
         });
       }
@@ -267,11 +267,11 @@ export function createSchemaHelpers(
       if (rows.length > 0) {
         // Index exists, drop it
         await client.query(`DROP INDEX ${indexName}`);
-        prefixedLogger.log({
+        prefixedLogger.info({
           message: `Removed index ${indexName}`,
         });
       } else {
-        prefixedLogger.log({
+        prefixedLogger.info({
           message: `Index ${indexName} doesn't exist, nothing to remove`,
         });
       }
@@ -316,11 +316,11 @@ export function createSchemaHelpers(
           REFERENCES ${referencedTable} (${referencedColumn})
           ON DELETE ${onDelete}
         `);
-        prefixedLogger.log({
+        prefixedLogger.info({
           message: `Added foreign key ${constraintName} to table ${tableName}`,
         });
       } else {
-        prefixedLogger.log({
+        prefixedLogger.info({
           message: `Foreign key ${constraintName} already exists on table ${tableName}`,
         });
       }
@@ -371,11 +371,11 @@ export function createSchemaHelpers(
           ON DELETE ${onDelete}
           DEFERRABLE ${deferredClause}
         `);
-        prefixedLogger.log({
+        prefixedLogger.info({
           message: `Added deferrable foreign key ${constraintName} to table ${tableName}`,
         });
       } else {
-        prefixedLogger.log({
+        prefixedLogger.info({
           message: `Foreign key ${constraintName} already exists on table ${tableName}`,
         });
       }
@@ -423,11 +423,11 @@ export function createSchemaHelpers(
           ALTER TABLE ${tableName}
           DROP CONSTRAINT ${constraintName}
         `);
-        prefixedLogger.log({
+        prefixedLogger.info({
           message: `Removed constraint ${constraintName} from table ${tableName}`,
         });
       } else {
-        prefixedLogger.log({
+        prefixedLogger.info({
           message: `Constraint ${constraintName} doesn't exist on table ${tableName}, nothing to remove`,
         });
       }
