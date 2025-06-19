@@ -1,4 +1,4 @@
-# Strataline v2.0.0
+# Strataline v3.0.0
 
 [![npm version](https://badge.fury.io/js/strataline.svg)](https://badge.fury.io/js/strataline)
 
@@ -19,7 +19,16 @@ The name **Strataline** comes from:
 - [Basic Usage](#basic-usage)
   - [Job Mode (Single Machine)](#job-mode-single-machine)
   - [Distributed Mode (Orchestrated)](#distributed-mode-orchestrated)
-- [Creating a Migration Script](#creating-a-migration-script)
+- [Running Migrations](#running-migrations)
+  - [Using the Built-in CLI Helper](#using-the-built-in-cli-helper)
+    - [Basic Setup](#basic-setup)
+    - [Configuration Options](#configuration-options)
+    - [Environment Variables](#environment-variables)
+    - [Available Commands](#available-commands)
+    - [Pool Management](#pool-management)
+    - [Package.json Scripts](#packagejson-scripts)
+    - [Node.js vs Bun](#nodejs-vs-bun)
+  - [Creating a Custom Migration Script](#creating-a-custom-migration-script)
 - [Architecture](#architecture)
   - [Job Mode](#job-mode)
   - [Distributed Mode](#distributed-mode)
@@ -42,7 +51,7 @@ The name **Strataline** comes from:
     - [Example in tests](#example-in-tests)
   - [Local Dev DB Server](#local-dev-db-server)
     - [Setting Up a Dev Database Script](#setting-up-a-dev-database-script)
-    - [Configuration Options](#configuration-options)
+    - [Configuration Options](#configuration-options-1)
     - [Logging](#logging-2)
     - [Data Persistence](#data-persistence)
     - [Process Management](#process-management)
