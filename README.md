@@ -1,4 +1,4 @@
-# Strataline v3.0.0
+# Strataline v3.0.1
 
 [![npm version](https://badge.fury.io/js/strataline.svg)](https://badge.fury.io/js/strataline)
 
@@ -8,6 +8,15 @@ The name **Strataline** comes from:
 
 - **Strata**: representing the _layers_ of a database migration—schema changes, data backfills, and cleanup steps
 - **Line**: reflecting the _path or flow_ each migration takes, whether inline or across distributed systems
+
+Unlike traditional tools that rely on rigid `up/down` scripts, Strataline offers a modern framework approach:
+
+- Define safe, phase-based migrations (`beforeSchema`, `migration`, `afterSchema`)
+- Use **job mode** for simple, single-node projects—or scale out with **distributed mode** when needed
+- Integrate directly into your app or scripts, using full TypeScript power and rich logging
+- Test easily with built-in helpers, and spin up either temporary **test instances** or a persistent **local Postgres dev server**—no Docker required
+
+Whether you're building a side project or orchestrating millions of rows in production, Strataline adapts to your needs—not the other way around.
 
 ## Table of Contents
 
