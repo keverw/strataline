@@ -2,14 +2,26 @@
   "name": "strataline",
   "version": "3.0.1",
   "description": "A structured migration runner for PostgreSQL that treats database changes as layered, resumable operations",
-  "main": "dist/index.js",
-  "module": "dist/index.mjs",
-  "types": "dist/index.d.ts",
   "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.mjs",
-      "require": "./dist/index.js"
+    "./migration": {
+      "types": "./dist/migration/migration.d.ts",
+      "import": "./dist/migration/migration.mjs",
+      "require": "./dist/migration/migration.js"
+    },
+    "./test-db-instance": {
+      "types": "./dist/test-db-instance/test-db-instance.d.ts",
+      "import": "./dist/test-db-instance/test-db-instance.mjs",
+      "require": "./dist/test-db-instance/test-db-instance.js"
+    },
+    "./local-dev-db-server": {
+      "types": "./dist/local-dev-db-server/local-dev-db-server.d.ts",
+      "import": "./dist/local-dev-db-server/local-dev-db-server.mjs",
+      "require": "./dist/local-dev-db-server/local-dev-db-server.js"
+    },
+    "./cli": {
+      "types": "./dist/cli/cli.d.ts",
+      "import": "./dist/cli/cli.mjs",
+      "require": "./dist/cli/cli.js"
     }
   },
   "files": [

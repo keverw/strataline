@@ -60,12 +60,49 @@ const allExternals = getAllDependencies([
 // For a library published to NPM, we want EVERYTHING external so users install their own deps
 // This approach automatically stays in sync with package.json changes
 
-export default defineConfig({
-  entry: ["src/index.ts"],
-  format: ["cjs", "esm"],
-  dts: true,
-  splitting: false,
-  sourcemap: true,
-  clean: true,
-  external: allExternals,
-});
+export default defineConfig([
+  // Migration system
+  {
+    entry: ["src/migration.ts"],
+    outDir: "dist/migration",
+    format: ["cjs", "esm"],
+    dts: true,
+    splitting: false,
+    sourcemap: true,
+    clean: true, // Safe to clean since it's in its own subdirectory
+    external: allExternals,
+  },
+  // Test database instance
+  {
+    entry: ["src/test-db-instance.ts"],
+    outDir: "dist/test-db-instance",
+    format: ["cjs", "esm"],
+    dts: true,
+    splitting: false,
+    sourcemap: true,
+    clean: true, // Safe to clean since it's in its own subdirectory
+    external: allExternals,
+  },
+  // Local dev database server
+  {
+    entry: ["src/local-dev-db-server.ts"],
+    outDir: "dist/local-dev-db-server",
+    format: ["cjs", "esm"],
+    dts: true,
+    splitting: false,
+    sourcemap: true,
+    clean: true, // Safe to clean since it's in its own subdirectory
+    external: allExternals,
+  },
+  // CLI
+  {
+    entry: ["src/cli.ts"],
+    outDir: "dist/cli",
+    format: ["cjs", "esm"],
+    dts: true,
+    splitting: false,
+    sourcemap: true,
+    clean: true, // Safe to clean since it's in its own subdirectory
+    external: allExternals,
+  },
+]);

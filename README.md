@@ -105,7 +105,7 @@ Job mode runs migrations inline on a single machine, ideal for development or sm
 
 ```typescript
 import { Pool } from "pg";
-import { MigrationManager } from "strataline";
+import { MigrationManager } from "strataline/migration";
 
 // Create a PostgreSQL connection pool
 const pool = new Pool({
@@ -320,7 +320,7 @@ Create a script file to run your migrations:
 // Load environment variables - this is only needed if you are using Node.js, Bun does not need it
 // import 'dotenv/config'
 
-import { RunStratalineCLI, createCLIConsoleLogger } from "strataline";
+import { RunStratalineCLI, createCLIConsoleLogger } from "strataline/cli";
 import { migrations } from "../path/to/your/migrations";
 
 // Use the built-in CLI console logger
@@ -409,7 +409,7 @@ Here's an example of a simple migration script that you can add to your project:
 ```typescript
 // migrate.ts
 import { Pool } from "pg";
-import { MigrationManager } from "strataline";
+import { MigrationManager } from "strataline/migration";
 
 // Import your migrations directly to ensure correct ordering
 import { migration001 } from "./migrations/001-add-users-table";
@@ -507,7 +507,7 @@ Then your migration script becomes simpler:
 ```typescript
 // migrate.ts
 import { Pool } from "pg";
-import { MigrationManager } from "strataline";
+import { MigrationManager } from "strataline/migration";
 import { migrations } from "./migrations";
 
 async function main() {
@@ -652,7 +652,7 @@ The logger system automatically formats messages with task and stage prefixes, m
 You can create your own logger by extending the `BaseLogger` class:
 
 ```typescript
-import { BaseLogger, LogDataInput } from "strataline";
+import { BaseLogger, LogDataInput } from "strataline/migration";
 
 // Create a custom logger that sends logs to a service
 class ApiLogger extends BaseLogger {
@@ -861,7 +861,10 @@ This helper creates short-lived, non-persistent Postgres clusters for testing pu
 #### Usage
 
 ```typescript
-import { TestDatabaseInstance, createTestDBConsoleLogger } from "strataline";
+import {
+  TestDatabaseInstance,
+  createTestDBConsoleLogger,
+} from "strataline/test-db-instance";
 import { migrations } from "./path/to/your/migrations";
 
 // Create a test database with migrations
@@ -949,7 +952,7 @@ This ensures all logs flow through a single logging interface, making it easy to
 #### Example in tests
 
 ```typescript
-import { TestDatabaseInstance } from "strataline";
+import { TestDatabaseInstance } from "strataline/test-db-instance";
 import { migrations } from "./path/to/your/migrations";
 
 describe("Database Tests", () => {
@@ -1029,7 +1032,10 @@ Create a script to run your local development database server:
 // scripts/dev-db.ts
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
-import { LocalDevDBServer, createDevDBConsoleLogger } from "strataline";
+import {
+  LocalDevDBServer,
+  createDevDBConsoleLogger,
+} from "strataline/local-dev-db-server";
 
 // Calculate paths relative to the current script
 const __filename = fileURLToPath(import.meta.url);
@@ -1097,7 +1103,7 @@ const server = new LocalDevDBServer({
 You can customize logging behavior using the built-in console logger:
 
 ```typescript
-import { createDevDBConsoleLogger } from "strataline";
+import { createDevDBConsoleLogger } from "strataline/local-dev-db-server";
 
 // Create a logger with custom verbosity settings
 const logger = createDevDBConsoleLogger(

@@ -66,7 +66,12 @@ describe("LocalDevDBServer", () => {
     }
 
     // Clean up temporary directory
-    tempDir.removeCallback();
+    try {
+      tempDir.removeCallback();
+    } catch (e) {
+      // Ignore cleanup errors - the directory might have already been removed
+      // by the PostgreSQL server process or other cleanup mechanisms
+    }
   });
 
   it("should create a LocalDevDBServer instance", () => {
