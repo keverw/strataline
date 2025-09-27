@@ -1,4 +1,12 @@
 {
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "editor.formatOnSave": true,
+  "editor.formatOnPaste": true,
+  "editor.codeActionsOnSave": {
+    "source.fixAll.eslint": "explicit"
+  },
+  "editor.snippetSuggestions": "top",
+  "files.autoSave": "afterDelay",
   "cSpell.words": [
     "backpressure",
     "myapp",
@@ -10,5 +18,7 @@
     "tablename",
     "TIMESTAMPTZ",
     "VARCHAR"
-  ]
+  ],
+  "prettier.prettierPath": "./node_modules/prettier",
+  "prettier.requireConfig": true
 }

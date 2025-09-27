@@ -1,4 +1,64 @@
 import { defineConfig } from "tsup";
+import { readFileSync } from "fs";
+import { join } from "path";
+
+// Read package.json to get all dependencies
+const packageJson = JSON.parse(
+  readFileSync(join(process.cwd(), "package.json"), "utf-8"),
+);
+
+// Get all dependencies (regular + peer + dev) for external list
+const getAllDependencies = (additionalDeps?: string[]) => {
+  const deps = new Set<string>();
+
+  // Add regular dependencies
+  if (packageJson.dependencies) {
+    for (const dep of Object.keys(packageJson.dependencies)) {
+      deps.add(dep);
+    }
+  }
+
+  // Add peer dependencies
+  if (packageJson.peerDependencies) {
+    for (const dep of Object.keys(packageJson.peerDependencies)) {
+      deps.add(dep);
+    }
+  }
+
+  // Add dev dependencies (in case they're used in build)
+  if (packageJson.devDependencies) {
+    for (const dep of Object.keys(packageJson.devDependencies)) {
+      deps.add(dep);
+    }
+  }
+
+  // Add additional dependencies if provided
+  if (additionalDeps) {
+    for (const dep of additionalDeps) {
+      deps.add(dep);
+    }
+  }
+
+  return Array.from(deps).sort();
+};
+
+const allExternals = getAllDependencies([
+  // Mark embedded-postgres platform-specific packages as external
+  // These are dynamically imported at runtime based on the platform
+  "@embedded-postgres/darwin-arm64",
+  "@embedded-postgres/darwin-x64",
+  "@embedded-postgres/linux-arm",
+  "@embedded-postgres/linux-arm64",
+  "@embedded-postgres/linux-ia32",
+  "@embedded-postgres/linux-ppc64",
+  "@embedded-postgres/linux-x64",
+  "@embedded-postgres/windows-x64",
+]);
+
+// NOTE: This configuration externalizes ALL dependencies for NPM distribution
+// By default, tsup only excludes "dependencies" and "peerDependencies" but bundles "devDependencies"
+// For a library published to NPM, we want EVERYTHING external so users install their own deps
+// This approach automatically stays in sync with package.json changes
 
 export default defineConfig({
   entry: ["src/index.ts"],
@@ -7,23 +67,5 @@ export default defineConfig({
   splitting: false,
   sourcemap: true,
   clean: true,
-  external: [
-    // Mark pg as external since it's a peer dependency
-    "pg",
-    // Mark all regular dependencies as external - npm will install them automatically
-    "get-port",
-    "tmp",
-    // Mark embedded-postgres as external since it's a peer dependency
-    "embedded-postgres",
-    // Mark embedded-postgres platform-specific packages as external
-    // These are dynamically imported at runtime based on the platform
-    "@embedded-postgres/darwin-arm64",
-    "@embedded-postgres/darwin-x64",
-    "@embedded-postgres/linux-arm",
-    "@embedded-postgres/linux-arm64",
-    "@embedded-postgres/linux-ia32",
-    "@embedded-postgres/linux-ppc64",
-    "@embedded-postgres/linux-x64",
-    "@embedded-postgres/windows-x64",
-  ],
+  external: allExternals,
 });
