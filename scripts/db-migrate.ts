@@ -1,7 +1,7 @@
 // Load environment variables - this is only needed if you are using Node.js, Bun does not need it
 // import 'dotenv/config'
 
-import { RunStratalineCLI, createCLIConsoleLogger } from "../src";
+import { RunStratalineCLI, createCLIConsoleLogger } from "../src/cli";
 
 // For a real application, you would import your migrations
 // This is just a placeholder - replace with your actual migrations

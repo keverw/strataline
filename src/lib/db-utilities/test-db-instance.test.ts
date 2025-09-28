@@ -3,7 +3,7 @@ import {
   TestDatabaseInstance,
   createTestDBConsoleLogger,
 } from "./test-db-instance";
-import { Migration } from "strataline";
+import { Migration } from "../migration-system";
 
 describe("TestDatabaseInstance", () => {
   let db: TestDatabaseInstance;
@@ -118,7 +118,7 @@ describe("TestDatabaseInstance", () => {
       );
 
       // Verify data exists
-      let result = await pool.query(`SELECT * FROM additional_test_table`);
+      const result = await pool.query(`SELECT * FROM additional_test_table`);
       expect(result.rows.length).toBe(1);
 
       // Reset the database

@@ -687,6 +687,7 @@ describe("RunStratalineCLI", () => {
         const beforeSchemaErrorMigration: Migration = {
           id: "error_before_schema",
           description: "This migration fails in the beforeSchema phase",
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
           beforeSchema: async (client) => {
             throw new Error("Intentional error in beforeSchema phase");
           },
@@ -725,7 +726,10 @@ describe("RunStratalineCLI", () => {
           try {
             await dbInstance.stop();
           } catch (e) {
-            throw new Error(`Failed to stop test database: ${e.message}`);
+            // Log cleanup error but don't throw to avoid masking the original test error
+            console.error(
+              `Failed to stop test database during cleanup: ${e.message}`,
+            );
           }
         }
       }
@@ -772,6 +776,7 @@ describe("RunStratalineCLI", () => {
             // Should complete successfully
             await client.query("SELECT 1");
           },
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
           migration: async (pool, ctx) => {
             throw new Error("Intentional error in dataMigration phase");
           },
@@ -807,7 +812,10 @@ describe("RunStratalineCLI", () => {
           try {
             await dbInstance.stop();
           } catch (e) {
-            throw new Error(`Failed to stop test database: ${e.message}`);
+            // Log cleanup error but don't throw to avoid masking the original test error
+            console.error(
+              `Failed to stop test database during cleanup: ${e.message}`,
+            );
           }
         }
       }
@@ -857,6 +865,7 @@ describe("RunStratalineCLI", () => {
           migration: async (pool, ctx) => {
             ctx.complete();
           },
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
           afterSchema: async (client) => {
             throw new Error("Intentional error in afterSchema phase");
           },
@@ -892,7 +901,10 @@ describe("RunStratalineCLI", () => {
           try {
             await dbInstance.stop();
           } catch (e) {
-            throw new Error(`Failed to stop test database: ${e.message}`);
+            // Log cleanup error but don't throw to avoid masking the original test error
+            console.error(
+              `Failed to stop test database during cleanup: ${e.message}`,
+            );
           }
         }
       }

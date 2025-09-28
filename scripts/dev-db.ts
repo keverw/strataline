@@ -1,6 +1,9 @@
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
-import { LocalDevDBServer, createDevDBConsoleLogger } from "../src/index";
+import {
+  LocalDevDBServer,
+  createDevDBConsoleLogger,
+} from "../src/local-dev-db-server";
 
 // Calculate paths relative to the current script
 const __filename = fileURLToPath(import.meta.url);

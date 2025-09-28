@@ -88,23 +88,31 @@ describe("MigrationManager", () => {
     } catch (error) {
       console.error("Failed to set up test database:", error);
       // Clean up if setup failed
-      if (pool)
+      if (pool) {
         await pool.end().catch((e) => console.error("Error closing pool:", e));
-      if (postgres)
+      }
+
+      if (postgres) {
         await postgres
           .stop()
           .catch((e) => console.error("Error stopping postgres:", e));
+      }
+
       throw error;
     }
   }); // Allow up to 30 seconds for startup
 
   // Clean up the embedded PostgreSQL server after all tests
   afterAll(async () => {
-    if (!isSetupComplete) return;
+    if (!isSetupComplete) {
+      return;
+    }
 
     try {
       // Close the connection pool
-      if (pool) await pool.end();
+      if (pool) {
+        await pool.end();
+      }
 
       // Drop the test database and stop the embedded PostgreSQL server
       if (postgres) {
@@ -229,7 +237,8 @@ describe("MigrationManager", () => {
       // Verify the migration was successful
       expect(result.success).toBe(true);
       expect(result.status).toBe("completed");
-      expect(result.completedMigrations).toContain("test_migration_001");
+      expect(result.completedMigrations).toEqual(["test_migration_001"]);
+      expect(result.previouslyAppliedMigrations).toEqual([]);
 
       // Verify the table was created and data was inserted
       const client = await pool.connect();
@@ -371,6 +380,7 @@ describe("MigrationManager", () => {
         success: true,
         status: "completed",
         completedMigrations: ["data_migration_001"],
+        previouslyAppliedMigrations: [],
         pendingMigrations: [],
         migrationData: {
           data_migration_001: {
@@ -457,6 +467,7 @@ describe("MigrationManager", () => {
       const errorBeforeSchemaMigration: Migration = {
         id: "error_before_schema_001",
         description: "Migration that errors in beforeSchema",
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
         beforeSchema: async (client) => {
           throw new Error("Failure in beforeSchema");
         },
@@ -473,7 +484,8 @@ describe("MigrationManager", () => {
       expect(result.reason).toBe(
         "Migration error_before_schema_001 failed: [beforeSchema] Failure in beforeSchema",
       );
-      expect(result.completedMigrations.length).toBe(0);
+      expect(result.completedMigrations).toEqual([]);
+      expect(result.previouslyAppliedMigrations).toEqual([]);
       expect(result.pendingMigrations).toContain("error_before_schema_001");
     },
     TEST_TIMEOUT,
@@ -485,6 +497,7 @@ describe("MigrationManager", () => {
       const errorInMigrationFunc: Migration = {
         id: "error_in_migration_func_001",
         description: "Migration that errors in its main function",
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
         migration: async (pool, ctx) => {
           throw new Error("Failure in migration function");
         },
@@ -511,6 +524,7 @@ describe("MigrationManager", () => {
         id: "no_callback_001",
         description:
           "Migration that finishes without calling complete or defer",
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
         migration: async (pool, ctx) => {
           // Simulates doing some work but not calling complete() or defer()
           await pool.query("SELECT 1");
@@ -543,6 +557,7 @@ describe("MigrationManager", () => {
         migration: async (pool, ctx) => {
           ctx.complete();
         },
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
         afterSchema: async (client) => {
           throw new Error("Failure in afterSchema");
         },
@@ -576,8 +591,9 @@ describe("MigrationManager", () => {
       // The migration should succeed since all phases are marked as complete
       expect(result.success).toBe(true);
       expect(result.status).toBe("completed");
-      expect(result.completedMigrations).toContain("empty_migration_001");
-      expect(result.pendingMigrations.length).toBe(0);
+      expect(result.completedMigrations).toEqual(["empty_migration_001"]);
+      expect(result.previouslyAppliedMigrations).toEqual([]);
+      expect(result.pendingMigrations).toEqual([]);
 
       // Verify migration status in the database
       const client = await pool.connect();
@@ -651,8 +667,9 @@ describe("MigrationManager", () => {
       // The migration should succeed with all handlers executed
       expect(result.success).toBe(true);
       expect(result.status).toBe("completed");
-      expect(result.completedMigrations).toContain("complete_handlers_001");
-      expect(result.pendingMigrations.length).toBe(0);
+      expect(result.completedMigrations).toEqual(["complete_handlers_001"]);
+      expect(result.previouslyAppliedMigrations).toEqual([]);
+      expect(result.pendingMigrations).toEqual([]);
 
       // Verify all handlers executed by checking the tracker table
       const verifyClient = await pool.connect();
@@ -738,7 +755,8 @@ describe("MigrationManager", () => {
       // Verify the migration was successful
       expect(result.success).toBe(true);
       expect(result.status).toBe("completed");
-      expect(result.completedMigrations).toContain("lock_renewal_test_001");
+      expect(result.completedMigrations).toEqual(["lock_renewal_test_001"]);
+      expect(result.previouslyAppliedMigrations).toEqual([]);
 
       // Verify the lock renewal by checking the lock_renewal_test table
       const client = await pool.connect();
@@ -833,7 +851,8 @@ describe("MigrationManager", () => {
       // Verify the migration was successful
       expect(result.success).toBe(true);
       expect(result.status).toBe("completed");
-      expect(result.completedMigrations).toContain("logger_test_001");
+      expect(result.completedMigrations).toEqual(["logger_test_001"]);
+      expect(result.previouslyAppliedMigrations).toEqual([]);
 
       // Verify the log entries were created in the database
       const client = await pool.connect();
@@ -927,11 +946,27 @@ describe("MigrationManager", () => {
       // Verify the migrations were successful
       expect(result.success).toBe(true);
       expect(result.status).toBe("completed");
-      expect(result.completedMigrations).toContain("multi_migration_001");
-      expect(result.completedMigrations).toContain("multi_migration_002");
-      expect(result.completedMigrations).toContain("multi_migration_003");
-      expect(result.completedMigrations.length).toBe(3);
-      expect(result.pendingMigrations.length).toBe(0);
+      expect(result.completedMigrations).toEqual([
+        "multi_migration_001",
+        "multi_migration_002",
+        "multi_migration_003",
+      ]);
+      expect(result.previouslyAppliedMigrations).toEqual([]);
+      expect(result.pendingMigrations).toEqual([]);
+
+      // Run migrations again to test previously applied migrations behavior
+      const secondResult = await migrationManager.runSchemaChanges("job");
+
+      // Verify that no new migrations were applied, but previously applied ones are tracked
+      expect(secondResult.success).toBe(true);
+      expect(secondResult.status).toBe("completed");
+      expect(secondResult.completedMigrations).toEqual([]); // No new migrations in this run
+      expect(secondResult.previouslyAppliedMigrations).toEqual([
+        "multi_migration_001",
+        "multi_migration_002",
+        "multi_migration_003",
+      ]); // All migrations were already applied
+      expect(secondResult.pendingMigrations).toEqual([]);
 
       // Verify the database state after all migrations
       const client = await pool.connect();

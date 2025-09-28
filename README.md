@@ -1,5 +1,7 @@
 # Strataline v3.0.1
 
+todo: bump to v4.0.0 since imports changed....
+
 [![npm version](https://badge.fury.io/js/strataline.svg)](https://badge.fury.io/js/strataline)
 
 **Strataline** is a structured migration system for PostgreSQL that treats database changes as layered, resumable operations—built to scale from small projects to distributed, orchestrated systems.
@@ -362,9 +364,9 @@ When using `loadFrom: "env"`, the following environment variables are required:
 
 Optional environment variables for pool configuration:
 
-- `POSTGRES_MAX_CONNECTIONS`: Maximum number of connections in the pool
-- `POSTGRES_IDLE_TIMEOUT`: Idle timeout in milliseconds
-- `POSTGRES_CONNECTION_TIMEOUT`: Connection timeout in milliseconds
+- `POSTGRES_MAX_CONNECTIONS`: Maximum number of connections in the pool (default: 20)
+- `POSTGRES_IDLE_TIMEOUT`: Idle timeout in milliseconds (default: 30000)
+- `POSTGRES_CONNECTION_TIMEOUT`: Connection timeout in milliseconds (default: 2000)
 
 #### Available Commands
 
@@ -444,8 +446,20 @@ async function main() {
 
     if (result.success) {
       console.log("✅ Migrations completed successfully!");
+
+      // Always show migrations applied in this run (even if none)
       console.log(
-        `Completed migrations: ${result.completedMigrations.join(", ") || "none"}`,
+        `Applied during this run: ${result.completedMigrations.join(", ") || "none"}`,
+      );
+
+      // Always show migrations that were already applied in previous runs (even if none)
+      console.log(
+        `Previously applied: ${result.previouslyAppliedMigrations?.join(", ") || "none"}`,
+      );
+
+      // Always show pending migrations (even if none)
+      console.log(
+        `Pending migrations: ${result.pendingMigrations.join(", ") || "none"}`,
       );
 
       if (
@@ -461,8 +475,18 @@ async function main() {
     } else {
       console.error(`❌ Migration failed: ${result.reason}`);
       console.log(
-        `Completed migrations: ${result.completedMigrations.join(", ") || "none"}`,
+        `Completed migrations in this run: ${result.completedMigrations.join(", ") || "none"}`,
       );
+
+      if (
+        result.previouslyAppliedMigrations &&
+        result.previouslyAppliedMigrations.length > 0
+      ) {
+        console.log(
+          `Previously applied migrations: ${result.previouslyAppliedMigrations.join(", ")}`,
+        );
+      }
+
       console.log(
         `Pending migrations: ${result.pendingMigrations.join(", ") || "none"}`,
       );
@@ -589,6 +613,33 @@ This approach allows you to:
 - Limit the impact of any single migration job
 - Implement sophisticated retry and monitoring logic
 - Handle backpressure and staged rollouts
+
+## Migration Results
+
+The `runSchemaChanges()` method returns a `MigrationResult` object that provides detailed information about the migration run:
+
+```typescript
+interface MigrationResult {
+  success: boolean; // Whether all migrations completed successfully
+  status: "completed" | "locked" | "error" | "deferred";
+  reason?: string; // User-friendly error/deferral message
+  completedMigrations: string[]; // IDs of migrations completed in this run
+  previouslyAppliedMigrations: string[]; // IDs of migrations already applied in previous runs
+  pendingMigrations: string[]; // IDs of migrations still pending
+  lastAttemptedMigration?: string; // ID of the last migration attempted
+  error?: Error; // Raw error object for debugging (unhandled exceptions only)
+  migrationData?: Record<string, any>; // Data returned by successful migrations
+}
+```
+
+### Error Handling
+
+Strataline provides two levels of error information:
+
+- **`reason`**: Always a formatted string message suitable for display in logs/CLI output
+- **`error`**: Raw Error object with stack trace, only present for unhandled exceptions (not for controlled migration phase errors)
+
+The built-in CLI shows both the `reason` (always) and `error` details with stack trace (when available) to help with debugging.
 
 ## Backpressure Handling
 

@@ -86,6 +86,7 @@ export class ConsoleLogger extends BaseLogger {
   info(data: LogDataInput): void {
     const logData: LogData = { ...data, level: "info" };
     const prefix = buildLogPrefix(logData);
+    // eslint-disable-next-line no-console
     console.log(`${prefix}${logData.message}`);
   }
 
@@ -96,6 +97,7 @@ export class ConsoleLogger extends BaseLogger {
   error(data: LogDataInput): void {
     const logData: LogData = { ...data, level: "error" };
     const prefix = buildLogPrefix(logData);
+    // eslint-disable-next-line no-console
     console.error(`${prefix}${logData.message}`, logData.error);
   }
 
@@ -105,6 +107,7 @@ export class ConsoleLogger extends BaseLogger {
   warn(data: LogDataInput): void {
     const logData: LogData = { ...data, level: "warn" };
     const prefix = buildLogPrefix(logData);
+    // eslint-disable-next-line no-console
     console.warn(`${prefix}${logData.message}`);
   }
 }

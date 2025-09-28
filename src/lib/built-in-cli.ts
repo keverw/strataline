@@ -26,23 +26,29 @@ export const createCLIConsoleLogger = (
   return (type, message) => {
     switch (type) {
       case "info":
+        // eslint-disable-next-line no-console
         console.log(message);
         break;
       case "error":
+        // eslint-disable-next-line no-console
         console.error(message);
         break;
       case "warn":
+        // eslint-disable-next-line no-console
         console.warn(message);
         break;
       case "migrate-info":
         if (migrateVerbose) {
+          // eslint-disable-next-line no-console
           console.log(`[MIGRATE-INFO] ${message}`);
         }
         break;
       case "migrate-error":
+        // eslint-disable-next-line no-console
         console.error(`[MIGRATE-ERROR] ${message}`);
         break;
       case "migrate-warn":
+        // eslint-disable-next-line no-console
         console.warn(`[MIGRATE-WARN] ${message}`);
         break;
     }
@@ -112,10 +118,11 @@ async function testConnection(
     } finally {
       client.release();
     }
-  } catch (error: any) {
+  } catch (error: unknown) {
     // Log the error with detailed connection information
     logger("error", "Error connecting to database:");
-    logger("error", `→ ${error.message}`);
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    logger("error", `→ ${errorMessage}`);
 
     // Only show environment variable details if we're using env mode
     if (loadedFrom === "env") {
@@ -171,21 +178,40 @@ async function runMigrations(
   const result = await manager.runSchemaChanges(mode);
 
   if (result.success) {
-    if (result.completedMigrations.length > 0) {
-      logger(
-        "info",
-        `Applied ${result.completedMigrations.length} migrations: ${result.completedMigrations.join(", ")}`,
-      );
-    } else {
-      logger("info", "No pending migrations to apply");
-    }
+    // Always show migrations applied in this run (even if none)
+    logger(
+      "info",
+      `Applied during this run: ${result.completedMigrations.join(", ") || "none"}`,
+    );
+
+    // Always show migrations that were already applied in previous runs (even if none)
+    logger(
+      "info",
+      `Previously applied: ${result.previouslyAppliedMigrations?.join(", ") || "none"}`,
+    );
+
+    // Always show pending migrations (even if none)
+    logger(
+      "info",
+      `Pending migrations: ${result.pendingMigrations.join(", ") || "none"}`,
+    );
   } else {
     logger("error", `Migration failed: ${result.reason}`);
 
     logger(
       "info",
-      `Completed migrations: ${result.completedMigrations.join(", ") || "none"}`,
+      `Completed migrations in this run: ${result.completedMigrations.join(", ") || "none"}`,
     );
+
+    if (
+      result.previouslyAppliedMigrations &&
+      result.previouslyAppliedMigrations.length > 0
+    ) {
+      logger(
+        "info",
+        `Previously applied migrations: ${result.previouslyAppliedMigrations.join(", ")}`,
+      );
+    }
 
     logger(
       "info",
@@ -197,6 +223,15 @@ async function runMigrations(
         "info",
         `Last attempted migration: ${result.lastAttemptedMigration}`,
       );
+    }
+
+    // Show raw error details if available for debugging (unhandled exceptions only)
+    if (result.error) {
+      logger("error", `Error details: ${result.error.message}`);
+
+      if (result.error.stack) {
+        logger("error", `Stack trace: ${result.error.stack}`);
+      }
     }
 
     throw new Error(`Migration failed: ${result.reason}`);
@@ -278,7 +313,7 @@ export async function RunStratalineCLI(config: {
   let poolInstance: Pool | undefined;
 
   // Validate configuration
-  if (config.loadFrom == "env") {
+  if (config.loadFrom === "env") {
     // Ensure pool is not provided, and envPrefix is optional
     if (config.pool) {
       throw new Error("Cannot provide both pool and loadFrom='env'");
@@ -299,15 +334,15 @@ export async function RunStratalineCLI(config: {
 
     // Check if all required environment variables are present with the given prefix
     const missingEnvVars = requiredEnvVars.filter(
-      (envVar) => !env[`${prefix}${envVar}`],
+      (envVar) => !env[prefix + envVar],
     );
 
     if (missingEnvVars.length > 0) {
-      const formattedVars = missingEnvVars.map((v) => `${prefix}${v}`);
+      const formattedVars = missingEnvVars.map((v) => prefix + v);
 
       config.logger(
         "error",
-        `Missing required environment variables: ${formattedVars.join(", ")}`,
+        "Missing required environment variables: " + formattedVars.join(", "),
       );
 
       config.logger(
@@ -316,28 +351,85 @@ export async function RunStratalineCLI(config: {
       );
 
       throw new Error(
-        `Missing required environment variables: ${formattedVars.join(", ")}`,
+        "Missing required environment variables: " + formattedVars.join(", "),
       );
     }
 
     // PostgreSQL Connection Pool
+    const portValue = env[prefix + "POSTGRES_PORT"];
+    const maxConnectionsValue = env[prefix + "POSTGRES_MAX_CONNECTIONS"];
+    const idleTimeoutValue = env[prefix + "POSTGRES_IDLE_TIMEOUT"];
+    const connectionTimeoutValue = env[prefix + "POSTGRES_CONNECTION_TIMEOUT"];
+
+    // Parse and validate port (required)
+    const port = parseInt(portValue || "5432", 10);
+
+    if (isNaN(port) || port <= 0 || port > 65535) {
+      throw new Error(
+        "Invalid " +
+          prefix +
+          "POSTGRES_PORT: must be a valid port number (1-65535), got: " +
+          portValue,
+      );
+    }
+
+    // Parse and validate optional numeric values
+    let maxConnections = 20;
+
+    if (maxConnectionsValue) {
+      maxConnections = parseInt(maxConnectionsValue, 10);
+
+      if (isNaN(maxConnections) || maxConnections <= 0) {
+        throw new Error(
+          "Invalid " +
+            prefix +
+            "POSTGRES_MAX_CONNECTIONS: must be a positive number, got: " +
+            maxConnectionsValue,
+        );
+      }
+    }
+
+    let idleTimeout = 30000;
+
+    if (idleTimeoutValue) {
+      idleTimeout = parseInt(idleTimeoutValue, 10);
+
+      if (isNaN(idleTimeout) || idleTimeout < 0) {
+        throw new Error(
+          "Invalid " +
+            prefix +
+            "POSTGRES_IDLE_TIMEOUT: must be a non-negative number, got: " +
+            idleTimeoutValue,
+        );
+      }
+    }
+
+    let connectionTimeout = 2000;
+
+    if (connectionTimeoutValue) {
+      connectionTimeout = parseInt(connectionTimeoutValue, 10);
+
+      if (isNaN(connectionTimeout) || connectionTimeout < 0) {
+        throw new Error(
+          "Invalid " +
+            prefix +
+            "POSTGRES_CONNECTION_TIMEOUT: must be a non-negative number, got: " +
+            connectionTimeoutValue,
+        );
+      }
+    }
+
     poolInstance = new Pool({
-      user: env[`${prefix}POSTGRES_USER`],
-      host: env[`${prefix}POSTGRES_HOST`],
-      database: env[`${prefix}POSTGRES_DATABASE`],
-      password: env[`${prefix}POSTGRES_PASSWORD`],
-      port: parseInt(env[`${prefix}POSTGRES_PORT`]!, 10),
-      max: env[`${prefix}POSTGRES_MAX_CONNECTIONS`]
-        ? parseInt(env[`${prefix}POSTGRES_MAX_CONNECTIONS`]!, 10)
-        : 20, // Max number of clients in the pool
-      idleTimeoutMillis: env[`${prefix}POSTGRES_IDLE_TIMEOUT`]
-        ? parseInt(env[`${prefix}POSTGRES_IDLE_TIMEOUT`]!, 10)
-        : 30000, // How long a client is allowed to remain idle before being closed
-      connectionTimeoutMillis: env[`${prefix}POSTGRES_CONNECTION_TIMEOUT`]
-        ? parseInt(env[`${prefix}POSTGRES_CONNECTION_TIMEOUT`]!, 10)
-        : 2000, // How long to wait for a connection from the pool
+      user: env[prefix + "POSTGRES_USER"],
+      host: env[prefix + "POSTGRES_HOST"],
+      database: env[prefix + "POSTGRES_DATABASE"],
+      password: env[prefix + "POSTGRES_PASSWORD"],
+      port: port,
+      max: maxConnections,
+      idleTimeoutMillis: idleTimeout,
+      connectionTimeoutMillis: connectionTimeout,
     });
-  } else if (config.loadFrom == "pool") {
+  } else if (config.loadFrom === "pool") {
     // Ensure pool is provided
     if (config.pool) {
       poolInstance = config.pool;
@@ -417,8 +509,10 @@ Options:
           );
           break;
       }
-    } catch (error: any) {
-      config.logger("error", `Error: ${error.message || String(error)}`);
+    } catch (error: unknown) {
+      const errorMessage =
+        error instanceof Error ? error.message : String(error);
+      config.logger("error", `Error: ${errorMessage}`);
       throw error; // Re-throw to allow caller to handle it
     } finally {
       await poolInstance.end();

@@ -16,7 +16,10 @@ export type MigrationCompletionCallback = () => void;
 export type MigrationDeferCallback = (reason?: string) => void;
 
 // Migration interface with generic payload and return types
-export interface Migration<TPayload = Record<string, any>, TReturn = any> {
+export interface Migration<
+  TPayload = Record<string, unknown>,
+  TReturn = unknown,
+> {
   id: string;
   description: string;
 
@@ -64,13 +67,13 @@ export type DataMigrationJobStatus =
   | "not_found"
   | "invalid_state";
 
-export interface DataMigrationJobResult<D = any> {
+export interface DataMigrationJobResult<D = unknown> {
   status: DataMigrationJobStatus;
   reason?: string;
   data?: D;
 }
 
-export interface DataMigrationPhaseResult<D = any> {
+export interface DataMigrationPhaseResult<D = unknown> {
   status: "success" | "deferred" | "error";
   reason?: string;
   data?: D;
@@ -79,18 +82,21 @@ export interface DataMigrationPhaseResult<D = any> {
 /**
  * Result of running schema changes
  */
-export interface MigrationResult<D_ALL = Record<string, any>> {
+export interface MigrationResult<D_ALL = Record<string, unknown>> {
   // Whether all migrations completed successfully
   success: boolean;
 
   // Status of the migration run
   status: "completed" | "locked" | "error" | "deferred";
 
-  // Reason for failure or deferral if applicable
+  // Reason for failure or deferral if applicable (always a formatted string for display)
   reason?: string;
 
-  // IDs of migrations that were successfully completed
+  // IDs of migrations that were successfully completed in this run
   completedMigrations: string[];
+
+  // IDs of migrations that were already applied in previous runs
+  previouslyAppliedMigrations: string[];
 
   // IDs of migrations that are still pending
   pendingMigrations: string[];
@@ -98,8 +104,11 @@ export interface MigrationResult<D_ALL = Record<string, any>> {
   // ID of the last migration that was attempted (whether successful or not)
   lastAttemptedMigration?: string;
 
-  // Error details if status is "error"
-  error?: any;
+  // Raw error object for debugging (only present for unhandled exceptions)
+  // Contains the original Error object when an exception was caught during migration execution
+  // Use 'reason' for formatted display messages, 'error' for stack traces and detailed debugging
+  // Note: Not present for controlled migration phase errors (those only populate 'reason')
+  error?: Error;
 
   // Data returned by successful migrations in this run
   migrationData?: D_ALL;
@@ -139,7 +148,7 @@ export class MigrationManager {
     },
   ): Promise<void> {
     const updates: string[] = [];
-    const values: any[] = [id];
+    const values: unknown[] = [id];
     let paramIndex = 2;
 
     if (fields.beforeSchemaApplied !== undefined) {
@@ -166,7 +175,9 @@ export class MigrationManager {
     updates.push(`last_updated = $${paramIndex++}`);
     values.push(Math.floor(Date.now() / 1000));
 
-    if (updates.length === 0) return;
+    if (updates.length === 0) {
+      return;
+    }
 
     const query = `
       UPDATE migration_status
@@ -250,7 +261,7 @@ export class MigrationManager {
    * @throws Error if duplicate migration IDs are detected
    */
 
-  register<TPayload = Record<string, any>, TReturn = any>(
+  register<TPayload = Record<string, unknown>, TReturn = unknown>(
     migrations: Migration<TPayload, TReturn>[],
   ): void {
     // Check for duplicate migration IDs
@@ -307,7 +318,7 @@ export class MigrationManager {
   async runSchemaChanges(mode: MigrationMode): Promise<MigrationResult> {
     await this.ensureInitialized();
 
-    const migrationData: Record<string, any> = {}; // To store data from successful migrations
+    const migrationData: Record<string, unknown> = {}; // To store data from successful migrations
 
     // Try to acquire the lock
     const lockAcquired = await this.acquireMigrationLock();
@@ -321,6 +332,7 @@ export class MigrationManager {
         status: "locked",
         reason: "Another process is running migrations",
         completedMigrations: [],
+        previouslyAppliedMigrations: [], // We don't check the status when locked
         pendingMigrations: this.migrations.map((m) => m.id),
         migrationData,
       };
@@ -340,20 +352,28 @@ export class MigrationManager {
       // Find migrations that haven't been applied yet or have applied_at = 0
       const pendingMigrations = this.migrations.filter((m) => {
         // If not in status table, it's pending
-        if (!migrationStatusMap.has(m.id)) return true;
+        if (!migrationStatusMap.has(m.id)) {
+          return true;
+        }
 
-        const migrationStatus = migrationStatusMap.get(m.id)!;
+        const migrationStatus = migrationStatusMap.get(m.id);
+        if (!migrationStatus) {
+          return true; // If not found in map, it's pending
+        }
 
         // If completedAt is 0, it's not fully completed yet
-        if (migrationStatus.completedAt === 0) return true;
+        if (migrationStatus.completedAt === 0) {
+          return true;
+        }
 
         // If any of the phases are not applied, it's pending
         if (
           !migrationStatus.beforeSchemaApplied ||
           !migrationStatus.migrationComplete ||
           !migrationStatus.afterSchemaApplied
-        )
+        ) {
           return true;
+        }
 
         // Otherwise, it's completed
         return false;
@@ -365,7 +385,8 @@ export class MigrationManager {
         return {
           success: true,
           status: "completed",
-          completedMigrations: appliedIds,
+          completedMigrations: [], // No migrations completed in this run
+          previouslyAppliedMigrations: appliedIds, // All migrations were already applied
           pendingMigrations: [],
           migrationData, // Empty, as no migrations from *this run*
         };
@@ -388,7 +409,7 @@ export class MigrationManager {
           });
 
           // P_Payload and P_Return will be 'any' here as runSchemaChanges doesn't know specific types
-          const result = await this.runSingleMigration<any, any>(
+          const result = await this.runSingleMigration<unknown, unknown>(
             migration,
             mode,
           );
@@ -418,10 +439,13 @@ export class MigrationManager {
               status: finalStatus,
               reason: finalReason,
               completedMigrations,
+              previouslyAppliedMigrations: appliedIds.filter(
+                (id) => !completedMigrations.includes(id),
+              ),
               pendingMigrations: remainingPendingMigrations,
               lastAttemptedMigration,
-              // Optionally, include the original error if it's an error status and available
-              ...(result.status === "error" && { error: result.reason }),
+              // Note: We don't set 'error' here because result.reason is already a processed string
+              // The 'error' field is reserved for raw error objects from unhandled exceptions
               migrationData, // Include data from migrations completed so far
             };
           }
@@ -441,7 +465,7 @@ export class MigrationManager {
           this.logger.info({
             message: `Successfully completed migration ${migration.id}`,
           });
-        } catch (error: any) {
+        } catch (error: unknown) {
           // Log the error and stop processing further migrations
           this.logger.error({
             message: `Migration ${migration.id} failed - stopping migration process to prevent out-of-order migrations`,
@@ -452,7 +476,8 @@ export class MigrationManager {
 
           // Check if the error already has a phase prefix; if not, add a generic one
           // This ensures we don't lose information about which phase had the error
-          const errorMessage = error.message || String(error);
+          const errorMessage =
+            error instanceof Error ? error.message : String(error);
           const errorReason = errorMessage.match(
             /\[(beforeSchema|dataMigration|afterSchema)\]/,
           )
@@ -464,9 +489,12 @@ export class MigrationManager {
             status: "error",
             reason: errorReason,
             completedMigrations,
+            previouslyAppliedMigrations: appliedIds.filter(
+              (id) => !completedMigrations.includes(id),
+            ),
             pendingMigrations: remainingPendingMigrations,
             lastAttemptedMigration,
-            error,
+            error: error instanceof Error ? error : undefined,
             migrationData, // Include data from migrations completed so far
           };
         }
@@ -477,6 +505,9 @@ export class MigrationManager {
         success: true,
         status: "completed",
         completedMigrations,
+        previouslyAppliedMigrations: appliedIds.filter(
+          (id) => !completedMigrations.includes(id),
+        ),
         pendingMigrations: [],
         migrationData,
       };
@@ -494,8 +525,8 @@ export class MigrationManager {
    */
 
   private async runSingleMigration<
-    TPayload = Record<string, any>,
-    TReturn = any,
+    TPayload = Record<string, unknown>,
+    TReturn = unknown,
   >(
     migration: Migration<TPayload, TReturn>,
     mode: MigrationMode,
@@ -544,7 +575,7 @@ export class MigrationManager {
           helpers,
           taskLogger,
         );
-      } catch (err: any) {
+      } catch (err: unknown) {
         taskLogger.error({
           message: `[beforeSchema] Error in beforeSchema for migration ${migration.id}:`,
           error: err,
@@ -552,7 +583,7 @@ export class MigrationManager {
 
         return {
           status: "error",
-          reason: `[beforeSchema] ${err.message || String(err)}`,
+          reason: `[beforeSchema] ${err instanceof Error ? err.message : String(err)}`,
         };
       }
     } else {
@@ -597,7 +628,7 @@ export class MigrationManager {
           helpers,
           taskLogger,
         );
-      } catch (err: any) {
+      } catch (err: unknown) {
         taskLogger.error({
           message: `[afterSchema] Error in afterSchema for migration ${migration.id}:`,
           error: err,
@@ -605,7 +636,7 @@ export class MigrationManager {
 
         return {
           status: "error",
-          reason: `[afterSchema] ${err.message || String(err)}`,
+          reason: `[afterSchema] ${err instanceof Error ? err.message : String(err)}`,
         };
       }
     } else {
@@ -637,7 +668,7 @@ export class MigrationManager {
   /**
    * Run a specific phase of a migration
    */
-  private async runMigrationPhase<P = Record<string, any>>(
+  private async runMigrationPhase<P = Record<string, unknown>>(
     migration: Migration<P>,
     phase: SchemaPhase,
     helpers: SchemaHelpers,
@@ -707,7 +738,10 @@ export class MigrationManager {
    * Returns a promise that resolves to a status object with optional data
    */
 
-  private async runDataMigration<TPayload = Record<string, any>, TReturn = any>(
+  private async runDataMigration<
+    TPayload = Record<string, unknown>,
+    TReturn = unknown,
+  >(
     migration: Migration<TPayload, TReturn>,
     logger: Logger,
     mode: MigrationMode,
@@ -734,7 +768,7 @@ export class MigrationManager {
 
             resolve({ status: "success", data }); // "Truly done"
           })
-          .catch((dbError: any) => {
+          .catch((dbError: unknown) => {
             logger.error({
               message: `[dataMigration] Error updating migration_status after callback:`,
               error: dbError,
@@ -744,7 +778,7 @@ export class MigrationManager {
               status: "error",
               reason:
                 "[dataMigration] Data migration complete callback: Failed to update migration status in database after complete() was called: " +
-                (dbError.message || String(dbError)),
+                (dbError instanceof Error ? dbError.message : String(dbError)),
             });
           });
       };
@@ -854,10 +888,13 @@ export class MigrationManager {
         );
 
         // If we get here, we got the lock with a clean insert
-      } catch (error: any) {
-        // If error is not a duplicate key error, rethrow
-        if (!error.message?.includes("duplicate key")) {
-          throw error;
+      } catch (error: unknown) {
+        // Only handle duplicate key errors from PostgreSQL (expected when lock already exists)
+        const isDuplicateKeyError =
+          error instanceof Error && error.message?.includes("duplicate key");
+
+        if (!isDuplicateKeyError) {
+          throw error; // Rethrow unexpected errors
         }
 
         // We have a lock record already - check if it's expired and we can take it over
@@ -949,7 +986,9 @@ export class MigrationManager {
    * Renew an existing migration lock
    */
   private async renewLock(): Promise<void> {
-    if (!this.lockId) return;
+    if (!this.lockId) {
+      return;
+    }
 
     const client = await this.pool.connect();
     try {
@@ -1015,7 +1054,10 @@ export class MigrationManager {
    * @param payload Optional payload to pass to the data migration
    * @returns A DataMigrationJobResult object indicating status and any returned data
    */
-  async runDataMigrationJobOnly<TPayload = Record<string, any>, TReturn = any>(
+  async runDataMigrationJobOnly<
+    TPayload = Record<string, unknown>,
+    TReturn = unknown,
+  >(
     migrationId: string,
     payload?: TPayload,
   ): Promise<DataMigrationJobResult<TReturn>> {
@@ -1147,13 +1189,16 @@ export class MigrationManager {
         });
         return { status: "error", reason: result.reason, data: result.data };
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       taskLogger.error({
         message: `Error in data migration:`,
         error: err,
       });
 
-      return { status: "error", reason: err.message || String(err) };
+      return {
+        status: "error",
+        reason: err instanceof Error ? err.message : String(err),
+      };
     }
   }
 
@@ -1166,7 +1211,9 @@ export class MigrationManager {
     this.stopLockRenewal();
 
     // Only try to release if we have a lock ID
-    if (!this.lockId) return;
+    if (!this.lockId) {
+      return;
+    }
 
     const client = await this.pool.connect();
     try {
