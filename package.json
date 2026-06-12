@@ -29,7 +29,9 @@
     "dist"
   ],
   "scripts": {
+    "prepublishOnly": "bun audit && bun run build && bun run type-check && bun run lint && bun test",
     "build": "bun run update-readme && tsup",
+    "type-check": "tsc --noEmit",
     "dev": "tsup --watch",
     "dev:db": "bun run scripts/dev-db.ts",
     "db:migrate": "bun run scripts/db-migrate.ts run",
