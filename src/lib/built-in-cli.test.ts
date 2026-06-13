@@ -680,7 +680,9 @@ describe("RunStratalineCLI", () => {
           const client = await pool.connect();
           await client.release();
         } catch (error: any) {
-          throw new Error(`Cannot connect to test database: ${error.message}`);
+          throw new Error(`Cannot connect to test database: ${error.message}`, {
+            cause: error,
+          });
         }
 
         // Define a simple migration that fails in the beforeSchema phase
@@ -765,7 +767,9 @@ describe("RunStratalineCLI", () => {
           const client = await pool.connect();
           await client.release();
         } catch (error: any) {
-          throw new Error(`Cannot connect to test database: ${error.message}`);
+          throw new Error(`Cannot connect to test database: ${error.message}`, {
+            cause: error,
+          });
         }
 
         // Define a simple migration that fails in the dataMigration phase
@@ -851,7 +855,9 @@ describe("RunStratalineCLI", () => {
           const client = await pool.connect();
           await client.release();
         } catch (error: any) {
-          throw new Error(`Cannot connect to test database: ${error.message}`);
+          throw new Error(`Cannot connect to test database: ${error.message}`, {
+            cause: error,
+          });
         }
 
         // Define a simple migration that fails in the afterSchema phase

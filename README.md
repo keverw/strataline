@@ -1245,9 +1245,9 @@ This helper runs a **persistent local PostgreSQL server** in a standalone script
 It uses the same embedded PostgreSQL binaries as Strataline's Test DB Instance, so there's **no need to install Postgres manually** or run Docker. No `brew`, no `apt`, no containers, just run `bun run dev:db` and go.
 
 - **For local development, you do _not_ need to install PostgreSQL manually.**
-- The dev database server (`bun run dev:db`) uses [@embedded-postgres](https://www.npmjs.com/package/@embedded-postgres) to provide platform-specific PostgreSQL 17 binaries via npm.
-- _Note: The embedded dev database does **not** bundle `pg_upgrade`. If we bump the embedded version in the future, you may need to delete your local data directory (`pgdata/`) and let it reinitialize. This is usually fine for dev/test workflows._
-- **Production deployments** still require a managed PostgreSQL 17+ instance, and upgrades must be handled manually by your ops team.
+- The dev database server (`bun run dev:db`) uses [@embedded-postgres](https://www.npmjs.com/package/@embedded-postgres) to provide platform-specific PostgreSQL 18 binaries via npm.
+- _Note: The embedded dev database does **not** bundle `pg_upgrade`. When we bump the embedded version in the future, you may need to delete your local data directory (`pgdata/`) and let it reinitialize. This is usually fine for dev/test workflows._
+- **Production deployments** still require a managed PostgreSQL 18+ instance, and upgrades must be handled manually by your ops team.
 
 Unlike test instances, the dev server is designed to **persist data between restarts**. That means you can keep your seeded content, local accounts, and data intact between sessions—making it especially useful when developing or demoing your app.
 

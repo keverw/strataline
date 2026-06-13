@@ -195,6 +195,13 @@ export class MigrationManager {
   private static readonly LOCK_NAME = "database_migrations";
 
   private pool: Pool;
+  // Every registered migration lives in this one array, but each can have a
+  // different payload/return type — there's no single generic that fits a mix
+  // of them, so the element type is intentionally `any`. (`unknown` doesn't
+  // work here: it can't satisfy each migration's specific payload type.)
+  // Type-safety is kept where it matters: the public register() and
+  // runSchemaChanges() generics check each migration as it's added and run.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private migrations: Migration<any, any>[] = [];
   private lockId: string | null = null;
   private lockRenewalInterval: NodeJS.Timeout | null = null;
@@ -209,7 +216,14 @@ export class MigrationManager {
   private lockLost = false;
 
   /**
-   * Helper method to update migration status fields
+   * Helper method to update migration status fields.
+   *
+   * Builds a dynamic, parameterized `UPDATE migration_status` statement that
+   * only touches the columns whose values were actually passed in `fields`
+   * (any omitted field is left untouched). Values are bound as query
+   * parameters ($1, $2, ...) rather than interpolated into the SQL string, so
+   * this is safe against SQL injection.
+   *
    * @private
    */
   private async markStatus(
@@ -227,48 +241,53 @@ export class MigrationManager {
       metadata?: unknown;
     },
   ): Promise<void> {
+    // Build a parameterized UPDATE that only sets the columns actually
+    // provided. `param()` records a bound value and returns its placeholder
+    // ($1, $2, ...), so the values array and the placeholders stay in lockstep
+    // automatically with no separate index to maintain. $1 is always the row
+    // id, consumed by the WHERE clause below.
     const updates: string[] = [];
     const values: unknown[] = [id];
-    let paramIndex = 2;
+    // Bind a value and return its positional placeholder (e.g. "$3").
+    const param = (value: unknown): string => {
+      values.push(value);
+      return `$${values.length}`;
+    };
 
     if (fields.beforeSchemaApplied !== undefined) {
-      updates.push(`before_schema_applied = $${paramIndex++}`);
-      values.push(fields.beforeSchemaApplied);
+      updates.push(
+        `before_schema_applied = ${param(fields.beforeSchemaApplied)}`,
+      );
     }
 
     if (fields.migrationComplete !== undefined) {
-      updates.push(`migration_complete = $${paramIndex++}`);
-      values.push(fields.migrationComplete);
+      updates.push(`migration_complete = ${param(fields.migrationComplete)}`);
     }
 
     if (fields.afterSchemaApplied !== undefined) {
-      updates.push(`after_schema_applied = $${paramIndex++}`);
-      values.push(fields.afterSchemaApplied);
+      updates.push(
+        `after_schema_applied = ${param(fields.afterSchemaApplied)}`,
+      );
     }
 
     if (fields.completedAt !== undefined) {
-      updates.push(`completed_at = $${paramIndex++}`);
-      values.push(fields.completedAt);
+      updates.push(`completed_at = ${param(fields.completedAt)}`);
     }
 
     if (fields.lastError !== undefined) {
-      updates.push(`last_error = $${paramIndex++}`);
-      values.push(fields.lastError);
+      updates.push(`last_error = ${param(fields.lastError)}`);
     }
 
     if (fields.metadata !== undefined) {
       // Serialize to JSON for the jsonb column.
-      updates.push(`metadata = $${paramIndex++}::jsonb`);
-      values.push(JSON.stringify(fields.metadata));
+      updates.push(
+        `metadata = ${param(JSON.stringify(fields.metadata))}::jsonb`,
+      );
     }
 
-    // Always update last_updated timestamp
-    updates.push(`last_updated = $${paramIndex++}`);
-    values.push(Math.floor(Date.now() / 1000));
-
-    if (updates.length === 0) {
-      return;
-    }
+    // Always bump last_updated so every status write touches the row (this also
+    // guarantees there is at least one column to SET).
+    updates.push(`last_updated = ${param(Math.floor(Date.now() / 1000))}`);
 
     const query = `
       UPDATE migration_status
@@ -1046,7 +1065,16 @@ export class MigrationManager {
     // return the result, writing nothing to migration_status.
     ownsState: boolean = true,
   ): Promise<DataMigrationPhaseResult<TReturn>> {
-    // Pre-condition: migration.migration is guaranteed to be non-null by the caller.
+    // Pre-condition: migration.migration is guaranteed to be non-null by the
+    // caller. Capture it once (with an explicit guard) so the rest of the method
+    // can use it without a non-null assertion.
+    const migrationFn = migration.migration;
+
+    if (!migrationFn) {
+      throw new Error(
+        `runDataMigration called for "${migration.id}" without a migration function`,
+      );
+    }
 
     // ctx.signal is always present; default to a signal that never aborts when
     // the caller did not supply one. What can trip it depends on the call path:
@@ -1198,7 +1226,7 @@ export class MigrationManager {
           });
 
           // Pass the task-specific logger that already prefixes messages with the task ID
-          const migrationFnExecution = migration.migration!(this.pool, {
+          const migrationFnExecution = migrationFn(this.pool, {
             logger, // This is the task-specific logger created in runSingleMigration
             complete: completeCallback,
             defer: deferCallback,

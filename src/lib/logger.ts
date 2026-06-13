@@ -10,7 +10,7 @@ export interface LogDataInput {
   task?: string;
   stage?: string;
   message: string;
-  error?: any;
+  error?: unknown;
 }
 
 /**
@@ -27,6 +27,29 @@ export interface Logger {
   info: (data: LogDataInput) => void;
   error: (data: LogDataInput) => void;
   warn: (data: LogDataInput) => void;
+}
+
+/**
+ * Best-effort extraction of a human-readable message from an unknown thrown
+ * value: an Error, an error-like object with a string `message`, or anything
+ * else coerced via String(). Use this instead of accessing `.message` on a
+ * caught value (whose type is `unknown`).
+ */
+export function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "message" in error &&
+    typeof (error as { message: unknown }).message === "string"
+  ) {
+    return (error as { message: string }).message;
+  }
+
+  return String(error);
 }
 
 /**

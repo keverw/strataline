@@ -9,6 +9,7 @@
   "files.autoSave": "afterDelay",
   "cSpell.words": [
     "backpressure",
+    "initdb",
     "myapp",
     "pgdata",
     "PGPASSWORD",

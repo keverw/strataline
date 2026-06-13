@@ -32,21 +32,26 @@ export const createDevDBConsoleLogger = (
   return (type, message) => {
     switch (type) {
       case "info":
+        // eslint-disable-next-line no-console
         console.log(message);
         break;
       case "error":
+        // eslint-disable-next-line no-console
         console.error(message);
         break;
       case "warn":
+        // eslint-disable-next-line no-console
         console.warn(message);
         break;
       case "pg":
         if (pgVerbose) {
+          // eslint-disable-next-line no-console
           console.log(`[PG] ${message}`);
         }
         break;
       case "setup":
         if (setupVerbose) {
+          // eslint-disable-next-line no-console
           console.log(`[SETUP] ${message}`);
         }
         break;
@@ -100,7 +105,6 @@ export class LocalDevDBServer {
   private pgUser: string;
   private pgPass: string;
   private pgDb: string;
-  private pgBinaries: PostgresBinaries | null = null;
   private pgDataDir: string;
   private pidFile: string;
   private logger?: DevDBLoggerFunction;
@@ -493,7 +497,9 @@ export class LocalDevDBServer {
   /**
    * Initializes the PostgreSQL data directory if it doesn't exist.
    */
-  private async initializeDataDirectory(): Promise<void> {
+  private async initializeDataDirectory(
+    pgBinaries: PostgresBinaries,
+  ): Promise<void> {
     // Check if PostgreSQL data directory exists and is initialized
     const configExists = await fileExists(
       join(this.pgDataDir, "postgresql.conf"),
@@ -508,10 +514,19 @@ export class LocalDevDBServer {
       // Create the data directory if it doesn't exist
       await mkdir(this.pgDataDir, { recursive: true });
 
-      // Initialize the data directory
-      const initResult = await this.runPgCommand(this.pgBinaries!.initdb, [
+      // Initialize the data directory. Pin initdb's locale instead of letting
+      // it inherit the host/CI shell's, for two reasons: (1) a Linux-style
+      // locale like LC_ALL=C.UTF-8 makes initdb fail on macOS ("invalid locale
+      // settings") because macOS libc has no C.UTF-8; (2) an inherited locale
+      // makes the DB's collation vary per machine. "C" + UTF8 is valid on every
+      // OS and gives the same byte-order collation everywhere — ideal for a
+      // throwaway DB (just not locale-aware sorting, so don't "fix" this to
+      // en_US).
+      const initResult = await this.runPgCommand(pgBinaries.initdb, [
         "-D",
         this.pgDataDir,
+        "--locale=C",
+        "--encoding=UTF8",
       ]);
 
       if (initResult.code !== 0) {
@@ -528,7 +543,9 @@ export class LocalDevDBServer {
   /**
    * Starts the PostgreSQL server process.
    */
-  private async startPostgresServer(): Promise<void> {
+  private async startPostgresServer(
+    pgBinaries: PostgresBinaries,
+  ): Promise<void> {
     this.log("setup", "Starting PostgreSQL server...");
 
     // Start PostgreSQL with optimized configuration
@@ -549,7 +566,7 @@ export class LocalDevDBServer {
     // connecting via 127.0.0.1 instead of localhost, we avoid IPv6 entirely and
     // eliminate these socket configuration errors.
     this.pgProcess = spawn(
-      this.pgBinaries!.postgres,
+      pgBinaries.postgres,
       [
         "-D",
         this.pgDataDir,
@@ -770,18 +787,18 @@ export class LocalDevDBServer {
       return;
     }
 
-    this.pgBinaries = await getBinaries();
+    const pgBinaries = await getBinaries();
 
-    this.log("setup", `Using PostgreSQL binaries: ${this.pgBinaries.postgres}`);
+    this.log("setup", `Using PostgreSQL binaries: ${pgBinaries.postgres}`);
     try {
       // Clean up any existing PostgreSQL processes
       await this.cleanupExistingProcess();
 
       // Initialize data directory if needed
-      await this.initializeDataDirectory();
+      await this.initializeDataDirectory(pgBinaries);
 
       // Start PostgreSQL server
-      await this.startPostgresServer();
+      await this.startPostgresServer(pgBinaries);
 
       // Wait for server to be ready
       await this.waitForServerReady();

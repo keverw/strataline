@@ -9,10 +9,28 @@ import {
 } from "bun:test";
 import EmbeddedPostgres from "embedded-postgres";
 import { Pool, type PoolClient } from "pg"; // Import PoolClient
-import { MigrationManager, type Migration } from "./migration-system";
+import {
+  MigrationManager,
+  type Migration,
+  type MigrationStatus,
+} from "./migration-system";
 import * as tmp from "tmp";
 import { consoleLogger, MutableLogger } from "./logger";
 import { createSchemaHelpers } from "./schema-helpers";
+
+// Look up a migration status by id, throwing a clear error if it's missing.
+// Keeps assertions readable without a non-null assertion on .find().
+function requireStatusById(
+  statuses: MigrationStatus[],
+  id: string,
+): MigrationStatus {
+  const status = statuses.find((s) => s.id === id);
+  if (!status) {
+    throw new Error(`Migration status not found for id: ${id}`);
+  }
+
+  return status;
+}
 
 // Set a longer timeout for tests that involve database operations
 const TEST_TIMEOUT = 30000;
@@ -58,6 +76,13 @@ describe("MigrationManager", () => {
         password: "test_password",
         persistent: false, // Don't persist data between test runs
         databaseDir: tempDir.name, // Use the temporary directory for the database
+        // Pin initdb's locale instead of inheriting the host/CI shell's: a
+        // Linux-style locale like LC_ALL=C.UTF-8 makes initdb fail on macOS
+        // ("invalid locale settings") because macOS libc has no C.UTF-8, and an
+        // inherited locale makes collation vary per machine. "C" + UTF8 is valid
+        // on every OS. See the test-db-instance/local-dev-db-server helpers for
+        // the fuller rationale.
+        initdbFlags: ["--locale=C", "--encoding=UTF8"],
         onLog: (message) => {
           // Only log postgres messages if PG_VERBOSE_LOGGING is enabled
           if (PG_VERBOSE_LOGGING) {
@@ -517,9 +542,10 @@ describe("MigrationManager", () => {
       expect(r1.status).toBe("deferred");
 
       const findStatus = async () =>
-        (await migrationManager.getMigrationStatus()).find(
-          (s) => s.id === "metadata_001",
-        )!;
+        requireStatusById(
+          await migrationManager.getMigrationStatus(),
+          "metadata_001",
+        );
 
       let st = await findStatus();
       expect(st.metadata).toEqual({ step: 1 });
@@ -558,9 +584,10 @@ describe("MigrationManager", () => {
 
       expect(updatePersisted).toBe(true); // returns true when persisted
 
-      const st = (await migrationManager.getMigrationStatus()).find(
-        (s) => s.id === "progress_001",
-      )!;
+      const st = requireStatusById(
+        await migrationManager.getMigrationStatus(),
+        "progress_001",
+      );
       expect(st.metadata).toEqual({ processed: 50 });
     },
     TEST_TIMEOUT,
@@ -598,9 +625,10 @@ describe("MigrationManager", () => {
 
       // The worker must NOT have marked the whole migration complete — only the
       // orchestrator pass owns migration_complete.
-      const st = (await migrationManager.getMigrationStatus()).find(
-        (s) => s.id === "worker_no_complete_001",
-      )!;
+      const st = requireStatusById(
+        await migrationManager.getMigrationStatus(),
+        "worker_no_complete_001",
+      );
       expect(st.migrationComplete).toBe(false);
     },
     TEST_TIMEOUT,
@@ -638,9 +666,10 @@ describe("MigrationManager", () => {
       expect(r1.status).toBe("error");
       expect(dataRuns).toBe(1);
 
-      const st = (await migrationManager.getMigrationStatus()).find(
-        (s) => s.id === "worker_already_complete_001",
-      )!;
+      const st = requireStatusById(
+        await migrationManager.getMigrationStatus(),
+        "worker_already_complete_001",
+      );
       expect(st.migrationComplete).toBe(true);
       expect(st.completedAt).toBe(0);
 
@@ -1033,9 +1062,10 @@ describe("MigrationManager", () => {
       expect(firstResult.status).toBe("error");
 
       const findStatus = async () =>
-        (await migrationManager.getMigrationStatus()).find(
-          (s) => s.id === "observability_001",
-        )!;
+        requireStatusById(
+          await migrationManager.getMigrationStatus(),
+          "observability_001",
+        );
 
       let status = await findStatus();
       expect(status.attempts).toBe(1);

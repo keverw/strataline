@@ -4,8 +4,8 @@ import {
   Logger as StratalineLogger,
   BaseLogger,
   LogDataInput,
+  getErrorMessage,
 } from "../logger";
-// @ts-expect-error - moduleResolution setting prevents TypeScript from finding embedded-postgres types
 import EmbeddedPostgres from "embedded-postgres";
 import * as tmp from "tmp";
 import getPort from "get-port";
@@ -47,6 +47,7 @@ export const createTestDBConsoleLogger = (
         console.log(message);
         break;
       case "error":
+        // eslint-disable-next-line no-console
         console.error(message);
         break;
       case "warn":
@@ -112,7 +113,7 @@ class TestDBStratalineLogger extends BaseLogger implements StratalineLogger {
     const stagePrefix = data.stage ? `[${data.stage}]` : "";
     const prefix = `${taskPrefix} ${stagePrefix}`.trim();
     const errorMsg = data.error
-      ? `${data.message}: ${data.error.message || String(data.error)}`
+      ? `${data.message}: ${getErrorMessage(data.error)}`
       : data.message;
     const message = prefix ? `${prefix} ${errorMsg}` : errorMsg;
 
@@ -266,6 +267,15 @@ export class TestDatabaseInstance {
         password: this.password,
         persistent: false, // Don't persist data between test runs
         databaseDir: this.tempDir,
+        // Pin initdb's locale instead of letting it inherit the host/CI
+        // shell's, for two reasons: (1) a Linux-style locale like
+        // LC_ALL=C.UTF-8 makes initdb fail on macOS ("invalid locale settings")
+        // because macOS libc has no C.UTF-8; (2) an inherited locale makes the
+        // DB's collation vary per machine. "C" + UTF8 is valid on every OS and
+        // gives the same byte-order collation everywhere — ideal for a
+        // throwaway DB (just not locale-aware sorting, so don't "fix" this to
+        // en_US).
+        initdbFlags: ["--locale=C", "--encoding=UTF8"],
         onLog: (message: string) => {
           this.log("pg", message);
         },

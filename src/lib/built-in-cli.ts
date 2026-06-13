@@ -4,7 +4,7 @@ import {
   type MigrationResult,
 } from "./migration-system";
 import { Pool } from "pg";
-import { Logger, LogDataInput, BaseLogger } from "./logger";
+import { Logger, LogDataInput, BaseLogger, getErrorMessage } from "./logger";
 
 /**
  * Logger function type for Strataline CLI
@@ -86,7 +86,7 @@ class CLIStratalineLogger extends BaseLogger implements Logger {
     const stagePrefix = data.stage ? `[${data.stage}]` : "";
     const prefix = `${taskPrefix} ${stagePrefix}`.trim();
     const errorMsg = data.error
-      ? `${data.message}: ${data.error.message || String(data.error)}`
+      ? `${data.message}: ${getErrorMessage(data.error)}`
       : data.message;
     const message = prefix ? `${prefix} ${errorMsg}` : errorMsg;
 
