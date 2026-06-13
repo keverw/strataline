@@ -730,7 +730,7 @@ describe("RunStratalineCLI", () => {
           } catch (e) {
             // Log cleanup error but don't throw to avoid masking the original test error
             console.error(
-              `Failed to stop test database during cleanup: ${e.message}`,
+              `Failed to stop test database during cleanup: ${(e as Error).message}`,
             );
           }
         }
@@ -818,7 +818,7 @@ describe("RunStratalineCLI", () => {
           } catch (e) {
             // Log cleanup error but don't throw to avoid masking the original test error
             console.error(
-              `Failed to stop test database during cleanup: ${e.message}`,
+              `Failed to stop test database during cleanup: ${(e as Error).message}`,
             );
           }
         }
@@ -909,7 +909,7 @@ describe("RunStratalineCLI", () => {
           } catch (e) {
             // Log cleanup error but don't throw to avoid masking the original test error
             console.error(
-              `Failed to stop test database during cleanup: ${e.message}`,
+              `Failed to stop test database during cleanup: ${(e as Error).message}`,
             );
           }
         }

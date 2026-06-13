@@ -2,10 +2,11 @@
 // import 'dotenv/config'
 
 import { RunStratalineCLI, createCLIConsoleLogger } from "../src/cli";
+import type { Migration } from "../src/migration";
 
 // For a real application, you would import your migrations
 // This is just a placeholder - replace with your actual migrations
-const migrations = [];
+const migrations: Migration[] = [];
 
 // Use the built-in CLI console logger
 // You can customize this or implement your own logger if needed
@@ -13,7 +14,8 @@ const logger = createCLIConsoleLogger(true);
 
 // Run the CLI with environment variables.
 // The returned result carries a distinct exit code per outcome:
-//   0 completed · 2 deferred · 3 locked · 4 aborted (1 = error, thrown below).
+//   0 completed · 2 deferred · 3 locked · 4 aborted · 5 lock_lost
+//   (1 = error, thrown below).
 RunStratalineCLI({
   migrations,
   loadFrom: "env",

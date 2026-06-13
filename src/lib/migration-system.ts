@@ -12,9 +12,17 @@ import { type SchemaHelpers, createSchemaHelpers } from "./schema-helpers";
 export type SchemaPhase = "beforeSchema" | "afterSchema";
 export type MigrationMode = "job" | "distributed";
 
-// Migration callback types
-export type MigrationCompletionCallback = () => void;
-export type MigrationDeferCallback = (reason?: string) => void;
+// Migration callback types. Generic over the migration's return type so the
+// `data` argument is typed; `TReturn` defaults to `unknown`. These mirror the
+// `complete`/`defer` callbacks on the data-migration `ctx` (and the interface
+// below references them, so the two never drift apart).
+export type MigrationCompletionCallback<TReturn = unknown> = (
+  data?: TReturn,
+) => void;
+export type MigrationDeferCallback<TReturn = unknown> = (
+  reason?: string,
+  data?: TReturn,
+) => void;
 
 // Migration interface with generic payload and return types
 export interface Migration<
@@ -50,8 +58,8 @@ export interface Migration<
     pool: Pool,
     ctx: {
       logger: Logger;
-      complete(data?: TReturn): void;
-      defer(reason?: string, data?: TReturn): void;
+      complete: MigrationCompletionCallback<TReturn>;
+      defer: MigrationDeferCallback<TReturn>;
       mode: MigrationMode;
       payload: TPayload;
       // Cooperative-cancellation signal. Aborts when the caller requests a

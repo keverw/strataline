@@ -6,23 +6,23 @@
   "exports": {
     "./migration": {
       "types": "./dist/migration/migration.d.ts",
-      "import": "./dist/migration/migration.mjs",
-      "require": "./dist/migration/migration.js"
+      "import": "./dist/migration/migration.js",
+      "require": "./dist/migration/migration.cjs"
     },
     "./test-db-instance": {
       "types": "./dist/test-db-instance/test-db-instance.d.ts",
-      "import": "./dist/test-db-instance/test-db-instance.mjs",
-      "require": "./dist/test-db-instance/test-db-instance.js"
+      "import": "./dist/test-db-instance/test-db-instance.js",
+      "require": "./dist/test-db-instance/test-db-instance.cjs"
     },
     "./local-dev-db-server": {
       "types": "./dist/local-dev-db-server/local-dev-db-server.d.ts",
-      "import": "./dist/local-dev-db-server/local-dev-db-server.mjs",
-      "require": "./dist/local-dev-db-server/local-dev-db-server.js"
+      "import": "./dist/local-dev-db-server/local-dev-db-server.js",
+      "require": "./dist/local-dev-db-server/local-dev-db-server.cjs"
     },
     "./cli": {
       "types": "./dist/cli/cli.d.ts",
-      "import": "./dist/cli/cli.mjs",
-      "require": "./dist/cli/cli.js"
+      "import": "./dist/cli/cli.js",
+      "require": "./dist/cli/cli.cjs"
     }
   },
   "files": [
@@ -30,7 +30,7 @@
   ],
   "scripts": {
     "prepublishOnly": "bun audit && bun run build && bun run type-check && bun run lint && bun run test",
-    "build": "bun run update-readme && tsup",
+    "build": "bun run update-docs && tsup",
     "type-check": "tsc --noEmit",
     "dev": "tsup --watch",
     "dev:db": "bun run scripts/dev-db.ts",
@@ -40,8 +40,9 @@
     "test": "bun test --timeout 60000",
     "test:clean-shm": "bun run scripts/clean-shm.ts",
     "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,css,scss,md,html}\"",
+    "format:docs": "prettier --write README.md",
     "lint": "eslint src",
-    "update-readme": "markdown-toc-gen update README.md && bun run scripts/update-readme-version.ts"
+    "update-docs": "markdown-toc-gen update README.md && bun run scripts/update-readme-version.ts && bun run format:docs"
   },
   "keywords": [
     "postgresql",

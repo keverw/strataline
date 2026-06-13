@@ -7,11 +7,10 @@
     "strict": true,
     "declaration": true,
     "outDir": "dist",
-    "rootDir": "src",
     "lib": ["ES2022"],
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "**/*.test.ts"]
+  "include": ["src/**/*", "scripts/**/*"],
+  "exclude": ["node_modules", "dist"]
 }
