@@ -31,6 +31,13 @@ describe("MigrationManager", () => {
   let migrationManager: MigrationManager;
   let isSetupComplete = false;
 
+  // Best-effort signal cleanup: if this test run is interrupted (Ctrl-C), bun's
+  // afterAll won't run, so the embedded Postgres would leak its SysV shared
+  // memory. macOS has a tiny SHMMNI limit, so a few leaks break later runs.
+  // Stop Postgres on SIGINT/SIGTERM so it releases shm before exiting. (Leftover
+  // segments from a hard kill can still be cleared with `bun run test:clean-shm`.)
+  let onSignalCleanup: (() => void) | undefined;
+
   // Set up the embedded PostgreSQL server before all tests
   beforeAll(async () => {
     try {
@@ -82,6 +89,19 @@ describe("MigrationManager", () => {
 
       isSetupComplete = true;
 
+      // Register a best-effort cleanup for interrupted runs (afterAll won't
+      // fire on SIGINT/SIGTERM). Stop Postgres so it releases its shared memory,
+      // then exit. once() avoids stacking handlers across files.
+      onSignalCleanup = () => {
+        postgres
+          ?.stop()
+          .catch(() => {})
+          .finally(() => process.exit(130));
+      };
+
+      process.once("SIGINT", onSignalCleanup);
+      process.once("SIGTERM", onSignalCleanup);
+
       if (PG_VERBOSE_LOGGING) {
         console.log("Embedded PostgreSQL started for testing");
       }
@@ -104,6 +124,14 @@ describe("MigrationManager", () => {
 
   // Clean up the embedded PostgreSQL server after all tests
   afterAll(async () => {
+    // Remove the interrupted-run signal handlers now that we're tearing down
+    // cleanly via afterAll.
+    if (onSignalCleanup) {
+      process.removeListener("SIGINT", onSignalCleanup);
+      process.removeListener("SIGTERM", onSignalCleanup);
+      onSignalCleanup = undefined;
+    }
+
     if (!isSetupComplete) {
       return;
     }
@@ -462,6 +490,172 @@ describe("MigrationManager", () => {
   );
 
   test(
+    "should persist metadata from defer/complete and expose it via ctx.metadata on the next run",
+    async () => {
+      const seenMetadata: unknown[] = [];
+      let runCount = 0;
+
+      const m: Migration<Record<string, never>, { step: number }> = {
+        id: "metadata_001",
+        description:
+          "Persists a checkpoint via defer, resumes via ctx.metadata",
+        migration: async (pool, ctx) => {
+          seenMetadata.push(ctx.metadata);
+          runCount++;
+          if (runCount === 1) {
+            ctx.defer("checkpoint", { step: 1 });
+          } else {
+            ctx.complete({ step: 2 });
+          }
+        },
+      };
+
+      migrationManager.register([m]);
+
+      // First run defers with data → metadata persisted.
+      const r1 = await migrationManager.runSchemaChanges("job");
+      expect(r1.status).toBe("deferred");
+
+      const findStatus = async () =>
+        (await migrationManager.getMigrationStatus()).find(
+          (s) => s.id === "metadata_001",
+        )!;
+
+      let st = await findStatus();
+      expect(st.metadata).toEqual({ step: 1 });
+
+      // Second run resumes; ctx.metadata should be the persisted checkpoint.
+      const r2 = await migrationManager.runSchemaChanges("job");
+      expect(r2.success).toBe(true);
+
+      expect(seenMetadata[0]).toBeNull(); // nothing stored on first run
+      expect(seenMetadata[1]).toEqual({ step: 1 }); // resumed from checkpoint
+
+      // complete({ step: 2 }) overwrote the persisted metadata.
+      st = await findStatus();
+      expect(st.metadata).toEqual({ step: 2 });
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "ctx.updateMetadata persists progress mid-run without completing",
+    async () => {
+      let updatePersisted: boolean | undefined;
+      const m: Migration<Record<string, never>, { processed: number }> = {
+        id: "progress_001",
+        description: "Reports progress via ctx.updateMetadata",
+        migration: async (pool, ctx) => {
+          // On the orchestrator pass it persists and returns true.
+          updatePersisted = await ctx.updateMetadata({ processed: 50 });
+          // complete() with no data: the progress metadata is NOT overwritten.
+          ctx.complete();
+        },
+      };
+
+      migrationManager.register([m]);
+      await migrationManager.runSchemaChanges("job");
+
+      expect(updatePersisted).toBe(true); // returns true when persisted
+
+      const st = (await migrationManager.getMigrationStatus()).find(
+        (s) => s.id === "progress_001",
+      )!;
+      expect(st.metadata).toEqual({ processed: 50 });
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "runDataMigrationJobOnly does not mark migration_complete (orchestrator owns it)",
+    async () => {
+      const m: Migration = {
+        id: "worker_no_complete_001",
+        description: "Defers as orchestrator, completes as worker",
+        beforeSchema: async (client) => {
+          await client.query("CREATE TABLE IF NOT EXISTS wnc_table (id INT)");
+        },
+        migration: async (pool, ctx) => {
+          if (ctx.mode === "distributed") {
+            ctx.defer("scheduled");
+          } else {
+            ctx.complete();
+          }
+        },
+      };
+
+      migrationManager.register([m]);
+
+      // Orchestrator pass: applies beforeSchema, data fn defers (distributed).
+      const r1 = await migrationManager.runSchemaChanges("distributed");
+      expect(r1.status).toBe("deferred");
+
+      // Worker pass: completes its batch.
+      const jobResult = await migrationManager.runDataMigrationJobOnly(
+        "worker_no_complete_001",
+      );
+      expect(jobResult.status).toBe("success");
+
+      // The worker must NOT have marked the whole migration complete — only the
+      // orchestrator pass owns migration_complete.
+      const st = (await migrationManager.getMigrationStatus()).find(
+        (s) => s.id === "worker_no_complete_001",
+      )!;
+      expect(st.migrationComplete).toBe(false);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "runDataMigrationJobOnly returns already_complete when the data phase is done but afterSchema failed (completed_at still 0)",
+    async () => {
+      let dataRuns = 0;
+      const afterSchemaShouldFail = true;
+
+      const m: Migration = {
+        id: "worker_already_complete_001",
+        description:
+          "Data completes, but afterSchema fails so completed_at stays 0",
+        beforeSchema: async (client) => {
+          await client.query("CREATE TABLE IF NOT EXISTS wac_table (id INT)");
+        },
+        migration: async (pool, ctx) => {
+          dataRuns++;
+          ctx.complete();
+        },
+        afterSchema: async () => {
+          if (afterSchemaShouldFail) {
+            throw new Error("boom in afterSchema");
+          }
+        },
+      };
+
+      migrationManager.register([m]);
+
+      // Orchestrator run: data completes (migration_complete = true), afterSchema
+      // throws → completed_at stays 0. This is the tricky resumable state.
+      const r1 = await migrationManager.runSchemaChanges("job");
+      expect(r1.status).toBe("error");
+      expect(dataRuns).toBe(1);
+
+      const st = (await migrationManager.getMigrationStatus()).find(
+        (s) => s.id === "worker_already_complete_001",
+      )!;
+      expect(st.migrationComplete).toBe(true);
+      expect(st.completedAt).toBe(0);
+
+      // A worker call must treat the data phase as done and NOT re-run it, even
+      // though completed_at is still 0.
+      const jobResult = await migrationManager.runDataMigrationJobOnly(
+        "worker_already_complete_001",
+      );
+      expect(jobResult.status).toBe("already_complete");
+      expect(dataRuns).toBe(1); // not re-run
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
     "should handle error in beforeSchema",
     async () => {
       const errorBeforeSchemaMigration: Migration = {
@@ -572,6 +766,361 @@ describe("MigrationManager", () => {
         "Migration error_after_schema_001 failed: [afterSchema] Failure in afterSchema",
       );
       // beforeSchema and migration phases would have completed successfully.
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "should report 'error' (not 'locked') when the lock cannot be acquired due to a DB error",
+    async () => {
+      const m: Migration = {
+        id: "lock_error_001",
+        description: "Migration used to exercise the lock-acquire error path",
+        migration: async (pool, ctx) => {
+          ctx.complete();
+        },
+      };
+
+      migrationManager.register([m]);
+
+      // Initialize the migration tables, then drop the lock table so the next
+      // acquire attempt fails with an unexpected (non-duplicate-key) error.
+      // This must surface as "error", not be masked as "locked".
+      await migrationManager.getMigrationStatus();
+      const client = await pool.connect();
+      try {
+        await client.query("DROP TABLE migration_lock");
+      } finally {
+        client.release();
+      }
+
+      const result = await migrationManager.runSchemaChanges("job");
+
+      expect(result.success).toBe(false);
+      expect(result.status).toBe("error");
+      expect(result.status).not.toBe("locked");
+      expect(result.reason).toContain("acquireMigrationLock");
+      expect(result.error).toBeInstanceOf(Error);
+      // The migration never ran, so it stays pending.
+      expect(result.pendingMigrations).toContain("lock_error_001");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "should abort a run via an external AbortSignal (graceful shutdown)",
+    async () => {
+      const controller = new AbortController();
+      let resolveStarted!: () => void;
+      const started = new Promise<void>((r) => {
+        resolveStarted = r;
+      });
+      let signalSeenAborted = false;
+
+      const m: Migration = {
+        id: "external_abort_001",
+        description: "Waits for an abort signal, then defers",
+        migration: async (pool, ctx) => {
+          resolveStarted();
+          // Wait until the caller aborts.
+          await new Promise<void>((res) => {
+            if (ctx.signal.aborted) {
+              res();
+              return;
+            }
+            ctx.signal.addEventListener("abort", () => res(), { once: true });
+          });
+          signalSeenAborted = ctx.signal.aborted;
+          ctx.defer("graceful shutdown");
+        },
+      };
+
+      migrationManager.register([m]);
+
+      const runPromise = migrationManager.runSchemaChanges("job", {
+        signal: controller.signal,
+      });
+
+      // Wait until the migration is actually running, then request shutdown.
+      await started;
+      controller.abort();
+
+      const result = await runPromise;
+
+      expect(signalSeenAborted).toBe(true); // ctx.signal was wired through
+      expect(result.success).toBe(false);
+      expect(result.status).toBe("aborted");
+      expect(result.pendingMigrations).toContain("external_abort_001");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "should abort with an error when the migration lock is lost mid-run (safety)",
+    async () => {
+      // Short renewal interval so lock loss is detected quickly.
+      const lockLossManager = new MigrationManager(pool, testLogger, {
+        lockRenewalSeconds: 1,
+      });
+
+      let resolveStarted!: () => void;
+      const started = new Promise<void>((r) => {
+        resolveStarted = r;
+      });
+
+      const m: Migration = {
+        id: "lock_loss_001",
+        description: "Runs until the lock is lost",
+        migration: async (pool, ctx) => {
+          resolveStarted();
+          await new Promise<void>((res) => {
+            if (ctx.signal.aborted) {
+              res();
+              return;
+            }
+            ctx.signal.addEventListener("abort", () => res(), { once: true });
+          });
+          ctx.defer("aborted due to lock loss");
+        },
+      };
+
+      lockLossManager.register([m]);
+
+      const runPromise = lockLossManager.runSchemaChanges("job");
+
+      // Once the migration is running, steal the lock so the next renewal
+      // (every 1s) finds it's gone and aborts the run for safety.
+      await started;
+      await pool.query(
+        `UPDATE migration_lock
+         SET locked_by = 'someone_else',
+             lock_expires_at = NOW() + interval '5 minutes'
+         WHERE lock_name = 'database_migrations'`,
+      );
+
+      const result = await runPromise;
+
+      expect(result.success).toBe(false);
+      // Distinct from a benign "locked" (couldn't acquire) and from a generic
+      // "error" — lock loss mid-run is its own unsafe status.
+      expect(result.status).toBe("lock_lost");
+      expect(result.reason).toMatch(/lock/i);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "should report 'aborted' even if the in-flight migration ignores the signal and completes",
+    async () => {
+      const controller = new AbortController();
+      let resolveStarted!: () => void;
+      const started = new Promise<void>((r) => {
+        resolveStarted = r;
+      });
+      let proceed!: () => void;
+      const canProceed = new Promise<void>((r) => {
+        proceed = r;
+      });
+
+      const m: Migration = {
+        id: "abort_on_success_001",
+        description: "Ignores ctx.signal and completes anyway",
+
+        migration: async (pool, ctx) => {
+          resolveStarted();
+          await canProceed;
+          // Deliberately does NOT check ctx.signal — completes regardless.
+          ctx.complete();
+        },
+      };
+
+      migrationManager.register([m]);
+
+      const runPromise = migrationManager.runSchemaChanges("job", {
+        signal: controller.signal,
+      });
+
+      // Abort while the migration is in flight, then let it complete anyway.
+      await started;
+      controller.abort();
+      proceed();
+
+      const result = await runPromise;
+
+      // The migration finished, but the run was aborted mid-flight — that must
+      // be surfaced, not masked as "completed".
+      expect(result.status).toBe("aborted");
+      expect(result.completedMigrations).toContain("abort_on_success_001");
+      expect(result.pendingMigrations).toEqual([]);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "should report 'lock_lost' even if the in-flight migration ignores the signal and completes (safety)",
+    async () => {
+      const lockLossManager = new MigrationManager(pool, testLogger, {
+        lockRenewalSeconds: 1,
+      });
+
+      let resolveStarted!: () => void;
+      const started = new Promise<void>((r) => {
+        resolveStarted = r;
+      });
+      let proceed!: () => void;
+      const canProceed = new Promise<void>((r) => {
+        proceed = r;
+      });
+
+      const m: Migration = {
+        id: "lock_loss_on_success_001",
+        description: "Ignores ctx.signal and completes despite lock loss",
+
+        migration: async (pool, ctx) => {
+          resolveStarted();
+          await canProceed;
+          // Ignores the abort signal and completes anyway.
+          ctx.complete();
+        },
+      };
+
+      lockLossManager.register([m]);
+
+      const runPromise = lockLossManager.runSchemaChanges("job");
+
+      await started;
+      // Steal the lock, then wait long enough for the 1s renewal to detect the
+      // loss (and abort) before we let the migration complete.
+      await pool.query(
+        `UPDATE migration_lock
+         SET locked_by = 'someone_else',
+             lock_expires_at = NOW() + interval '5 minutes'
+         WHERE lock_name = 'database_migrations'`,
+      );
+      await new Promise<void>((res) => setTimeout(res, 2500));
+      proceed();
+
+      const result = await runPromise;
+
+      // Even though the migration completed, exclusivity was lost — this must be
+      // reported as the unsafe lock_lost status, not masked as "completed".
+      expect(result.success).toBe(false);
+      expect(result.status).toBe("lock_lost");
+      expect(result.reason).toMatch(/lock/i);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "should track attempts, started_at, and last_error for observability",
+    async () => {
+      let afterSchemaShouldFail = true;
+
+      const obsMigration: Migration = {
+        id: "observability_001",
+        description: "Migration used to exercise observability columns",
+        afterSchema: async () => {
+          if (afterSchemaShouldFail) {
+            throw new Error("boom in afterSchema");
+          }
+        },
+      };
+
+      migrationManager.register([obsMigration]);
+
+      // First run fails in afterSchema.
+      const firstResult = await migrationManager.runSchemaChanges("job");
+      expect(firstResult.status).toBe("error");
+
+      const findStatus = async () =>
+        (await migrationManager.getMigrationStatus()).find(
+          (s) => s.id === "observability_001",
+        )!;
+
+      let status = await findStatus();
+      expect(status.attempts).toBe(1);
+      expect(status.startedAt).toBeGreaterThan(0);
+      expect(status.lastError).toContain("boom in afterSchema");
+      expect(status.completedAt).toBe(0);
+
+      const startedAtAfterFirstRun = status.startedAt;
+
+      // Second run succeeds.
+      afterSchemaShouldFail = false;
+      const secondResult = await migrationManager.runSchemaChanges("job");
+      expect(secondResult.success).toBe(true);
+
+      status = await findStatus();
+      expect(status.attempts).toBe(2); // incremented per attempt
+      expect(status.startedAt).toBe(startedAtAfterFirstRun); // stamped once, stable
+      expect(status.lastError).toBeNull(); // cleared on success
+      expect(status.completedAt).toBeGreaterThan(0);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "should not re-run a completed data migration when resuming after an afterSchema failure",
+    async () => {
+      // Tracks how many times the data migration body actually executes.
+      let dataMigrationRuns = 0;
+      // Toggled to false before the second run so afterSchema can succeed.
+      let afterSchemaShouldFail = true;
+
+      const resumeMigration: Migration = {
+        id: "resume_after_schema_001",
+        description: "Migration whose afterSchema fails on the first attempt",
+        beforeSchema: async (client) => {
+          await client.query(
+            "CREATE TABLE IF NOT EXISTS resume_dummy_table (id INT)",
+          );
+        },
+        migration: async (pool, ctx) => {
+          dataMigrationRuns++;
+          ctx.complete();
+        },
+        afterSchema: async () => {
+          if (afterSchemaShouldFail) {
+            throw new Error("Failure in afterSchema");
+          }
+        },
+      };
+
+      migrationManager.register([resumeMigration]);
+
+      // First run: data migration completes, but afterSchema throws.
+      const firstResult = await migrationManager.runSchemaChanges("job");
+      expect(firstResult.success).toBe(false);
+      expect(firstResult.status).toBe("error");
+      expect(dataMigrationRuns).toBe(1);
+
+      // Second run (resume): afterSchema now succeeds. The data migration must
+      // NOT execute again, since it was already marked complete.
+      afterSchemaShouldFail = false;
+      const secondResult = await migrationManager.runSchemaChanges("job");
+      expect(secondResult.success).toBe(true);
+      expect(secondResult.status).toBe("completed");
+      expect(secondResult.completedMigrations).toEqual([
+        "resume_after_schema_001",
+      ]);
+      // The key assertion: the data migration ran exactly once across both runs.
+      expect(dataMigrationRuns).toBe(1);
+
+      // Verify the migration is now fully completed in the status table.
+      const client = await pool.connect();
+      try {
+        const { rows } = await client.query(
+          `SELECT * FROM migration_status WHERE id = $1`,
+          ["resume_after_schema_001"],
+        );
+        expect(rows.length).toBe(1);
+        expect(rows[0].before_schema_applied).toBe(true);
+        expect(rows[0].migration_complete).toBe(true);
+        expect(rows[0].after_schema_applied).toBe(true);
+        expect(Number(rows[0].completed_at)).toBeGreaterThan(0);
+      } finally {
+        client.release();
+      }
     },
     TEST_TIMEOUT,
   );

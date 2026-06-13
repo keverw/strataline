@@ -60,7 +60,7 @@ describe("LocalDevDBServer", () => {
     if (existsSync(pidFile)) {
       try {
         unlinkSync(pidFile);
-      } catch (e) {
+      } catch {
         // Ignore cleanup errors
       }
     }
@@ -68,7 +68,7 @@ describe("LocalDevDBServer", () => {
     // Clean up temporary directory
     try {
       tempDir.removeCallback();
-    } catch (e) {
+    } catch {
       // Ignore cleanup errors - the directory might have already been removed
       // by the PostgreSQL server process or other cleanup mechanisms
     }
@@ -136,8 +136,6 @@ describe("LocalDevDBServer", () => {
   it("should handle custom port configuration", async () => {
     // Create a server with a dynamically assigned port
     const customPort = await getPort();
-    let customExitCalled = false;
-    let customExitCode: number | undefined;
 
     const customServer = new LocalDevDBServer({
       port: customPort,
@@ -147,10 +145,7 @@ describe("LocalDevDBServer", () => {
       dataDir: join(tempDir.name, "custom_pgdata"),
       pidFile: join(tempDir.name, ".custom_pg_pid"),
       // No logger for silent tests
-      onExit: (exitCode) => {
-        customExitCalled = true;
-        customExitCode = exitCode;
-      },
+      onExit: () => {},
     });
 
     try {
@@ -181,8 +176,6 @@ describe("LocalDevDBServer", () => {
   it("should work without a logger", async () => {
     // Create a server without a logger
     const silentPort = await getPort();
-    let silentExitCalled = false;
-    let silentExitCode: number | undefined;
 
     const silentServer = new LocalDevDBServer({
       port: silentPort,
@@ -192,10 +185,7 @@ describe("LocalDevDBServer", () => {
       dataDir: join(tempDir.name, "silent_pgdata"),
       pidFile: join(tempDir.name, ".silent_pg_pid"),
       // No logger provided
-      onExit: (exitCode) => {
-        silentExitCalled = true;
-        silentExitCode = exitCode;
-      },
+      onExit: () => {},
     });
 
     try {
@@ -228,10 +218,6 @@ describe("LocalDevDBServer", () => {
     const dataDir = join(tempDir.name, "persistent_pgdata");
     const persistPort1 = await getPort();
     const persistPort2 = await getPort();
-    let persist1ExitCalled = false;
-    let persist1ExitCode: number | undefined;
-    let persist2ExitCalled = false;
-    let persist2ExitCode: number | undefined;
 
     // Create first server instance
     const server1 = new LocalDevDBServer({
@@ -242,11 +228,12 @@ describe("LocalDevDBServer", () => {
       dataDir: dataDir,
       pidFile: join(tempDir.name, ".persist_pg_pid_1"),
       // No logger for silent tests
-      onExit: (exitCode) => {
-        persist1ExitCalled = true;
-        persist1ExitCode = exitCode;
-      },
+      onExit: () => {},
     });
+
+    // Declared out here so the finally block can guarantee cleanup even if the
+    // test throws before server2 is started.
+    let server2: LocalDevDBServer | undefined;
 
     try {
       await server1.start();
@@ -277,7 +264,7 @@ describe("LocalDevDBServer", () => {
       await server1.stop();
 
       // Create second server instance using the same data directory
-      const server2 = new LocalDevDBServer({
+      server2 = new LocalDevDBServer({
         port: persistPort2,
         user: "persist_user",
         password: "persist_password",
@@ -285,10 +272,7 @@ describe("LocalDevDBServer", () => {
         dataDir: dataDir,
         pidFile: join(tempDir.name, ".persist_pg_pid_2"),
         // No logger for silent tests
-        onExit: (exitCode) => {
-          persist2ExitCalled = true;
-          persist2ExitCode = exitCode;
-        },
+        onExit: () => {},
       });
 
       await server2.start();
@@ -310,14 +294,23 @@ describe("LocalDevDBServer", () => {
         expect(result.rows[0].message).toBe("persistent data");
       } finally {
         await pool2.end();
-        await server2.stop();
       }
-    } catch (error) {
-      // Ensure cleanup even if test fails
+    } finally {
+      // Best-effort cleanup. Unlike the previous catch block, this does NOT
+      // swallow errors thrown from the test body, so a failed assertion still
+      // fails the test instead of passing silently.
       try {
         await server1.stop();
-      } catch (e) {
-        // Ignore cleanup errors
+      } catch {
+        // Ignore cleanup errors (server may already be stopped)
+      }
+
+      if (server2) {
+        try {
+          await server2.stop();
+        } catch {
+          // Ignore cleanup errors
+        }
       }
     }
   }, 45000);

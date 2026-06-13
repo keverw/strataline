@@ -1,3 +1,4 @@
+import { hostname } from "os";
 import { type Pool, type PoolClient } from "pg";
 import { type Logger, consoleLogger, createPrefixedLogger } from "./logger";
 import { type SchemaHelpers, createSchemaHelpers } from "./schema-helpers";
@@ -40,6 +41,43 @@ export interface Migration<
       defer(reason?: string, data?: TReturn): void;
       mode: MigrationMode;
       payload: TPayload;
+      // Cooperative-cancellation signal. Aborts when the caller requests a
+      // graceful shutdown (via the AbortSignal passed to runSchemaChanges or
+      // runDataMigrationJobOnly) and — on the orchestrator pass only — when the
+      // migration lock is lost mid-run (workers don't hold the lock, so that
+      // can't happen there). Long-running data migrations should check
+      // `ctx.signal.aborted` (or listen for "abort") and wind down gracefully,
+      // typically by calling ctx.defer(). Always present: if no signal was
+      // supplied, this is a signal that never aborts.
+      signal: AbortSignal;
+      // Freeform state previously persisted for this migration (the most recent
+      // `data` passed to complete()/defer()), loaded at the start of this
+      // attempt — null if nothing was stored yet. Use it to resume from a
+      // checkpoint across runs. Only the orchestrator pass (runSchemaChanges)
+      // persists it; runDataMigrationJobOnly workers can read it but do not
+      // write migration state. Typed `unknown` because what's stored isn't
+      // guaranteed to match TReturn (it may predate the current code).
+      metadata: unknown;
+      // Persist freeform progress/state to the metadata column mid-run, without
+      // completing or deferring. Useful for live progress an external observer
+      // can read from the status table. Await it.
+      //
+      // Where it writes depends on who's running the migration:
+      //   - Orchestrator pass (runSchemaChanges): writes to the metadata column.
+      //   - Job-only worker (runDataMigrationJobOnly): no-op. Workers don't write
+      //     migration state; they report progress via the data they return.
+      //
+      // On the orchestrator pass only: a later complete(data)/defer(reason, data)
+      // overwrites what you set here whenever it passes a value — including an
+      // explicit empty value like {} (or null), which resets it. Only omitting
+      // the argument entirely (complete()/defer() with no data) leaves the value
+      // you set here in place; it is never auto-cleared.
+      //
+      // Resolves to `true` if the value was persisted, `false` otherwise (a
+      // job-only worker no-op, or a failed write). It is non-fatal: a failed
+      // write is logged and returns `false` rather than throwing, so a progress
+      // update can't turn a healthy migration into an error.
+      updateMetadata: (value: TReturn) => Promise<boolean>;
     },
   ) => Promise<void>; // Migration function itself still returns Promise<void>, data is passed via complete()
 
@@ -56,6 +94,21 @@ export interface MigrationStatus {
   afterSchemaApplied: boolean;
   completedAt: number;
   lastUpdated: number;
+  // Observability fields:
+  // When the migration was first attempted (epoch seconds, 0 if never).
+  startedAt: number;
+  // How many times this migration has been attempted via runSchemaChanges.
+  // Incremented at the start of every attempt, regardless of how it ends -
+  // including attempts that defer() or error. (runDataMigrationJobOnly, the
+  // distributed-mode data-job path, does NOT increment this.)
+  attempts: number;
+  // The most recent error or defer reason, or null once it completes cleanly.
+  lastError: string | null;
+  // Freeform JSON the migration persists via ctx.complete(data)/ctx.defer(reason,
+  // data). Unlike lastError it is NOT cleared between attempts, so it can carry
+  // checkpoint/progress state forward (e.g. { remaining: 120, jobId: "..." }).
+  // null until the migration writes something.
+  metadata: unknown;
 }
 
 // For runDataMigrationJobOnly and internal phase results
@@ -86,8 +139,23 @@ export interface MigrationResult<D_ALL = Record<string, unknown>> {
   // Whether all migrations completed successfully
   success: boolean;
 
-  // Status of the migration run
-  status: "completed" | "locked" | "error" | "deferred";
+  // Status of the migration run.
+  // - "locked": could not acquire the lock — another process already holds it
+  //   (benign; nothing was attempted).
+  // - "lock_lost": the lock was lost mid-run (its renewal found another process
+  //   had taken it over). Unsafe — the run is aborted to avoid concurrency.
+  //   Distinct from "locked" so callers can tell "someone else is running" from
+  //   "I lost exclusivity while running".
+  // - "aborted": the run was stopped early via a caller-supplied AbortSignal
+  //   (graceful shutdown). Distinct from "error" (a real failure) and from
+  //   "deferred" (a migration paused itself).
+  status:
+    | "completed"
+    | "locked"
+    | "lock_lost"
+    | "error"
+    | "deferred"
+    | "aborted";
 
   // Reason for failure or deferral if applicable (always a formatted string for display)
   reason?: string;
@@ -133,6 +201,12 @@ export class MigrationManager {
   private lockRenewalSeconds: number; // Configurable lock renewal interval in seconds
   private logger: MigrationLogger;
   private initialized = false;
+  // Abort controller scoped to a single runSchemaChanges call. Aborted on a
+  // caller-supplied shutdown signal or when the lock is lost during renewal.
+  private runAbortController: AbortController | null = null;
+  // Set when lock renewal detects the lock was lost (taken by another process).
+  // Distinguishes an unsafe lock-loss abort from a graceful shutdown abort.
+  private lockLost = false;
 
   /**
    * Helper method to update migration status fields
@@ -145,6 +219,12 @@ export class MigrationManager {
       migrationComplete?: boolean;
       afterSchemaApplied?: boolean;
       completedAt?: number;
+      // Pass a string to record the latest failure/defer reason, or null to
+      // clear it (e.g. on successful completion).
+      lastError?: string | null;
+      // Freeform JSON to persist into the metadata column. Stored as-is; not
+      // cleared between attempts. Omit to leave the existing value untouched.
+      metadata?: unknown;
     },
   ): Promise<void> {
     const updates: string[] = [];
@@ -169,6 +249,17 @@ export class MigrationManager {
     if (fields.completedAt !== undefined) {
       updates.push(`completed_at = $${paramIndex++}`);
       values.push(fields.completedAt);
+    }
+
+    if (fields.lastError !== undefined) {
+      updates.push(`last_error = $${paramIndex++}`);
+      values.push(fields.lastError);
+    }
+
+    if (fields.metadata !== undefined) {
+      // Serialize to JSON for the jsonb column.
+      updates.push(`metadata = $${paramIndex++}::jsonb`);
+      values.push(JSON.stringify(fields.metadata));
     }
 
     // Always update last_updated timestamp
@@ -235,8 +326,22 @@ export class MigrationManager {
           migration_complete BOOLEAN NOT NULL DEFAULT FALSE,
           after_schema_applied BOOLEAN NOT NULL DEFAULT FALSE,
           completed_at BIGINT NOT NULL DEFAULT 0,
-          last_updated BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::bigint
+          last_updated BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::bigint,
+          started_at BIGINT NOT NULL DEFAULT 0,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          metadata JSONB
         )
+      `);
+
+      // Backfill the observability columns for tables created by older versions
+      // of Strataline. ADD COLUMN IF NOT EXISTS is a no-op when they're present.
+      await client.query(`
+        ALTER TABLE migration_status
+          ADD COLUMN IF NOT EXISTS started_at BIGINT NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS last_error TEXT,
+          ADD COLUMN IF NOT EXISTS metadata JSONB
       `);
 
       // Create migration lock table
@@ -301,12 +406,25 @@ export class MigrationManager {
         migration_complete AS "migrationComplete",
         after_schema_applied AS "afterSchemaApplied",
         completed_at AS "completedAt",
-        last_updated AS "lastUpdated"
+        last_updated AS "lastUpdated",
+        started_at AS "startedAt",
+        attempts AS "attempts",
+        last_error AS "lastError",
+        metadata AS "metadata"
       FROM migration_status
       ORDER BY completed_at
     `);
 
-    return rows;
+    // pg returns BIGINT columns as strings to avoid precision loss. Our epoch
+    // timestamps fit safely in a JS number, so coerce them here to honour the
+    // numeric MigrationStatus type and keep numeric comparisons reliable.
+    return rows.map((row) => ({
+      ...row,
+      completedAt: Number(row.completedAt),
+      lastUpdated: Number(row.lastUpdated),
+      startedAt: Number(row.startedAt),
+      attempts: Number(row.attempts),
+    }));
   }
 
   /**
@@ -315,13 +433,40 @@ export class MigrationManager {
    * @returns A structured result object with details about the migration run
    */
 
-  async runSchemaChanges(mode: MigrationMode): Promise<MigrationResult> {
+  async runSchemaChanges(
+    mode: MigrationMode,
+    opts?: {
+      // Optional caller-owned signal for graceful shutdown. When it aborts, the
+      // run stops at the next safe point and any in-flight data migration is
+      // notified via ctx.signal. The library never installs OS signal handlers
+      // itself — wire this to your own SIGTERM/SIGINT handling if desired.
+      signal?: AbortSignal;
+    },
+  ): Promise<MigrationResult> {
     await this.ensureInitialized();
 
     const migrationData: Record<string, unknown> = {}; // To store data from successful migrations
 
-    // Try to acquire the lock
-    const lockAcquired = await this.acquireMigrationLock();
+    // Try to acquire the lock. A `false` return means another process holds it
+    // (expected, skip), whereas a thrown error means an unexpected DB failure
+    // that should be reported distinctly rather than masked as "locked".
+    let lockAcquired: boolean;
+
+    try {
+      lockAcquired = await this.acquireMigrationLock();
+    } catch (error: unknown) {
+      return {
+        success: false,
+        status: "error",
+        reason: `[acquireMigrationLock] ${error instanceof Error ? error.message : String(error)}`,
+        completedMigrations: [],
+        previouslyAppliedMigrations: [],
+        pendingMigrations: this.migrations.map((m) => m.id),
+        error: error instanceof Error ? error : undefined,
+        migrationData,
+      };
+    }
+
     if (!lockAcquired) {
       this.logger.info({
         message: "Another process is running migrations, skipping",
@@ -336,6 +481,25 @@ export class MigrationManager {
         pendingMigrations: this.migrations.map((m) => m.id),
         migrationData,
       };
+    }
+
+    // Set up the run-scoped abort controller now that we hold the lock. A run
+    // can be aborted by either:
+    //  - the caller's shutdown signal (graceful -> reported as "aborted")
+    //  - lock loss detected during renewal (unsafe -> reported as "error")
+    this.lockLost = false;
+    this.runAbortController = new AbortController();
+    const externalSignal = opts?.signal;
+    const onExternalAbort = () => this.runAbortController?.abort();
+
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        this.runAbortController.abort();
+      } else {
+        externalSignal.addEventListener("abort", onExternalAbort, {
+          once: true,
+        });
+      }
     }
 
     try {
@@ -399,8 +563,54 @@ export class MigrationManager {
 
       let lastAttemptedMigration: string | undefined;
 
+      // Builds the result when a run is interrupted (aborted or lock lost).
+      // Lock loss is unsafe, so it's surfaced as "error"; a caller-requested
+      // shutdown is a benign "aborted".
+      const buildInterruptedResult = (): MigrationResult => {
+        const previouslyAppliedMigrations = appliedIds.filter(
+          (id) => !completedMigrations.includes(id),
+        );
+
+        if (this.lockLost) {
+          return {
+            success: false,
+            status: "lock_lost",
+            reason:
+              "[lock] Migration lock was lost (it may have been acquired by another process); aborting to avoid concurrent migrations.",
+            completedMigrations,
+            previouslyAppliedMigrations,
+            pendingMigrations: remainingPendingMigrations,
+            lastAttemptedMigration,
+            migrationData,
+          };
+        }
+
+        return {
+          success: false,
+          status: "aborted",
+          reason: "Migration run aborted via shutdown signal",
+          completedMigrations,
+          previouslyAppliedMigrations,
+          pendingMigrations: remainingPendingMigrations,
+          lastAttemptedMigration,
+          migrationData,
+        };
+      };
+
       // Process migrations in order, stopping if any migration fails
       for (const migration of pendingMigrations) {
+        // Stop before starting the next migration if a shutdown was requested
+        // or the lock was lost.
+        if (this.runAbortController?.signal.aborted) {
+          this.logger.info({
+            message: this.lockLost
+              ? "Migration lock lost - stopping before next migration"
+              : "Shutdown requested - stopping before next migration",
+          });
+
+          return buildInterruptedResult();
+        }
+
         lastAttemptedMigration = migration.id;
 
         try {
@@ -412,9 +622,19 @@ export class MigrationManager {
           const result = await this.runSingleMigration<unknown, unknown>(
             migration,
             mode,
+            this.runAbortController?.signal,
           );
 
           if (result.status !== "success") {
+            // If the run was interrupted while this migration ran, that takes
+            // precedence over however the migration itself ended (it may have
+            // cooperatively deferred in response to the abort). Report the
+            // interruption ("error" if the lock was lost, otherwise "aborted")
+            // rather than a benign defer.
+            if (this.runAbortController?.signal.aborted) {
+              return buildInterruptedResult();
+            }
+
             this.logger.info({
               message: `Migration ${migration.id} did not complete successfully - stopping migration process to prevent out-of-order migrations. Status: ${result.status}, Reason: ${result.reason || "N/A"}`,
             });
@@ -465,6 +685,18 @@ export class MigrationManager {
           this.logger.info({
             message: `Successfully completed migration ${migration.id}`,
           });
+
+          // The migration finished, but the run may have been interrupted while
+          // it was in flight — the migration could have ignored ctx.signal and
+          // called complete() after a shutdown signal, or the lock could have
+          // been lost yet the migration still finished. Surface that here so we
+          // don't fall through and report "completed", which would mask a
+          // graceful abort or (critically) an unsafe lock-loss condition. The
+          // just-completed migration is already in completedMigrations, so the
+          // result's lists stay accurate. lockLost -> "error", else "aborted".
+          if (this.runAbortController?.signal.aborted) {
+            return buildInterruptedResult();
+          }
         } catch (error: unknown) {
           // Log the error and stop processing further migrations
           this.logger.error({
@@ -483,6 +715,19 @@ export class MigrationManager {
           )
             ? errorMessage // Already has a phase prefix, preserve it
             : `[runSchemaChanges] ${errorMessage}`; // Add generic prefix for errors without phase info
+
+          // Record the failure on the migration row for observability. The
+          // per-phase failures inside runSingleMigration already do this, but an
+          // unexpected throw lands here without last_error being set. Best-effort
+          // and guarded so a failing write doesn't mask the original error.
+          try {
+            await this.markStatus(migration.id, { lastError: errorReason });
+          } catch (statusErr: unknown) {
+            this.logger.error({
+              message: `Failed to persist last_error for ${migration.id}`,
+              error: statusErr,
+            });
+          }
 
           return {
             success: false,
@@ -512,6 +757,12 @@ export class MigrationManager {
         migrationData,
       };
     } finally {
+      // Detach the external abort listener and clear the run-scoped controller.
+      if (externalSignal) {
+        externalSignal.removeEventListener("abort", onExternalAbort);
+      }
+      this.runAbortController = null;
+
       // Always release the lock when done
       await this.releaseMigrationLock();
     }
@@ -530,6 +781,7 @@ export class MigrationManager {
   >(
     migration: Migration<TPayload, TReturn>,
     mode: MigrationMode,
+    signal?: AbortSignal,
   ): Promise<DataMigrationPhaseResult<TReturn>> {
     // Create a task-specific logger for this migration
     const taskLogger = this.createTaskLogger(migration.id);
@@ -542,11 +794,18 @@ export class MigrationManager {
     // Create schema helpers with the task-specific logger
     const helpers = createSchemaHelpers(taskLogger);
 
-    // Ensure migration record exists in the status table
+    // Ensure migration record exists in the status table, and capture the
+    // current phase flags so we can skip phases that are already applied.
     const { rows } = await this.pool.query(
-      `SELECT id FROM migration_status WHERE id = $1`,
+      `SELECT migration_complete FROM migration_status WHERE id = $1`,
       [migration.id],
     );
+
+    // Whether the data migration phase has already been marked complete in a
+    // prior run. Used to avoid re-running a completed data migration if a
+    // later phase (e.g. afterSchema) failed and the migration is being resumed.
+    const dataMigrationAlreadyComplete =
+      rows.length > 0 && rows[0].migration_complete === true;
 
     if (rows.length === 0) {
       // Create initial migration record if it doesn't exist
@@ -566,6 +825,22 @@ export class MigrationManager {
       });
     }
 
+    // Record this attempt: bump the attempt counter, stamp started_at on the
+    // first attempt, and clear any error from a prior attempt now that we're
+    // trying again.
+    const attemptNow = Math.floor(Date.now() / 1000);
+    await this.pool.query(
+      `
+      UPDATE migration_status
+      SET attempts = attempts + 1,
+          started_at = CASE WHEN started_at = 0 THEN $2 ELSE started_at END,
+          last_error = NULL,
+          last_updated = $2
+      WHERE id = $1
+      `,
+      [migration.id, attemptNow],
+    );
+
     // Step 1: Run schema changes before data migration if provided
     if (migration.beforeSchema) {
       try {
@@ -581,9 +856,11 @@ export class MigrationManager {
           error: err,
         });
 
+        const reason = `[beforeSchema] ${err instanceof Error ? err.message : String(err)}`;
+        await this.markStatus(migration.id, { lastError: reason });
         return {
           status: "error",
-          reason: `[beforeSchema] ${err instanceof Error ? err.message : String(err)}`,
+          reason,
         };
       }
     } else {
@@ -596,15 +873,28 @@ export class MigrationManager {
     }
 
     // Step 2: Run data migration if provided
-    if (migration.migration) {
+    if (migration.migration && dataMigrationAlreadyComplete) {
+      // The data migration was already completed in a previous run (e.g. the
+      // migration is being resumed after a later phase failed). Skip it so we
+      // don't re-execute non-idempotent data work, mirroring how the schema
+      // phases skip when already applied.
+      taskLogger.info({
+        message: `[dataMigration] Skipping data migration for ${migration.id} - already marked complete`,
+      });
+    } else if (migration.migration) {
       const dataMigrationResult = await this.runDataMigration<
         TPayload,
         TReturn
-      >(migration, taskLogger, mode, {} as TPayload); // Pass default payload
+      >(migration, taskLogger, mode, {} as TPayload, signal); // Pass default payload
 
       if (dataMigrationResult.status !== "success") {
         taskLogger.info({
           message: `[dataMigration] Data migration for ${migration.id} did not complete successfully (status: ${dataMigrationResult.status}). Reason: ${dataMigrationResult.reason || "N/A"}`,
+        });
+        await this.markStatus(migration.id, {
+          lastError:
+            dataMigrationResult.reason ??
+            `[dataMigration] ${dataMigrationResult.status}`,
         });
         return dataMigrationResult; // Propagate status, reason, and potentially data (if provided by either complete or defer)
       }
@@ -634,9 +924,11 @@ export class MigrationManager {
           error: err,
         });
 
+        const reason = `[afterSchema] ${err instanceof Error ? err.message : String(err)}`;
+        await this.markStatus(migration.id, { lastError: reason });
         return {
           status: "error",
-          reason: `[afterSchema] ${err instanceof Error ? err.message : String(err)}`,
+          reason,
         };
       }
     } else {
@@ -746,8 +1038,40 @@ export class MigrationManager {
     logger: Logger,
     mode: MigrationMode,
     payload: TPayload = {} as TPayload,
+    signal?: AbortSignal,
+    // Whether this call owns the migration's status. The orchestrator pass
+    // (runSingleMigration) passes true: complete() marks migration_complete and
+    // complete()/defer() persist the `data` to the metadata column. Job workers
+    // (runDataMigrationJobOnly) pass false: they just run the function and
+    // return the result, writing nothing to migration_status.
+    ownsState: boolean = true,
   ): Promise<DataMigrationPhaseResult<TReturn>> {
     // Pre-condition: migration.migration is guaranteed to be non-null by the caller.
+
+    // ctx.signal is always present; default to a signal that never aborts when
+    // the caller did not supply one. What can trip it depends on the call path:
+    //   - Orchestrator (runSchemaChanges): the run-scoped controller, which
+    //     aborts on a caller shutdown signal OR on lock loss.
+    //   - Worker (runDataMigrationJobOnly): only the caller's signal — this path
+    //     never takes the lock, so lock loss can't trigger it here.
+    const ctxSignal = signal ?? new AbortController().signal;
+
+    // Load any previously-persisted metadata so the migration can resume from a
+    // checkpoint via ctx.metadata. Read-only — safe on every path.
+    let loadedMetadata: unknown = null;
+    try {
+      const { rows } = await this.pool.query(
+        `SELECT metadata FROM migration_status WHERE id = $1`,
+        [migration.id],
+      );
+      loadedMetadata = rows.length > 0 ? (rows[0].metadata ?? null) : null;
+    } catch (err: unknown) {
+      logger.error({
+        message: `[dataMigration] Failed to load metadata for ${migration.id}; continuing with null`,
+        error: err,
+      });
+      loadedMetadata = null;
+    }
 
     return new Promise<DataMigrationPhaseResult<TReturn>>((resolve) => {
       let callbackCalled = false;
@@ -760,7 +1084,27 @@ export class MigrationManager {
 
         callbackCalled = true;
 
-        this.markStatus(migration.id, { migrationComplete: true })
+        // Job-only workers don't own migration state: just report success and
+        // hand the data back to the caller without writing anything.
+        if (!ownsState) {
+          logger.info({
+            message: `[dataMigration] Data migration function reported complete (worker call — migration state not persisted).`,
+          });
+
+          resolve({ status: "success", data });
+          return;
+        }
+
+        // Orchestrator pass: mark complete, and persist data as metadata if any.
+        const fields: { migrationComplete: boolean; metadata?: unknown } = {
+          migrationComplete: true,
+        };
+
+        if (data !== undefined) {
+          fields.metadata = data;
+        }
+
+        this.markStatus(migration.id, fields)
           .then(() => {
             logger.info({
               message: `[dataMigration] Data migration marked as complete via callback.`,
@@ -799,8 +1143,52 @@ export class MigrationManager {
           message: logMessage,
         });
 
+        // Persist data as metadata on the orchestrator pass only (best-effort —
+        // a failed metadata write should not turn a valid defer into an error).
+        if (ownsState && data !== undefined) {
+          this.markStatus(migration.id, { metadata: data })
+            .catch((dbError: unknown) => {
+              logger.error({
+                message: `[dataMigration] Failed to persist metadata on defer for ${migration.id}`,
+                error: dbError,
+              });
+            })
+            .finally(() => {
+              resolve({ status: "deferred", reason: reason, data });
+            });
+          return;
+        }
+
         // Resolve to deferred status, include data
         resolve({ status: "deferred", reason: reason, data });
+      };
+
+      // Mid-run progress reporting. Writes only on the orchestrator pass; a
+      // no-op on job-only workers (which report via their returned data).
+      // Returns whether the value was persisted, and is non-fatal: a failed
+      // write is logged and returns false rather than throwing, so a progress
+      // update can never turn a healthy migration into an error.
+      const updateMetadataCallback = async (
+        value: TReturn,
+      ): Promise<boolean> => {
+        if (!ownsState) {
+          logger.info({
+            message: `[dataMigration] ctx.updateMetadata ignored on worker call (migration state not persisted).`,
+          });
+          return false;
+        }
+
+        try {
+          await this.markStatus(migration.id, { metadata: value });
+          return true;
+        } catch (err: unknown) {
+          logger.error({
+            message: `[dataMigration] ctx.updateMetadata failed to persist for ${migration.id} (continuing)`,
+            error: err,
+          });
+
+          return false;
+        }
       };
 
       (async () => {
@@ -816,6 +1204,9 @@ export class MigrationManager {
             defer: deferCallback,
             mode,
             payload,
+            signal: ctxSignal,
+            metadata: loadedMetadata,
+            updateMetadata: updateMetadataCallback,
           });
 
           // If the migration function returns a promise, await its settlement.
@@ -872,8 +1263,12 @@ export class MigrationManager {
       const now = new Date();
       const expiresAt = new Date(now.getTime() + 5 * 60 * 1000); // 5 minutes expiration
 
-      // Generate a unique lock ID for this process
-      const processLockId = `${process.env.HOSTNAME || "unknown"}-${process.pid}-${Date.now()}`;
+      // Generate a unique lock ID for this process.
+      // Prefer HOSTNAME, but fall back to os.hostname() (HOSTNAME is often
+      // unset on macOS / non-login shells, which otherwise leaves locks
+      // attributed to "unknown").
+      const host = process.env.HOSTNAME || hostname() || "unknown";
+      const processLockId = `${host}-${process.pid}-${Date.now()}`;
 
       // First try a simple insert - this is the most common case when no lock exists
       let lockResult;
@@ -945,11 +1340,14 @@ export class MigrationManager {
 
       return true;
     } catch (error) {
+      // Unexpected failure (e.g. lost connection, permissions). Don't swallow
+      // it as "false", which the caller would report as "another process holds
+      // the lock" and could retry forever. Surface it so it becomes an error.
       this.logger.error({
         message: "Error acquiring migration lock:",
         error,
       });
-      return false;
+      throw error;
     } finally {
       client.release();
     }
@@ -1025,6 +1423,13 @@ export class MigrationManager {
               "Failed to renew migration lock - it may have been taken by another process",
           });
         }
+
+        // The lock is gone, which means another process may now be running.
+        // Flag it and abort the in-flight run so we stop doing work without a
+        // valid lock (a safety condition, surfaced to the caller as an error).
+        this.lockLost = true;
+        this.runAbortController?.abort();
+
         // Stop trying to renew
         this.stopLockRenewal();
       }
@@ -1052,6 +1457,8 @@ export class MigrationManager {
    * Run only the data migration phase for a specific migration as a job
    * @param migrationId The ID of the migration to run
    * @param payload Optional payload to pass to the data migration
+   * @param opts.signal Optional AbortSignal exposed to the data migration as
+   *   ctx.signal, so distributed job workers can be cancelled cooperatively.
    * @returns A DataMigrationJobResult object indicating status and any returned data
    */
   async runDataMigrationJobOnly<
@@ -1060,6 +1467,7 @@ export class MigrationManager {
   >(
     migrationId: string,
     payload?: TPayload,
+    opts?: { signal?: AbortSignal },
   ): Promise<DataMigrationJobResult<TReturn>> {
     await this.ensureInitialized();
 
@@ -1119,8 +1527,13 @@ export class MigrationManager {
       };
     }
 
-    // Check if migration is already complete (migration_complete flag is true and completed_at > 0)
-    if (status.migration_complete && status.completed_at > 0) {
+    // If the data phase is already complete, a worker has nothing to do.
+    // Check `migration_complete` directly — NOT completed_at. completed_at is
+    // only set once the whole migration finishes (after afterSchema), so it can
+    // still be 0 when migration_complete is true (e.g. afterSchema failed and the
+    // migration is mid-resume). Gating on completed_at here would let a late or
+    // retrying worker re-run the data migration even though its phase is done.
+    if (status.migration_complete) {
       taskLogger.info({
         message: `Data migration for ${migrationId} has already been completed`,
       });
@@ -1140,13 +1553,13 @@ export class MigrationManager {
       };
     }
 
-    // If there's no data migration function, mark it as complete and return
+    // If there's no data migration function, there's nothing for this worker to
+    // run. It does NOT mark the migration complete — only the orchestrator pass
+    // (runSchemaChanges) owns the migration_complete flag. Just report success.
     if (!migration.migration) {
       taskLogger.info({
-        message: `No data migration provided for migration ${migration.id}, marking as complete`,
+        message: `No data migration provided for migration ${migration.id}; nothing to run (migration_complete is owned by runSchemaChanges)`,
       });
-
-      await this.markStatus(migration.id, { migrationComplete: true });
 
       return { status: "success" }; // Successfully did nothing, no data.
     }
@@ -1165,6 +1578,10 @@ export class MigrationManager {
         taskLogger,
         mode,
         payload || ({} as TPayload),
+        opts?.signal,
+        // Worker call: run the function and return the result, but do NOT write
+        // migration_complete/metadata — the orchestrator pass owns that.
+        false,
       );
 
       if (result.status === "success") {

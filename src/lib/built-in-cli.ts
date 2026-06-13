@@ -1,4 +1,8 @@
-import { Migration, MigrationManager } from "./migration-system";
+import {
+  Migration,
+  MigrationManager,
+  type MigrationResult,
+} from "./migration-system";
 import { Pool } from "pg";
 import { Logger, LogDataInput, BaseLogger } from "./logger";
 
@@ -157,13 +161,18 @@ async function testConnection(
  * @param mode Migration mode (job or distributed)
  * @param migrations Array of migrations to run
  * @param logger Logger function to use
+ * @param signal Optional AbortSignal for graceful shutdown
+ * @returns The MigrationResult. Throws only when the run ends in "error";
+ *   "deferred"/"locked"/"aborted" are logged and returned (they are not
+ *   failures), so the caller can map them to distinct exit codes.
  */
 async function runMigrations(
   pool: Pool,
   mode: "job" | "distributed",
   migrations: Migration[],
   logger: CLILoggerFunction,
-): Promise<void> {
+  signal?: AbortSignal,
+): Promise<MigrationResult> {
   logger("info", `Initializing database migration manager in ${mode} mode...`);
 
   // Create migration manager with our adapter for logging
@@ -175,9 +184,25 @@ async function runMigrations(
 
   // Run pending migrations
   logger("info", "Running pending schema changes...");
-  const result = await manager.runSchemaChanges(mode);
+  const result = await manager.runSchemaChanges(mode, { signal });
 
   if (result.success) {
+    const appliedNow = result.completedMigrations.length;
+    const previouslyApplied = result.previouslyAppliedMigrations?.length ?? 0;
+
+    // Lead with a clear, human summary so it's obvious at a glance whether
+    // anything happened, rather than leaving the reader to parse the lists.
+    if (appliedNow === 0 && previouslyApplied === 0) {
+      logger("info", "No migrations registered — nothing to do.");
+    } else if (appliedNow === 0) {
+      logger(
+        "info",
+        `✓ Already up to date — all ${previouslyApplied} migration(s) were applied in previous runs.`,
+      );
+    } else {
+      logger("info", `✓ Applied ${appliedNow} migration(s) in this run.`);
+    }
+
     // Always show migrations applied in this run (even if none)
     logger(
       "info",
@@ -195,12 +220,36 @@ async function runMigrations(
       "info",
       `Pending migrations: ${result.pendingMigrations.join(", ") || "none"}`,
     );
+
+    return result;
   } else {
-    logger("error", `Migration failed: ${result.reason}`);
+    // A run can end early for several reasons. Only "error" is an actual
+    // failure — a deferral is a deliberate pause (staged rollout), a locked
+    // result just means another process is handling it, and "aborted" is a
+    // caller-requested graceful shutdown.
+    switch (result.status) {
+      case "deferred":
+        logger("warn", `⏸ Migration run paused — deferred: ${result.reason}`);
+        break;
+      case "locked":
+        logger("warn", `⏭ Migration run skipped: ${result.reason}`);
+        break;
+      case "aborted":
+        logger("warn", `⏹ Migration run aborted: ${result.reason}`);
+        break;
+      case "lock_lost":
+        // Unsafe condition — log loudly, but it's returned (not thrown) with
+        // its own exit code so callers can distinguish it from a generic error.
+        logger("error", `✗ Migration lock lost mid-run: ${result.reason}`);
+        break;
+      default:
+        logger("error", `✗ Migration failed: ${result.reason}`);
+        break;
+    }
 
     logger(
       "info",
-      `Completed migrations in this run: ${result.completedMigrations.join(", ") || "none"}`,
+      `Completed during this run: ${result.completedMigrations.join(", ") || "none"}`,
     );
 
     if (
@@ -213,6 +262,7 @@ async function runMigrations(
       );
     }
 
+    // Remaining work is always surfaced when a run ends early.
     logger(
       "info",
       `Pending migrations: ${result.pendingMigrations.join(", ") || "none"}`,
@@ -234,7 +284,14 @@ async function runMigrations(
       }
     }
 
-    throw new Error(`Migration failed: ${result.reason}`);
+    // Only a real "error" throws (so callers that only `.catch` still see
+    // failures and exit non-zero). deferred/locked/aborted are not failures —
+    // they're returned so the caller can map each to its own exit code.
+    if (result.status === "error") {
+      throw new Error(`Migration failed: ${result.reason}`);
+    }
+
+    return result;
   }
 }
 
@@ -265,28 +322,119 @@ async function showMigrationStatus(
   if (status.length === 0) {
     logger("info", "No migrations have been applied yet.");
   } else {
-    logger(
-      "info",
-      "ID                   | Before | Migration | After  | Applied At",
-    );
-    logger(
-      "info",
-      "---------------------|--------|-----------|--------|------------------",
-    );
-
-    status.forEach((m) => {
-      const date = m.completedAt
-        ? new Date(m.completedAt * 1000)
+    const formatDate = (completedAt: number): string =>
+      completedAt
+        ? new Date(completedAt * 1000)
             .toISOString()
             .replace("T", " ")
             .substring(0, 19)
         : "Not completed";
 
-      logger(
-        "info",
-        `${m.id.padEnd(20)} | ${m.beforeSchemaApplied ? "Yes" : "No ".padEnd(6)} | ${m.migrationComplete ? "Yes" : "No ".padEnd(9)} | ${m.afterSchemaApplied ? "Yes" : "No ".padEnd(6)} | ${date}`,
-      );
-    });
+    const yesNo = (applied: boolean): string => (applied ? "Yes" : "No");
+
+    // Keep the table readable by truncating long values to a single line.
+    const truncate = (text: string, max: number): string => {
+      const oneLine = text.replace(/\s+/g, " ").trim();
+      return oneLine.length > max ? oneLine.slice(0, max - 1) + "…" : oneLine;
+    };
+
+    const formatError = (lastError: string | null): string =>
+      lastError ? truncate(lastError, 60) : "—";
+
+    const formatMetadata = (metadata: unknown): string => {
+      if (metadata === null || metadata === undefined) {
+        return "—";
+      }
+      try {
+        return truncate(JSON.stringify(metadata), 40);
+      } catch {
+        return "(unserializable)";
+      }
+    };
+
+    // Build the rows first so column widths can be sized to the actual content
+    // (keeps the table aligned regardless of migration ID length).
+    const headers = [
+      "ID",
+      "Before",
+      "Migration",
+      "After",
+      "Applied At",
+      "Attempts",
+      "Last Error",
+      "Metadata",
+    ];
+
+    const rows = status.map((m) => [
+      m.id,
+      yesNo(m.beforeSchemaApplied),
+      yesNo(m.migrationComplete),
+      yesNo(m.afterSchemaApplied),
+      formatDate(m.completedAt),
+      String(m.attempts),
+      formatError(m.lastError),
+      formatMetadata(m.metadata),
+    ]);
+
+    const widths = headers.map((header, col) =>
+      Math.max(header.length, ...rows.map((row) => row[col].length)),
+    );
+
+    const renderRow = (cells: string[]): string =>
+      cells.map((cell, col) => cell.padEnd(widths[col])).join(" | ");
+
+    logger("info", renderRow(headers));
+    logger("info", widths.map((w) => "-".repeat(w)).join("-+-"));
+
+    for (const row of rows) {
+      logger("info", renderRow(row));
+    }
+  }
+}
+
+/**
+ * Process exit codes returned by RunStratalineCLI, one per outcome so wrapper
+ * scripts can distinguish them. A genuine "error" is thrown rather than
+ * returned, so callers that `.catch(() => process.exit(1))` still map it to 1.
+ */
+export const STRATALINE_EXIT_CODES = {
+  completed: 0,
+  error: 1,
+  deferred: 2,
+  locked: 3,
+  aborted: 4,
+  lock_lost: 5,
+} as const;
+
+/**
+ * Result returned by RunStratalineCLI for non-error outcomes.
+ */
+export interface StratalineCLIResult {
+  // The CLI command that ran ("run", "status", or "help").
+  command: string;
+  // The migration run status, present for the "run" command.
+  status?: MigrationResult["status"];
+  // Suggested process exit code for this outcome.
+  exitCode: number;
+  // Human-readable reason, when the run did not simply complete.
+  reason?: string;
+}
+
+function exitCodeForRunStatus(status: MigrationResult["status"]): number {
+  switch (status) {
+    case "completed":
+      return STRATALINE_EXIT_CODES.completed;
+    case "deferred":
+      return STRATALINE_EXIT_CODES.deferred;
+    case "locked":
+      return STRATALINE_EXIT_CODES.locked;
+    case "aborted":
+      return STRATALINE_EXIT_CODES.aborted;
+    case "lock_lost":
+      return STRATALINE_EXIT_CODES.lock_lost;
+    default:
+      // "error" is thrown, not returned, but map it for completeness.
+      return STRATALINE_EXIT_CODES.error;
   }
 }
 
@@ -300,6 +448,11 @@ async function showMigrationStatus(
  * @param config.logger Logger function to use for logging (Required, unlike the other ones in this project)
  * @param config.argv Optional array to use instead of process.argv for CLI arguments
  * @param config.env Optional environment object to use instead of process.env
+ * @param config.signal Optional AbortSignal for graceful shutdown. The library
+ *   never traps OS signals itself — wire this to your own SIGTERM/SIGINT
+ *   handling. When it aborts, an in-flight `run` stops at the next safe point.
+ * @returns A StratalineCLIResult with a suggested `exitCode`. Throws on a real
+ *   migration error or on configuration/connection failures.
  */
 export async function RunStratalineCLI(config: {
   migrations: Migration[];
@@ -309,7 +462,8 @@ export async function RunStratalineCLI(config: {
   logger: CLILoggerFunction;
   argv?: string[];
   env?: Record<string, string | undefined>;
-}) {
+  signal?: AbortSignal;
+}): Promise<StratalineCLIResult> {
   let poolInstance: Pool | undefined;
 
   // Validate configuration
@@ -476,21 +630,32 @@ export async function RunStratalineCLI(config: {
         throw new Error("Database connection failure");
       }
 
+      let cliResult: StratalineCLIResult;
+
       switch (operation) {
-        case "run":
-          await runMigrations(
+        case "run": {
+          const result = await runMigrations(
             poolInstance,
             isDistributed ? "distributed" : "job",
             config.migrations,
             config.logger,
+            config.signal,
           );
+          cliResult = {
+            command: "run",
+            status: result.status,
+            exitCode: exitCodeForRunStatus(result.status),
+            reason: result.reason,
+          };
           break;
+        }
         case "status":
           await showMigrationStatus(
             poolInstance,
             config.migrations,
             config.logger,
           );
+          cliResult = { command: "status", exitCode: 0 };
           break;
         case "help":
         default:
@@ -507,8 +672,11 @@ Options:
   --distributed  Run migrations in distributed mode
 `,
           );
+          cliResult = { command: "help", exitCode: 0 };
           break;
       }
+
+      return cliResult;
     } catch (error: unknown) {
       const errorMessage =
         error instanceof Error ? error.message : String(error);

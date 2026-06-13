@@ -5,7 +5,7 @@ import {
   BaseLogger,
   LogDataInput,
 } from "../logger";
-// @ts-ignore - moduleResolution setting prevents TypeScript from finding embedded-postgres types
+// @ts-expect-error - moduleResolution setting prevents TypeScript from finding embedded-postgres types
 import EmbeddedPostgres from "embedded-postgres";
 import * as tmp from "tmp";
 import getPort from "get-port";
@@ -43,28 +43,34 @@ export const createTestDBConsoleLogger = (
   return (type, message) => {
     switch (type) {
       case "info":
+        // eslint-disable-next-line no-console
         console.log(message);
         break;
       case "error":
         console.error(message);
         break;
       case "warn":
+        // eslint-disable-next-line no-console
         console.warn(message);
         break;
       case "pg":
         if (pgVerbose) {
+          // eslint-disable-next-line no-console
           console.log(`[PG] ${message}`);
         }
         break;
       case "migrate-info":
         if (migrateVerbose) {
+          // eslint-disable-next-line no-console
           console.log(`[MIGRATE-INFO] ${message}`);
         }
         break;
       case "migrate-error":
+        // eslint-disable-next-line no-console
         console.error(`[MIGRATE-ERROR] ${message}`);
         break;
       case "migrate-warn":
+        // eslint-disable-next-line no-console
         console.warn(`[MIGRATE-WARN] ${message}`);
         break;
     }
@@ -84,7 +90,9 @@ class TestDBStratalineLogger extends BaseLogger implements StratalineLogger {
   }
 
   info(data: LogDataInput): void {
-    if (!this.testDbLogger) return;
+    if (!this.testDbLogger) {
+      return;
+    }
 
     const taskPrefix = data.task ? `[${data.task}]` : "";
     const stagePrefix = data.stage ? `[${data.stage}]` : "";
@@ -96,7 +104,9 @@ class TestDBStratalineLogger extends BaseLogger implements StratalineLogger {
   }
 
   error(data: LogDataInput): void {
-    if (!this.testDbLogger) return;
+    if (!this.testDbLogger) {
+      return;
+    }
 
     const taskPrefix = data.task ? `[${data.task}]` : "";
     const stagePrefix = data.stage ? `[${data.stage}]` : "";
@@ -111,7 +121,9 @@ class TestDBStratalineLogger extends BaseLogger implements StratalineLogger {
   }
 
   warn(data: LogDataInput): void {
-    if (!this.testDbLogger) return;
+    if (!this.testDbLogger) {
+      return;
+    }
 
     const taskPrefix = data.task ? `[${data.task}]` : "";
     const stagePrefix = data.stage ? `[${data.stage}]` : "";
@@ -236,8 +248,11 @@ export class TestDatabaseInstance {
             prefix: "pg-test-",
           },
           (err, path) => {
-            if (err) reject(err);
-            else resolve(path);
+            if (err) {
+              reject(err);
+            } else {
+              resolve(path);
+            }
           },
         );
       });

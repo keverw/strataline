@@ -29,7 +29,7 @@
     "dist"
   ],
   "scripts": {
-    "prepublishOnly": "bun audit && bun run build && bun run type-check && bun run lint && bun test",
+    "prepublishOnly": "bun audit && bun run build && bun run type-check && bun run lint && bun run test",
     "build": "bun run update-readme && tsup",
     "type-check": "tsc --noEmit",
     "dev": "tsup --watch",
@@ -37,7 +37,8 @@
     "db:migrate": "bun run scripts/db-migrate.ts run",
     "db:migrate:distributed": "bun run scripts/db-migrate.ts run --distributed",
     "db:status": "bun run scripts/db-migrate.ts status",
-    "test": "bun test",
+    "test": "bun test --timeout 60000",
+    "test:clean-shm": "bun run scripts/clean-shm.ts",
     "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,css,scss,md,html}\"",
     "lint": "eslint src",
     "update-readme": "markdown-toc-gen update README.md && bun run scripts/update-readme-version.ts"

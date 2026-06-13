@@ -192,7 +192,9 @@ export class LocalDevDBServer {
    * Handle graceful shutdown by forwarding the signal to PostgreSQL
    */
   private handleGracefulShutdown(): void {
-    if (this.isCleaningUp) return;
+    if (this.isCleaningUp) {
+      return;
+    }
     this.isCleaningUp = true;
 
     this.log("info", "\nShutting down PostgreSQL server...");
@@ -246,7 +248,9 @@ export class LocalDevDBServer {
     });
 
     process.on("uncaughtException", (err) => {
-      if (this.isCleaningUp) return;
+      if (this.isCleaningUp) {
+        return;
+      }
       this.log("error", `Uncaught exception: ${err}`);
       process.exit(1);
     });
@@ -261,7 +265,7 @@ export class LocalDevDBServer {
           if (pid) {
             this.killProcess(pid, "SIGKILL");
           }
-        } catch (e) {
+        } catch {
           // Process might already be gone
         }
       }
@@ -279,7 +283,7 @@ export class LocalDevDBServer {
       // Signal 0 doesn't send a signal but checks if process exists
       process.kill(pid, 0);
       return true;
-    } catch (e) {
+    } catch {
       return false;
     }
   }
@@ -298,7 +302,7 @@ export class LocalDevDBServer {
     try {
       process.kill(pid, signal);
       return true;
-    } catch (e) {
+    } catch {
       return false;
     }
   }
@@ -343,7 +347,7 @@ export class LocalDevDBServer {
         // Remove the PID file if it exists but is invalid
         try {
           await unlink(this.pidFile);
-        } catch (err) {
+        } catch {
           // Ignore errors
         }
       }
@@ -614,7 +618,7 @@ export class LocalDevDBServer {
       // Clean up PID file
       try {
         await unlink(this.pidFile);
-      } catch (e) {
+      } catch {
         // File might already be gone, ignore error
       }
 
@@ -651,7 +655,7 @@ export class LocalDevDBServer {
 
         this.log("setup", "PostgreSQL server is ready to accept connections");
         serverReady = true;
-      } catch (e) {
+      } catch {
         attempts++;
 
         if (attempts % 5 === 0) {
