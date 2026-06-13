@@ -75,6 +75,7 @@ Whether you're building a side project or orchestrating millions of rows in prod
     - [Process Management](#process-management)
     - [Using with Your Application](#using-with-your-application)
     - [Git Configuration](#git-configuration)
+  - [Locale and Collation](#locale-and-collation)
 - [Development](#development)
 
 <!-- tocstop -->
@@ -1417,6 +1418,33 @@ Add the following to your `.gitignore` to exclude the PostgreSQL data directory 
 /pgdata
 .pg_pid
 ```
+
+### Locale and Collation
+
+Both embedded helpers (Test DB Instance and Local Dev DB Server) initialize PostgreSQL with `--locale=C --encoding=UTF8`. The cluster still stores full Unicode (UTF-8) text; only the **default sort order** is set to `C` (byte order) rather than a language-specific locale.
+
+This is deliberate. Letting `initdb` inherit the host/CI locale causes two problems: a Linux-style locale such as `LC_ALL=C.UTF-8` makes `initdb` **fail outright on macOS** (macOS libc has no `C.UTF-8`), and an inherited locale makes text sort differently on each developer's machine. Pinning `C` gives the same, deterministic ordering everywhere and avoids the index-breaking "collation version mismatch" issues that libc locales (like `en_US.UTF-8`) can cause across OS upgrades.
+
+**What this affects — and what it doesn't.** Collation only applies to **text** types, and only as the _default_ when a query or column doesn't specify otherwise (resolution order: explicit `COLLATE` in the query → the column's collation → the database default). So it has **no effect** on ordering by timestamps, numbers, `uuid`s, or ULIDs:
+
+- `timestamptz` / `timestamp`, integers, and `uuid` are non-text types — always sorted by value, regardless of collation.
+- ULIDs stored as **text** are canonical Crockford base32 (`0-9A-Z`), which is time-ordered and sorts the same whether the collation is `C` or a locale. Just normalize them to uppercase on the way in (and validate them if they come from external sources) — Crockford is case-insensitive, and mixed case would sort inconsistently under `C` (uppercase bytes sort before lowercase).
+
+The `C`-vs-locale difference only shows up on **human-language text** with mixed case or accents (e.g. `"Zebra"` sorts before `"apple"` under `C`). If you need dictionary-style ordering, set it explicitly with a per-column or per-query `COLLATE` rather than relying on the database default:
+
+```sql
+-- per query, in the user's language
+SELECT * FROM people ORDER BY last_name COLLATE "es-ES-x-icu";
+
+-- or pin it on the column that needs it
+CREATE TABLE people (last_name text COLLATE "en-US-x-icu");
+```
+
+Being explicit is the recommended pattern regardless of this library:
+
+- **Correctness:** one cluster-wide collation can't be right for English, Spanish, German, etc. at the same time — only the query or column knows which language it's ordering.
+- **You may not control the default:** managed providers often fix the cluster collation, and a database's collation can't be changed after it's created (short of a dump/restore). Per-column and per-query `COLLATE` always work.
+- **Portability:** your real production database is a separate, managed PostgreSQL instance with its own collation — `--locale=C` only governs the local embedded dev/test databases, never prod. Setting collation explicitly is what keeps ordering consistent across all of them (local, CI, production) instead of silently depending on whatever default each environment happens to have.
 
 ## Development
 
