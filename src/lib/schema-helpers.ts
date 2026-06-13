@@ -249,40 +249,64 @@ export function createSchemaHelpers(
         throw new Error(`Table ${tableName} does not exist.`);
       }
 
-      // Check whether an index of this name already exists ON THIS TABLE, scoped
-      // to the target table (indrelid = to_regclass(tableName)) rather than
-      // resolving the bare index name through search_path. CREATE INDEX always
-      // creates the index in the *table's* schema, which may not be the first
-      // schema on search_path — so resolving the name independently could
-      // false-positive against a same-named index in another schema (wrongly
-      // skipping creation) or miss the real index when the table's schema isn't on
-      // search_path (then attempting a duplicate CREATE INDEX). Scoping to the
-      // resolved table keeps the check consistent with where the index will land.
+      // Look for an existing relation named indexName in the *table's* schema —
+      // the exact schema CREATE INDEX will create it in (which may not be the
+      // first schema on search_path). We scope by the table's namespace, and by
+      // the target table for the index case, rather than resolving the bare name
+      // through search_path: that would false-positive against a same-named index
+      // in another schema (wrongly skipping creation) or miss the real index when
+      // the table's schema isn't on search_path (then attempting a duplicate
+      // CREATE INDEX).
+      //
+      // relkind/on_target_table let us distinguish three cases in the table's
+      // schema:
+      //   - an index of this name on THIS table  -> already exists, skip
+      //   - an index of this name on ANOTHER table, or any non-index relation of
+      //     this name -> the name is taken; CREATE INDEX would fail with a raw
+      //     duplicate error, so fail fast with a clear message instead
+      //   - nothing                               -> create it
       const { rows } = await client.query(
         `
-        SELECT 1
-        FROM pg_index i
-        JOIN pg_class idx ON idx.oid = i.indexrelid
-        WHERE i.indrelid = to_regclass($1)
-          AND idx.relname = $2
+        SELECT c.relkind,
+               (i.indrelid = to_regclass($1)) AS on_target_table
+        FROM pg_class c
+        LEFT JOIN pg_index i ON i.indexrelid = c.oid
+        WHERE c.relname = $2
+          AND c.relnamespace = (
+            SELECT relnamespace FROM pg_class WHERE oid = to_regclass($1)
+          )
         `,
         [tableName, indexName],
       );
 
-      if (rows.length === 0) {
-        // Index doesn't exist, create it
+      const existing = rows[0];
+      // Both ordinary ('i') and partitioned ('I') indexes count as an index.
+      const isIndex =
+        existing?.relkind === "i" || existing?.relkind === "I";
+
+      if (!existing) {
+        // Nothing of this name in the table's schema — create it.
         const uniqueClause = unique ? "UNIQUE " : "";
         await client.query(`
-          CREATE ${uniqueClause}INDEX ${indexName} 
+          CREATE ${uniqueClause}INDEX ${indexName}
           ON ${tableName} (${columns.join(", ")})
         `);
         prefixedLogger.info({
           message: `Created index ${indexName} on table ${tableName}`,
         });
-      } else {
+      } else if (isIndex && existing.on_target_table) {
+        // The exact index we'd create already exists on this table — skip.
         prefixedLogger.info({
           message: `Index ${indexName} already exists on table ${tableName}`,
         });
+      } else {
+        // The name is already used in the table's schema by something else (an
+        // index on a different table, or a non-index relation). CREATE INDEX
+        // would fail with a raw "relation already exists" error; surface a clear
+        // one instead.
+        throw new Error(
+          `Cannot create index ${indexName} on table ${tableName}: a ${isIndex ? "different index" : "relation"} named ${indexName} already exists in the table's schema.`,
+        );
       }
     } catch (error) {
       prefixedLogger.error({

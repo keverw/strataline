@@ -837,6 +837,61 @@ describe("MigrationManager", () => {
   );
 
   test(
+    "reports 'locked' (via the unique-violation branch) when a fresh lock is already held",
+    async () => {
+      const m: Migration = {
+        id: "lock_held_001",
+        description: "Should not run while a fresh lock row exists",
+        migration: async (pool, ctx) => ctx.complete(),
+      };
+      migrationManager.register([m]);
+
+      // Initialize tables, then plant a non-expired lock owned by someone else.
+      // acquire's INSERT then hits a unique violation (SQLSTATE 23505); the
+      // takeover UPDATE finds the lock unexpired and updates nothing -> "locked".
+      // This exercises the code-based 23505 detection rather than message text.
+      await migrationManager.getMigrationStatus();
+      await pool.query(
+        `INSERT INTO migration_lock (lock_name, locked_by, locked_at, lock_expires_at)
+         VALUES ('database_migrations', 'someone_else', NOW(), NOW() + interval '5 minutes')`,
+      );
+
+      const result = await migrationManager.runSchemaChanges("job");
+
+      expect(result.status).toBe("locked");
+      expect(result.success).toBe(false);
+      expect(result.pendingMigrations).toContain("lock_held_001");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "takes over an expired lock (unique-violation branch) and completes",
+    async () => {
+      const m: Migration = {
+        id: "lock_takeover_001",
+        description: "Should run by taking over an expired lock",
+        migration: async (pool, ctx) => ctx.complete(),
+      };
+      migrationManager.register([m]);
+
+      // Plant an EXPIRED lock. acquire's INSERT hits the unique violation, then
+      // the takeover UPDATE (lock_expires_at < now) succeeds and the run proceeds.
+      await migrationManager.getMigrationStatus();
+      await pool.query(
+        `INSERT INTO migration_lock (lock_name, locked_by, locked_at, lock_expires_at)
+         VALUES ('database_migrations', 'crashed_process', NOW() - interval '10 minutes', NOW() - interval '5 minutes')`,
+      );
+
+      const result = await migrationManager.runSchemaChanges("job");
+
+      expect(result.status).toBe("completed");
+      expect(result.completedMigrations).toContain("lock_takeover_001");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
     "should abort a run via an external AbortSignal (graceful shutdown)",
     async () => {
       const controller = new AbortController();
@@ -1052,6 +1107,325 @@ describe("MigrationManager", () => {
       expect(result.reason).toMatch(/lock/i);
       expect(afterSchemaRan).toBe(false);
       expect(result.completedMigrations).toEqual([]);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a stolen lock fences off the complete() status write (no zombie migration_complete)",
+    async () => {
+      // The write fence is the *synchronous* lock-loss detector: even with a
+      // long renewal interval (so the renewal timer never fires during the
+      // test), stealing the lock must cause the in-flight complete() write to
+      // no-op and the run to be reported as lock_lost — and crucially the
+      // migration_complete flag must NOT be flipped by the zombie, which would
+      // otherwise mislead the rightful new owner into skipping the data phase.
+      const manager = new MigrationManager(pool, testLogger, {
+        lockRenewalSeconds: 120, // long: renewal won't fire in the test window
+      });
+
+      let resolveStarted!: () => void;
+      const started = new Promise<void>((r) => {
+        resolveStarted = r;
+      });
+      let proceed!: () => void;
+      const canProceed = new Promise<void>((r) => {
+        proceed = r;
+      });
+
+      let afterSchemaRan = false;
+      const m: Migration = {
+        id: "fence_zombie_001",
+        description: "Ignores the signal and completes after the lock is stolen",
+        migration: async (_pool, ctx) => {
+          resolveStarted();
+          await canProceed;
+          // Ignores ctx.signal entirely and reports complete.
+          ctx.complete({ done: true });
+        },
+        afterSchema: async () => {
+          afterSchemaRan = true;
+        },
+      };
+
+      manager.register([m]);
+      const runPromise = manager.runSchemaChanges("job");
+
+      // Steal the lock WITHOUT waiting for any renewal tick, then let complete()
+      // run. Only the write fence can detect this.
+      await started;
+      await pool.query(
+        `UPDATE migration_lock
+         SET locked_by = 'someone_else',
+             lock_expires_at = NOW() + interval '5 minutes'
+         WHERE lock_name = 'database_migrations'`,
+      );
+      proceed();
+
+      const result = await runPromise;
+
+      // Loss detected at write time -> lock_lost, afterSchema never ran.
+      expect(result.status).toBe("lock_lost");
+      expect(afterSchemaRan).toBe(false);
+      expect(result.completedMigrations).toEqual([]);
+
+      // The zombie's complete() write was fenced: migration_complete is still
+      // false, so a rightful owner won't be tricked into skipping the data phase.
+      const { rows } = await pool.query(
+        `SELECT migration_complete FROM migration_status WHERE id = 'fence_zombie_001'`,
+      );
+      expect(rows[0].migration_complete).toBe(false);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "the attempt-bookkeeping write is fenced: a lock lost just before it leaves attempts/last_error untouched",
+    async () => {
+      // Targets the P2 window: the lock vanishes between the top-of-migration
+      // abort check and the attempts/started_at/last_error bookkeeping write. We
+      // can't pause there from user code, so we use a contained test seam —
+      // wrapping pool.query to steal the lock the instant that exact UPDATE is
+      // issued. The fenced write must then no-op, so a process that no longer
+      // owns the run can't bump attempts or wipe the prior last_error (which
+      // would undo the no-work-resume guarantee), and the run reports lock_lost.
+      const manager = new MigrationManager(pool, testLogger, {
+        lockRenewalSeconds: 120,
+      });
+
+      // Pre-seed the status row with prior observability state to prove it
+      // survives untouched.
+      await manager.getMigrationStatus(); // ensure tables exist
+      await pool.query(
+        `INSERT INTO migration_status
+           (id, description, before_schema_applied, migration_complete, after_schema_applied, completed_at, last_updated, started_at, attempts, last_error)
+         VALUES ('attempt_fence_001', 'seeded', FALSE, FALSE, FALSE, 0, 0, 111, 5, 'previous failure boom')`,
+      );
+
+      let beforeSchemaRan = false;
+      const m: Migration = {
+        id: "attempt_fence_001",
+        description: "seeded",
+        beforeSchema: async () => {
+          beforeSchemaRan = true;
+        },
+      };
+      manager.register([m]);
+
+      // Seam: when the attempt-bookkeeping UPDATE is issued, steal the lock first
+      // (on the real query fn), then let the original call run — now fenced.
+      const realQuery = pool.query.bind(pool);
+      let stole = false;
+      (pool as unknown as { query: (...args: unknown[]) => unknown }).query = (
+        ...args: unknown[]
+      ) => {
+        const first = args[0];
+        const sql =
+          typeof first === "string"
+            ? first
+            : (first as { text?: string } | undefined)?.text;
+        if (
+          !stole &&
+          typeof sql === "string" &&
+          sql.includes("attempts = attempts + 1")
+        ) {
+          stole = true;
+          return realQuery(
+            `UPDATE migration_lock
+             SET locked_by = 'someone_else',
+                 lock_expires_at = NOW() + interval '5 minutes'
+             WHERE lock_name = 'database_migrations'`,
+          ).then(() => realQuery(...(args as Parameters<typeof realQuery>)));
+        }
+        return realQuery(...(args as Parameters<typeof realQuery>));
+      };
+
+      let result;
+      try {
+        result = await manager.runSchemaChanges("job");
+      } finally {
+        (pool as unknown as { query: typeof realQuery }).query = realQuery;
+      }
+
+      expect(stole).toBe(true); // the seam actually fired
+      expect(result.status).toBe("lock_lost");
+      expect(beforeSchemaRan).toBe(false); // never got past the fenced write
+
+      // Prior observability state must be intact: attempts not bumped, the prior
+      // last_error not cleared, started_at not touched.
+      const { rows } = await realQuery(
+        `SELECT attempts, last_error, started_at, before_schema_applied
+         FROM migration_status WHERE id = 'attempt_fence_001'`,
+      );
+      expect(Number(rows[0].attempts)).toBe(5);
+      expect(rows[0].last_error).toBe("previous failure boom");
+      expect(Number(rows[0].started_at)).toBe(111);
+      expect(rows[0].before_schema_applied).toBe(false);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "the initial status-row insert is fenced: a lock lost just before it creates no row and reports lock_lost",
+    async () => {
+      // Companion to the attempt-write fence: the very first write for a brand
+      // new migration is the INSERT that creates its status row. If the lock
+      // vanishes just before it, the fenced INSERT ... SELECT ... WHERE EXISTS
+      // must insert nothing (no tracking row created without exclusivity), and a
+      // concurrent racer must not surface a duplicate-key error — both resolve to
+      // lock_lost. Same deterministic seam as the attempt-write test.
+      const manager = new MigrationManager(pool, testLogger, {
+        lockRenewalSeconds: 120,
+      });
+      await manager.getMigrationStatus(); // ensure tables exist (no row pre-seeded)
+
+      let beforeSchemaRan = false;
+      const m: Migration = {
+        id: "insert_fence_001",
+        description: "brand new migration",
+        beforeSchema: async () => {
+          beforeSchemaRan = true;
+        },
+      };
+      manager.register([m]);
+
+      const realQuery = pool.query.bind(pool);
+      let stole = false;
+      (pool as unknown as { query: (...args: unknown[]) => unknown }).query = (
+        ...args: unknown[]
+      ) => {
+        const first = args[0];
+        const sql =
+          typeof first === "string"
+            ? first
+            : (first as { text?: string } | undefined)?.text;
+        if (
+          !stole &&
+          typeof sql === "string" &&
+          sql.includes("INSERT INTO migration_status")
+        ) {
+          stole = true;
+          return realQuery(
+            `UPDATE migration_lock
+             SET locked_by = 'someone_else',
+                 lock_expires_at = NOW() + interval '5 minutes'
+             WHERE lock_name = 'database_migrations'`,
+          ).then(() => realQuery(...(args as Parameters<typeof realQuery>)));
+        }
+        return realQuery(...(args as Parameters<typeof realQuery>));
+      };
+
+      let result;
+      try {
+        result = await manager.runSchemaChanges("job");
+      } finally {
+        (pool as unknown as { query: typeof realQuery }).query = realQuery;
+      }
+
+      expect(stole).toBe(true);
+      expect(result.status).toBe("lock_lost");
+      expect(beforeSchemaRan).toBe(false);
+
+      // No tracking row should have been created without a valid lock.
+      const { rows } = await realQuery(
+        `SELECT COUNT(*)::int AS c FROM migration_status WHERE id = 'insert_fence_001'`,
+      );
+      expect(rows[0].c).toBe(0);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a status write is fenced once our own lease has expired, even if no one took over yet",
+    async () => {
+      // The fence checks lease *validity*, not just ownership: if renewal stalls
+      // past lock_expires_at but no other process has grabbed the row yet, our
+      // own writes must still be rejected — because a takeover is allowed at any
+      // instant once the lease lapses, so committing would risk a race.
+      const manager = new MigrationManager(pool, testLogger, {
+        lockRenewalSeconds: 120, // long: renewal won't refresh the lease mid-test
+      });
+
+      let afterSchemaRan = false;
+      const m: Migration = {
+        id: "fence_expired_lease_001",
+        description: "Expires its own lease, then completes",
+        migration: async (_pool, ctx) => {
+          // Push our OWN lease into the past WITHOUT changing locked_by — the
+          // row is still attributed to us, it's just expired.
+          await pool.query(
+            `UPDATE migration_lock
+             SET lock_expires_at = NOW() - interval '1 minute'
+             WHERE lock_name = 'database_migrations'`,
+          );
+          ctx.complete({ done: true });
+        },
+        afterSchema: async () => {
+          afterSchemaRan = true;
+        },
+      };
+
+      manager.register([m]);
+      const result = await manager.runSchemaChanges("job");
+
+      expect(result.status).toBe("lock_lost");
+      expect(afterSchemaRan).toBe(false);
+
+      // complete() was fenced by the expired lease — migration_complete stays false.
+      const { rows } = await pool.query(
+        `SELECT migration_complete FROM migration_status WHERE id = 'fence_expired_lease_001'`,
+      );
+      expect(rows[0].migration_complete).toBe(false);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a lock stolen mid-schema-phase rolls back the phase (DDL + flag) and reports lock_lost",
+    async () => {
+      // The phase-flag write is fenced inside the phase transaction, so losing
+      // the lock during beforeSchema must roll the whole phase back: the DDL is
+      // undone, before_schema_applied stays false, and the run is lock_lost — a
+      // zombie can't commit a schema change (or its phase flag) without the lock.
+      const manager = new MigrationManager(pool, testLogger, {
+        lockRenewalSeconds: 120, // long: renewal won't fire in the test window
+      });
+
+      const m: Migration = {
+        id: "fence_phase_001",
+        description: "Creates a table, then loses the lock before the flag write",
+        beforeSchema: async (client) => {
+          // Real DDL inside the phase transaction.
+          await client.query(
+            `CREATE TABLE fence_phase_tbl (id INTEGER PRIMARY KEY)`,
+          );
+          // Steal the lock mid-phase on a separate connection (the pool), so the
+          // upcoming fenced flag write matches zero rows.
+          await pool.query(
+            `UPDATE migration_lock
+             SET locked_by = 'someone_else',
+                 lock_expires_at = NOW() + interval '5 minutes'
+             WHERE lock_name = 'database_migrations'`,
+          );
+        },
+      };
+
+      manager.register([m]);
+      const result = await manager.runSchemaChanges("job");
+
+      expect(result.status).toBe("lock_lost");
+
+      // The phase flag must NOT have been committed.
+      const { rows: statusRows } = await pool.query(
+        `SELECT before_schema_applied FROM migration_status WHERE id = 'fence_phase_001'`,
+      );
+      expect(statusRows[0].before_schema_applied).toBe(false);
+
+      // The DDL must have been rolled back with the phase.
+      const { rows: tableRows } = await pool.query(
+        `SELECT to_regclass('fence_phase_tbl') IS NOT NULL AS "exists"`,
+      );
+      expect(tableRows[0].exists).toBe(false);
     },
     TEST_TIMEOUT,
   );
@@ -1792,6 +2166,99 @@ describe("MigrationManager", () => {
     TEST_TIMEOUT,
   );
 
+  test("constructor rejects a renewal interval that is too long for the lease", () => {
+    // Renewal must be at most half the lease window, otherwise the lock can
+    // expire before a renewal fires. Default lease is 300s -> max renewal 150s.
+    expect(() => new MigrationManager(pool, testLogger, {
+      lockRenewalSeconds: 200,
+    })).toThrow(/lockRenewalSeconds/);
+
+    // Non-positive renewal is also invalid.
+    expect(() => new MigrationManager(pool, testLogger, {
+      lockRenewalSeconds: 0,
+    })).toThrow(/lockRenewalSeconds/);
+
+    // Non-finite values are rejected for both knobs, each with its own message.
+    expect(() => new MigrationManager(pool, testLogger, {
+      lockRenewalSeconds: Number.POSITIVE_INFINITY,
+    })).toThrow(/lockRenewalSeconds must be a positive, finite number/);
+
+    expect(() => new MigrationManager(pool, testLogger, {
+      lockExpirySeconds: Number.NaN,
+    })).toThrow(/lockExpirySeconds must be a positive, finite number/);
+  });
+
+  test("constructor validates a custom lease and the renewal relative to it", () => {
+    // A custom (shorter) lease is allowed...
+    expect(() => new MigrationManager(pool, testLogger, {
+      lockExpirySeconds: 20,
+      lockRenewalSeconds: 5,
+    })).not.toThrow();
+
+    // ...but the renewal must still be <= half of THAT lease (10s here).
+    expect(() => new MigrationManager(pool, testLogger, {
+      lockExpirySeconds: 20,
+      lockRenewalSeconds: 15,
+    })).toThrow(/lockRenewalSeconds/);
+
+    // A non-positive lease is invalid.
+    expect(() => new MigrationManager(pool, testLogger, {
+      lockExpirySeconds: 0,
+    })).toThrow(/lockExpirySeconds/);
+  });
+
+  test(
+    "a partially-applied migration is reported as pending, not previously applied",
+    async () => {
+      // Regression for the result-accounting fix: a migration that has a status
+      // row but isn't fully applied (a phase failed/was interrupted) must show
+      // up only in pendingMigrations — never in previouslyAppliedMigrations.
+      let bShouldFail = true;
+
+      const a: Migration = {
+        id: "partial_a",
+        description: "Fully applies",
+        beforeSchema: async (client) => {
+          await client.query("SELECT 1");
+        },
+      };
+      const b: Migration = {
+        id: "partial_b",
+        description: "Fails in afterSchema, leaving it partially applied",
+        afterSchema: async () => {
+          if (bShouldFail) {
+            throw new Error("boom in afterSchema");
+          }
+        },
+      };
+
+      migrationManager.register([a, b]);
+
+      // First run: A completes, B fails in afterSchema (before/migration applied,
+      // after not -> partially applied, completed_at still 0).
+      const first = await migrationManager.runSchemaChanges("job");
+      expect(first.status).toBe("error");
+      expect(first.completedMigrations).toEqual(["partial_a"]);
+      expect(first.pendingMigrations).toContain("partial_b");
+
+      // Second run: A is now fully applied (previously), B is still partial.
+      const second = await migrationManager.runSchemaChanges("job");
+      expect(second.status).toBe("error");
+      // A should be counted as previously applied...
+      expect(second.previouslyAppliedMigrations).toContain("partial_a");
+      // ...and the partially-applied B must NOT be double-counted as applied.
+      expect(second.previouslyAppliedMigrations).not.toContain("partial_b");
+      expect(second.pendingMigrations).toContain("partial_b");
+
+      // Let B finish and confirm it then moves to previously-applied accounting.
+      bShouldFail = false;
+      const third = await migrationManager.runSchemaChanges("job");
+      expect(third.status).toBe("completed");
+      expect(third.completedMigrations).toContain("partial_b");
+    },
+    TEST_TIMEOUT,
+  );
+
   // Add a new describe block for schema helpers
   describe("SchemaHelpers", () => {
     let helpers: ReturnType<typeof createSchemaHelpers>;
@@ -2039,6 +2506,68 @@ describe("MigrationManager", () => {
         await client.query(`RESET search_path;`);
         await client.query(`DROP SCHEMA IF EXISTS idx_scope_a CASCADE;`);
         await client.query(`DROP SCHEMA IF EXISTS idx_scope_b CASCADE;`);
+      }
+    });
+
+    test("addIndex throws a clear error if the index name is taken by another table in the same schema", async () => {
+      // CREATE INDEX would otherwise fail with a raw "relation already exists"
+      // error. We detect the name collision in the table's schema and raise a
+      // clear message instead of silently skipping (which would leave the
+      // intended table without its index).
+      try {
+        await client.query(`
+          CREATE SCHEMA IF NOT EXISTS idx_collide;
+          CREATE TABLE idx_collide.t1 (a INT);
+          CREATE TABLE idx_collide.t2 (a INT);
+          CREATE INDEX dup_idx ON idx_collide.t1 (a);
+        `);
+
+        let caught: unknown;
+        try {
+          await helpers.addIndex(client, "idx_collide.t2", "dup_idx", ["a"]);
+        } catch (err) {
+          caught = err;
+        }
+        expect(caught).toBeInstanceOf(Error);
+        expect((caught as Error).message).toMatch(
+          /already exists in the table's schema/,
+        );
+
+        // The index on t2 must NOT have been created.
+        const { rows } = await client.query(
+          `SELECT 1
+           FROM pg_index i
+           WHERE i.indrelid = 'idx_collide.t2'::regclass
+             AND i.indexrelid = 'idx_collide.dup_idx'::regclass`,
+        );
+        expect(rows.length).toBe(0);
+      } finally {
+        await client.query(`DROP SCHEMA IF EXISTS idx_collide CASCADE;`);
+      }
+    });
+
+    test("addIndex throws a clear error if the name is taken by a non-index relation in the same schema", async () => {
+      // A table/view/sequence of the same name in the table's schema also
+      // blocks CREATE INDEX; surface a clear error rather than a raw one.
+      try {
+        await client.query(`
+          CREATE SCHEMA IF NOT EXISTS idx_collide2;
+          CREATE TABLE idx_collide2.t (a INT);
+          CREATE TABLE idx_collide2.taken_name (x INT);
+        `);
+
+        let caught: unknown;
+        try {
+          await helpers.addIndex(client, "idx_collide2.t", "taken_name", ["a"]);
+        } catch (err) {
+          caught = err;
+        }
+        expect(caught).toBeInstanceOf(Error);
+        expect((caught as Error).message).toMatch(
+          /already exists in the table's schema/,
+        );
+      } finally {
+        await client.query(`DROP SCHEMA IF EXISTS idx_collide2 CASCADE;`);
       }
     });
 

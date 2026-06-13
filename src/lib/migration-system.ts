@@ -33,6 +33,19 @@ export interface Migration<
   // The logger is task-specific and will prefix all messages with the task ID
   // Mode is required and payload is always passed (empty object if not provided)
   // Data can be passed to ctx.complete(data)
+  //
+  // Unlike the schema phases (each wrapped in one library-managed transaction),
+  // the data migration receives the raw `Pool` and owns its own transaction
+  // boundaries. This is deliberate: a data migration can touch a huge number of
+  // rows, and forcing it into a single transaction would hold locks for the
+  // whole run, bloat WAL, and throw away all progress on any failure. Instead
+  // you process in batches / per-entity units (e.g. a user plus their related
+  // rows across several tables), committing as you go so progress is durable and
+  // the migration can resume from a checkpoint (see ctx.metadata) after an
+  // interruption. The flip side: Strataline can't fence these writes by the lock
+  // (it never sees them) and a batch may re-run on resume, so the data migration
+  // MUST be idempotent. The lock gives coarse exclusivity; your own transactions
+  // give per-unit atomicity; idempotency covers the re-run.
   migration?: (
     pool: Pool,
     ctx: {
@@ -98,9 +111,11 @@ export interface MigrationStatus {
   // When the migration was first attempted (epoch seconds, 0 if never).
   startedAt: number;
   // How many times this migration has been attempted via runSchemaChanges.
-  // Incremented at the start of every attempt, regardless of how it ends -
-  // including attempts that defer() or error. (runDataMigrationJobOnly, the
-  // distributed-mode data-job path, does NOT increment this.)
+  // Incremented once the attempt actually begins work, regardless of how it ends
+  // - including attempts that defer() or error. A run that is already aborted
+  // before this migration's schema phase starts does NOT count (it does no work
+  // and leaves the prior last_error intact). (runDataMigrationJobOnly, the
+  // distributed-mode data-job path, also does NOT increment this.)
   attempts: number;
   // The most recent error or defer reason, or null once it completes cleanly.
   lastError: string | null;
@@ -194,6 +209,13 @@ export class MigrationManager {
   // Class constant for the lock name to ensure consistency
   private static readonly LOCK_NAME = "database_migrations";
 
+  // Default lease window: how long an acquired lock stays valid before another
+  // process may take it over. The renewal timer pushes the expiry forward every
+  // `lockRenewalSeconds`, so the lease must be comfortably larger than the
+  // renewal interval to tolerate a few missed renewals. Overridable via
+  // opts.lockExpirySeconds.
+  private static readonly DEFAULT_LOCK_EXPIRY_SECONDS = 5 * 60; // 5 minutes
+
   private pool: Pool;
   // Every registered migration lives in this one array, but each can have a
   // different payload/return type — there's no single generic that fits a mix
@@ -206,6 +228,7 @@ export class MigrationManager {
   private lockId: string | null = null;
   private lockRenewalInterval: NodeJS.Timeout | null = null;
   private lockRenewalSeconds: number; // Configurable lock renewal interval in seconds
+  private lockExpirySeconds: number; // Configurable lock lease window in seconds
   private logger: MigrationLogger;
   private initialized = false;
   // Abort controller scoped to a single runSchemaChanges call. Aborted on a
@@ -214,6 +237,12 @@ export class MigrationManager {
   // Set when lock renewal detects the lock was lost (taken by another process).
   // Distinguishes an unsafe lock-loss abort from a graceful shutdown abort.
   private lockLost = false;
+  // Epoch ms at which the lock we currently hold expires. Set on acquire and on
+  // every successful renewal. Used by renewLock to decide, when a renewal query
+  // *throws* (vs. cleanly finding the lock taken), whether the lease window has
+  // already lapsed — at which point we can no longer assume exclusivity and must
+  // treat it as a loss rather than optimistically retrying forever.
+  private lockExpiresAtMs = 0;
 
   /**
    * Helper method to update migration status fields.
@@ -223,6 +252,21 @@ export class MigrationManager {
    * (any omitted field is left untouched). Values are bound as query
    * parameters ($1, $2, ...) rather than interpolated into the SQL string, so
    * this is safe against SQL injection.
+   *
+   * Lock fencing: every status write is gated on still holding the migration
+   * lock. When `this.lockId` is set (always true during a run), the UPDATE only
+   * applies if `migration_lock.locked_by` still equals our lock id — so once the
+   * lock has been taken over by another process, our writes become no-ops at the
+   * database level rather than racing the rightful owner. (The lock is just a
+   * row, so Postgres can't physically block us; this WHERE clause is how we
+   * enforce it for Strataline's own bookkeeping. It does NOT fence the arbitrary
+   * SQL a data migration runs on the pool — those stay the caller's
+   * responsibility to make idempotent.)
+   *
+   * Returns `true` if the row was updated (we still hold the lock), `false` if
+   * nothing was updated (lock lost, or the row is missing). Callers that advance
+   * migration state (`migration_complete`, `completed_at`, the phase flags) must
+   * treat `false` as a lock loss; best-effort/observability writes can ignore it.
    *
    * @private
    */
@@ -240,7 +284,7 @@ export class MigrationManager {
       // cleared between attempts. Omit to leave the existing value untouched.
       metadata?: unknown;
     },
-  ): Promise<void> {
+  ): Promise<boolean> {
     // Build a parameterized UPDATE that only sets the columns actually
     // provided. `param()` records a bound value and returns its placeholder
     // ($1, $2, ...), so the values array and the placeholders stay in lockstep
@@ -289,13 +333,62 @@ export class MigrationManager {
     // guarantees there is at least one column to SET).
     updates.push(`last_updated = ${param(Math.floor(Date.now() / 1000))}`);
 
+    // Fence the write on still holding a *valid* lock. Skipped only if we
+    // somehow have no lock id (markStatus is always called within a held lock
+    // today, so in practice this clause is always present). When present, the
+    // UPDATE no-ops if another process has taken the lock over (locked_by no
+    // longer ours) OR our own lease has already expired (lock_expires_at in the
+    // past) — the latter matters because once the lease lapses another runner is
+    // allowed to take over at any instant, so we must stop committing even
+    // before the takeover actually lands. The expiry is compared against the
+    // current time on our own clock (a bound param), consistent with how
+    // acquire/renew/takeover compare leases.
+    const lockFence = this.lockId
+      ? ` AND EXISTS (
+            SELECT 1 FROM migration_lock
+            WHERE lock_name = ${param(MigrationManager.LOCK_NAME)}
+              AND locked_by = ${param(this.lockId)}
+              AND lock_expires_at > ${param(new Date())}
+          )`
+      : "";
+
     const query = `
       UPDATE migration_status
       SET ${updates.join(", ")}
-      WHERE id = $1
+      WHERE id = $1${lockFence}
     `;
 
-    await this.pool.query(query, values);
+    const result = await this.pool.query(query, values);
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  /**
+   * Advance migration state via markStatus, treating a fenced-out (no-op) write
+   * as a lock loss. A status write that updates zero rows means another process
+   * has taken the lock over (the fence in markStatus rejected it), so we flag the
+   * loss, abort the run, and stop renewal — exactly like a renewal that finds the
+   * lock gone, but detected synchronously at write time (closing the gap between
+   * the lease expiring and the next renewal tick noticing). Returns whether the
+   * write applied. Use this for writes that advance state (migration_complete,
+   * completed_at, the phase-applied flags); purely observational writes
+   * (last_error) can call markStatus directly and ignore the result.
+   *
+   * @private
+   */
+  private async advanceStatusOrLoseLock(
+    id: string,
+    fields: Parameters<MigrationManager["markStatus"]>[1],
+    context: string,
+  ): Promise<boolean> {
+    const applied = await this.markStatus(id, fields);
+
+    if (!applied) {
+      this.handleLockLost(
+        `[${context}] migration_status write for ${id} was rejected - the migration lock is no longer held by this process (it may have been taken over); aborting to avoid concurrent migrations.`,
+      );
+    }
+
+    return applied;
   }
 
   /**
@@ -304,15 +397,58 @@ export class MigrationManager {
    * @param logger Logger instance (defaults to console logger)
    * @param opts Optional configuration options
    * @param opts.lockRenewalSeconds Number of seconds between lock renewal attempts (defaults to 60)
+   * @param opts.lockExpirySeconds Lease window in seconds — how long an acquired
+   *   lock stays valid before another process may take it over (defaults to 300).
+   *   The renewal interval must be at most half this value.
    */
   constructor(
     pool: Pool,
     logger: MigrationLogger = consoleLogger,
-    opts?: { lockRenewalSeconds?: number },
+    opts?: { lockRenewalSeconds?: number; lockExpirySeconds?: number },
   ) {
     this.pool = pool;
     this.logger = logger;
     this.lockRenewalSeconds = opts?.lockRenewalSeconds ?? 60; // Default to 60 seconds if not specified
+    this.lockExpirySeconds =
+      opts?.lockExpirySeconds ?? MigrationManager.DEFAULT_LOCK_EXPIRY_SECONDS;
+
+    // Validate the two knobs independently so each failure points at the exact
+    // problem, then validate their relationship. Three distinct throws:
+
+    // 1. The lease window must itself be a sane positive, finite number.
+    if (
+      !Number.isFinite(this.lockExpirySeconds) ||
+      this.lockExpirySeconds <= 0
+    ) {
+      throw new Error(
+        `lockExpirySeconds must be a positive, finite number; got ${this.lockExpirySeconds}.`,
+      );
+    }
+
+    // 2. The renewal interval must itself be a sane positive, finite number.
+    if (
+      !Number.isFinite(this.lockRenewalSeconds) ||
+      this.lockRenewalSeconds <= 0
+    ) {
+      throw new Error(
+        `lockRenewalSeconds must be a positive, finite number; got ${this.lockRenewalSeconds}.`,
+      );
+    }
+
+    // 3. The renewal interval must be no greater than half the lease window —
+    // otherwise the lock can expire before a renewal fires, letting another
+    // process take it over during normal operation. Capping at half the lease
+    // leaves room for at least one missed renewal so a single transient renewal
+    // failure can't drop the lock. This is a misconfiguration, so fail loudly at
+    // construction rather than silently allowing intermittent concurrent
+    // migrations.
+    const maxRenewalSeconds = this.lockExpirySeconds / 2;
+    if (this.lockRenewalSeconds > maxRenewalSeconds) {
+      throw new Error(
+        `lockRenewalSeconds (${this.lockRenewalSeconds}) must be no greater than ${maxRenewalSeconds} ` +
+          `(half the ${this.lockExpirySeconds}s lock lease, leaving room for a missed renewal).`,
+      );
+    }
   }
 
   /**
@@ -541,7 +677,20 @@ export class MigrationManager {
 
     try {
       const status = await this.getMigrationStatus();
-      const appliedIds = status.map((s) => s.id);
+
+      // A migration counts as fully applied only when every phase is applied AND
+      // completed_at is stamped. A row can exist while still incomplete (a phase
+      // failed, deferred, or was interrupted mid-run), so "has a status row" is
+      // NOT the same as "applied". previouslyAppliedMigrations is derived from
+      // this so a partially-applied migration isn't double-counted as both
+      // applied and pending.
+      const isFullyApplied = (s: MigrationStatus): boolean =>
+        s.completedAt !== 0 &&
+        s.beforeSchemaApplied &&
+        s.migrationComplete &&
+        s.afterSchemaApplied;
+
+      const fullyAppliedIds = status.filter(isFullyApplied).map((s) => s.id);
 
       // Get the status of migrations that are in our registered list
       const migrationStatusMap = new Map<string, MigrationStatus>();
@@ -550,34 +699,16 @@ export class MigrationManager {
         migrationStatusMap.set(s.id, s);
       }
 
-      // Find migrations that haven't been applied yet or have applied_at = 0
+      // A registered migration is pending unless it has a status row that is
+      // fully applied.
       const pendingMigrations = this.migrations.filter((m) => {
-        // If not in status table, it's pending
-        if (!migrationStatusMap.has(m.id)) {
-          return true;
-        }
-
         const migrationStatus = migrationStatusMap.get(m.id);
+        // If not in status table (or somehow absent), it's pending.
         if (!migrationStatus) {
-          return true; // If not found in map, it's pending
-        }
-
-        // If completedAt is 0, it's not fully completed yet
-        if (migrationStatus.completedAt === 0) {
           return true;
         }
 
-        // If any of the phases are not applied, it's pending
-        if (
-          !migrationStatus.beforeSchemaApplied ||
-          !migrationStatus.migrationComplete ||
-          !migrationStatus.afterSchemaApplied
-        ) {
-          return true;
-        }
-
-        // Otherwise, it's completed
-        return false;
+        return !isFullyApplied(migrationStatus);
       });
 
       // If no pending migrations, return early with success
@@ -587,7 +718,7 @@ export class MigrationManager {
           success: true,
           status: "completed",
           completedMigrations: [], // No migrations completed in this run
-          previouslyAppliedMigrations: appliedIds, // All migrations were already applied
+          previouslyAppliedMigrations: fullyAppliedIds, // All migrations were already applied
           pendingMigrations: [],
           migrationData, // Empty, as no migrations from *this run*
         };
@@ -604,7 +735,7 @@ export class MigrationManager {
       // Lock loss is unsafe, so it's surfaced as "error"; a caller-requested
       // shutdown is a benign "aborted".
       const buildInterruptedResult = (): MigrationResult => {
-        const previouslyAppliedMigrations = appliedIds.filter(
+        const previouslyAppliedMigrations = fullyAppliedIds.filter(
           (id) => !completedMigrations.includes(id),
         );
 
@@ -699,7 +830,7 @@ export class MigrationManager {
               status: finalStatus,
               reason: finalReason,
               completedMigrations,
-              previouslyAppliedMigrations: appliedIds.filter(
+              previouslyAppliedMigrations: fullyAppliedIds.filter(
                 (id) => !completedMigrations.includes(id),
               ),
               pendingMigrations: remainingPendingMigrations,
@@ -775,7 +906,7 @@ export class MigrationManager {
             status: "error",
             reason: errorReason,
             completedMigrations,
-            previouslyAppliedMigrations: appliedIds.filter(
+            previouslyAppliedMigrations: fullyAppliedIds.filter(
               (id) => !completedMigrations.includes(id),
             ),
             pendingMigrations: remainingPendingMigrations,
@@ -791,7 +922,7 @@ export class MigrationManager {
         success: true,
         status: "completed",
         completedMigrations,
-        previouslyAppliedMigrations: appliedIds.filter(
+        previouslyAppliedMigrations: fullyAppliedIds.filter(
           (id) => !completedMigrations.includes(id),
         ),
         pendingMigrations: [],
@@ -848,42 +979,11 @@ export class MigrationManager {
     const dataMigrationAlreadyComplete =
       rows.length > 0 && rows[0].migration_complete === true;
 
-    if (rows.length === 0) {
-      // Create initial migration record if it doesn't exist
-      // Set completed_at to 0 initially - will be updated when migration is fully completed
-      const now = Math.floor(Date.now() / 1000);
-      await this.pool.query(
-        `
-        INSERT INTO migration_status (
-          id, description, before_schema_applied, migration_complete, after_schema_applied, completed_at, last_updated
-        ) VALUES ($1, $2, FALSE, FALSE, FALSE, 0, $3)
-        `,
-        [migration.id, migration.description, now],
-      );
-
-      taskLogger.info({
-        message: `Created migration record for ${migration.id}`,
-      });
-    }
-
-    // Record this attempt: bump the attempt counter, stamp started_at on the
-    // first attempt, and clear any error from a prior attempt now that we're
-    // trying again.
-    const attemptNow = Math.floor(Date.now() / 1000);
-    await this.pool.query(
-      `
-      UPDATE migration_status
-      SET attempts = attempts + 1,
-          started_at = CASE WHEN started_at = 0 THEN $2 ELSE started_at END,
-          last_error = NULL,
-          last_updated = $2
-      WHERE id = $1
-      `,
-      [migration.id, attemptNow],
-    );
-
-    // If the run was signalled to stop before this library-controlled schema
-    // phase, stop here rather than running DDL.
+    // If the run was already signalled to stop, bail before touching the status
+    // row at all — don't create a record, bump the attempt counter, or clear the
+    // prior last_error for a resume that's going to do no work. (The earlier
+    // last_error/attempts write used to happen first, which erased the previous
+    // failure reason on an aborted no-op resume.)
     //
     // NOTE: the status/reason returned here is NOT what the caller sees. After we
     // return, runSchemaChanges checks the aborted signal (the same signal we test)
@@ -899,6 +999,101 @@ export class MigrationManager {
         status: "deferred",
         reason:
           "[beforeSchema] Run stopped before schema phase; deferring to resume on the next run",
+      };
+    }
+
+    if (rows.length === 0) {
+      // Create initial migration record if it doesn't exist. Set completed_at to
+      // 0 initially - it's updated when the migration is fully completed.
+      //
+      // Fenced like every other status write: the row is only inserted if we
+      // still hold a valid lock (INSERT ... SELECT ... WHERE EXISTS). It's also
+      // made idempotent with ON CONFLICT DO NOTHING so that if a concurrent
+      // runner (which can only exist if our exclusivity was already lost) created
+      // the same row, we get a clean zero-row result instead of a raw
+      // duplicate-key error. Either way, a zero-row result while we expected to
+      // hold the lock means we no longer do — treat it as a lock loss rather than
+      // creating a tracking row (or erroring) without exclusivity.
+      const now = Math.floor(Date.now() / 1000);
+      const insertParams: unknown[] = [migration.id, migration.description, now];
+      let insertFence = "";
+
+      if (this.lockId) {
+        insertParams.push(MigrationManager.LOCK_NAME, this.lockId, new Date());
+        insertFence = ` WHERE EXISTS (
+          SELECT 1 FROM migration_lock
+          WHERE lock_name = $4 AND locked_by = $5 AND lock_expires_at > $6
+        )`;
+      }
+
+      const insertResult = await this.pool.query(
+        `
+        INSERT INTO migration_status (
+          id, description, before_schema_applied, migration_complete, after_schema_applied, completed_at, last_updated
+        )
+        SELECT $1, $2, FALSE, FALSE, FALSE, 0, $3${insertFence}
+        ON CONFLICT (id) DO NOTHING
+        `,
+        insertParams,
+      );
+
+      if (this.lockId && (insertResult.rowCount ?? 0) === 0) {
+        this.handleLockLost(
+          `[beforeSchema] initial migration_status insert for ${migration.id} was rejected - the migration lock is no longer held by this process; aborting.`,
+        );
+
+        return {
+          status: "deferred",
+          reason:
+            "[beforeSchema] Lock lost before creating the migration record; deferring to resume on the next run",
+        };
+      }
+
+      taskLogger.info({
+        message: `Created migration record for ${migration.id}`,
+      });
+    }
+
+    // Record this attempt: bump the attempt counter, stamp started_at on the
+    // first attempt, and clear any error from a prior attempt now that we're
+    // trying again. Fenced on still holding a valid lock (same predicate as
+    // markStatus / the phase write): if the lock was taken over between the
+    // abort check above and here, this must NOT bump attempts or wipe the prior
+    // last_error on the rightful owner's behalf — that would undo the no-work
+    // resume guarantee. A fenced-out write is treated as a lock loss.
+    const attemptNow = Math.floor(Date.now() / 1000);
+    const attemptParams: unknown[] = [migration.id, attemptNow];
+    let attemptFence = "";
+
+    if (this.lockId) {
+      attemptParams.push(MigrationManager.LOCK_NAME, this.lockId, new Date());
+      attemptFence = ` AND EXISTS (
+        SELECT 1 FROM migration_lock
+        WHERE lock_name = $3 AND locked_by = $4 AND lock_expires_at > $5
+      )`;
+    }
+
+    const attemptResult = await this.pool.query(
+      `
+      UPDATE migration_status
+      SET attempts = attempts + 1,
+          started_at = CASE WHEN started_at = 0 THEN $2 ELSE started_at END,
+          last_error = NULL,
+          last_updated = $2
+      WHERE id = $1${attemptFence}
+      `,
+      attemptParams,
+    );
+
+    if ((attemptResult.rowCount ?? 0) === 0) {
+      this.handleLockLost(
+        `[beforeSchema] attempt-bookkeeping write for ${migration.id} was rejected - the migration lock is no longer held by this process; aborting.`,
+      );
+
+      return {
+        status: "deferred",
+        reason:
+          "[beforeSchema] Lock lost before recording the attempt; deferring to resume on the next run",
       };
     }
 
@@ -930,7 +1125,19 @@ export class MigrationManager {
       });
 
       // Mark beforeSchema as applied even though it wasn't provided
-      await this.markStatus(migration.id, { beforeSchemaApplied: true });
+      if (
+        !(await this.advanceStatusOrLoseLock(
+          migration.id,
+          { beforeSchemaApplied: true },
+          "beforeSchema",
+        ))
+      ) {
+        return {
+          status: "deferred",
+          reason:
+            "[beforeSchema] Lock lost before marking phase applied; deferring to resume on the next run",
+        };
+      }
     }
 
     // Step 2: Run data migration if provided
@@ -967,7 +1174,19 @@ export class MigrationManager {
         message: `No data migration provided for migration ${migration.id}`,
       });
 
-      await this.markStatus(migration.id, { migrationComplete: true });
+      if (
+        !(await this.advanceStatusOrLoseLock(
+          migration.id,
+          { migrationComplete: true },
+          "dataMigration",
+        ))
+      ) {
+        return {
+          status: "deferred",
+          reason:
+            "[dataMigration] Lock lost before marking migration complete; deferring to resume on the next run",
+        };
+      }
     }
 
     // Critical guard: the data migration may have ignored ctx.signal and called
@@ -1018,12 +1237,36 @@ export class MigrationManager {
       });
 
       // Mark afterSchema as applied even though it wasn't provided
-      await this.markStatus(migration.id, { afterSchemaApplied: true });
+      if (
+        !(await this.advanceStatusOrLoseLock(
+          migration.id,
+          { afterSchemaApplied: true },
+          "afterSchema",
+        ))
+      ) {
+        return {
+          status: "deferred",
+          reason:
+            "[afterSchema] Lock lost before marking phase applied; deferring to resume on the next run",
+        };
+      }
     }
 
     // Update completedAt to mark when the migration was fully completed
     const completionTime = Math.floor(Date.now() / 1000);
-    await this.markStatus(migration.id, { completedAt: completionTime });
+    if (
+      !(await this.advanceStatusOrLoseLock(
+        migration.id,
+        { completedAt: completionTime },
+        "afterSchema",
+      ))
+    ) {
+      return {
+        status: "deferred",
+        reason:
+          "[afterSchema] Lock lost before stamping completion; deferring to resume on the next run",
+      };
+    }
 
     // Log that the migration is fully completed with the timestamp
     taskLogger.info({
@@ -1079,15 +1322,56 @@ export class MigrationManager {
         await migration.afterSchema(client, helpers);
       }
 
-      // Update migration status
-      await client.query(
+      // Mark the phase applied, fenced on still holding the lock — and because
+      // this UPDATE shares the transaction with the DDL above, the fence
+      // protects the DDL too: if the lock was taken over, the UPDATE matches
+      // zero rows and we ROLLBACK the whole phase (schema change included)
+      // rather than committing a phase flag (and DDL) without exclusivity, which
+      // would let the next owner wrongly skip this phase. (markStatus can't be
+      // reused here because it runs on its own pool connection, outside this
+      // transaction.) The lock fence is included only when we hold a lock id, to
+      // mirror markStatus.
+      const now = Math.floor(Date.now() / 1000);
+      const params: unknown[] = [migration.id, now];
+      let lockFence = "";
+
+      if (this.lockId) {
+        // Require the lock to still be ours AND the lease to still be valid (not
+        // yet expired) — see the matching note in markStatus. lock_expires_at is
+        // compared against the current time as a bound param ($5) rather than
+        // SQL now(), because now() is the transaction's start time and this
+        // UPDATE runs after the (potentially long) DDL above, which would make
+        // the check stale and too lenient.
+        params.push(MigrationManager.LOCK_NAME, this.lockId, new Date());
+        lockFence = ` AND EXISTS (
+          SELECT 1 FROM migration_lock
+          WHERE lock_name = $3 AND locked_by = $4 AND lock_expires_at > $5
+        )`;
+      }
+
+      const updateResult = await client.query(
         `
         UPDATE migration_status
         SET ${statusField} = TRUE, last_updated = $2
-        WHERE id = $1
+        WHERE id = $1${lockFence}
         `,
-        [migration.id, Math.floor(Date.now() / 1000)],
+        params,
       );
+
+      if ((updateResult.rowCount ?? 0) === 0) {
+        // The fenced write matched nothing: the lock was taken over (or the row
+        // vanished). Flag the loss so the run aborts and is reported as
+        // lock_lost, then throw to trigger the ROLLBACK below — undoing both the
+        // phase flag and the DDL so nothing schema-related commits without the
+        // lock.
+        this.handleLockLost(
+          `[${phase}] migration_status write for ${migration.id} was rejected - the migration lock is no longer held by this process; rolling back the ${phase} phase.`,
+        );
+
+        throw new Error(
+          `[${phase}] Migration lock lost while applying ${phase} for ${migration.id}; phase rolled back to avoid schema changes without exclusivity.`,
+        );
+      }
 
       await client.query("COMMIT");
       logger.info({
@@ -1195,7 +1479,25 @@ export class MigrationManager {
         }
 
         this.markStatus(migration.id, fields)
-          .then(() => {
+          .then((applied) => {
+            if (!applied) {
+              // The fenced write updated zero rows: the lock was taken over
+              // before complete() landed. Do NOT report success — that would let
+              // a zombie flip migration_complete and mislead the rightful owner
+              // into skipping the data phase. Flag the loss (aborts the run) and
+              // return non-success; runSchemaChanges then reports lock_lost.
+              this.handleLockLost(
+                `[dataMigration] complete() write for ${migration.id} was rejected - the migration lock is no longer held by this process; aborting.`,
+              );
+
+              resolve({
+                status: "error",
+                reason:
+                  "[dataMigration] Lock lost before marking migration complete; the lock was taken over by another process.",
+              });
+              return;
+            }
+
             logger.info({
               message: `[dataMigration] Data migration marked as complete via callback.`,
             });
@@ -1257,7 +1559,11 @@ export class MigrationManager {
       // no-op on job-only workers (which report via their returned data).
       // Returns whether the value was persisted, and is non-fatal: a failed
       // write is logged and returns false rather than throwing, so a progress
-      // update can never turn a healthy migration into an error.
+      // update can never turn a healthy migration into an error. A return of
+      // false also covers the lock having been taken over (the fenced write
+      // no-ops) — this is intentionally just reported, not escalated to an
+      // abort: progress reporting stays best-effort, and the completion writes
+      // plus the renewal timer are what enforce/detect loss.
       const updateMetadataCallback = async (
         value: TReturn,
       ): Promise<boolean> => {
@@ -1269,8 +1575,7 @@ export class MigrationManager {
         }
 
         try {
-          await this.markStatus(migration.id, { metadata: value });
-          return true;
+          return await this.markStatus(migration.id, { metadata: value });
         } catch (err: unknown) {
           logger.error({
             message: `[dataMigration] ctx.updateMetadata failed to persist for ${migration.id} (continuing)`,
@@ -1351,7 +1656,7 @@ export class MigrationManager {
     const client = await this.pool.connect();
     try {
       const now = new Date();
-      const expiresAt = new Date(now.getTime() + 5 * 60 * 1000); // 5 minutes expiration
+      const expiresAt = new Date(now.getTime() + this.lockExpirySeconds * 1000);
 
       // Generate a unique lock ID for this process.
       // Prefer HOSTNAME, but fall back to os.hostname() (HOSTNAME is often
@@ -1374,11 +1679,19 @@ export class MigrationManager {
 
         // If we get here, we got the lock with a clean insert
       } catch (error: unknown) {
-        // Only handle duplicate key errors from PostgreSQL (expected when lock already exists)
-        const isDuplicateKeyError =
-          error instanceof Error && error.message?.includes("duplicate key");
+        // Only handle unique-violation errors from PostgreSQL (expected when the
+        // lock row already exists). Match on the SQLSTATE code (23505) rather
+        // than the message text: error messages are localized via lc_messages,
+        // so a string match like "duplicate key" silently breaks on a
+        // non-English server — which would not only misreport a held lock as an
+        // error but, worse, skip the expired-lock takeover UPDATE below, leaving
+        // a stale lock from a crashed process permanently unrecoverable.
+        const isUniqueViolation =
+          typeof error === "object" &&
+          error !== null &&
+          (error as { code?: unknown }).code === "23505";
 
-        if (!isDuplicateKeyError) {
+        if (!isUniqueViolation) {
           throw error; // Rethrow unexpected errors
         }
 
@@ -1420,6 +1733,7 @@ export class MigrationManager {
 
       // We've got the lock
       this.lockId = lockResult.rows[0].locked_by;
+      this.lockExpiresAtMs = expiresAt.getTime();
 
       this.logger.info({
         message: `Acquired migration lock (${this.lockId}), expires at ${lockResult.rows[0].lock_expires_at}`,
@@ -1480,11 +1794,9 @@ export class MigrationManager {
 
     const client = await this.pool.connect();
     try {
-      // Using the class constant for consistency
-
-      // Set new expiration time (5 minutes from now)
+      // Push the expiry forward by a full lease window from now.
       const now = new Date();
-      const expiresAt = new Date(now.getTime() + 5 * 60 * 1000);
+      const expiresAt = new Date(now.getTime() + this.lockExpirySeconds * 1000);
 
       // Update the lock expiration
       const result = await client.query(
@@ -1498,39 +1810,59 @@ export class MigrationManager {
       );
 
       if (result.rowCount && result.rowCount > 0) {
+        // Renewed cleanly: extend our local view of the lease too, so the
+        // catch-branch lapse check below stays accurate.
+        this.lockExpiresAtMs = expiresAt.getTime();
+
         this.logger.info({
           message: `Renewed migration lock until ${expiresAt.toISOString()}`,
         });
       } else {
-        if (this.logger.warn) {
-          this.logger.warn({
-            message:
-              "Failed to renew migration lock - it may have been taken by another process",
-          });
-        } else {
-          this.logger.info({
-            message:
-              "Failed to renew migration lock - it may have been taken by another process",
-          });
-        }
-
-        // The lock is gone, which means another process may now be running.
-        // Flag it and abort the in-flight run so we stop doing work without a
-        // valid lock (a safety condition, surfaced to the caller as an error).
-        this.lockLost = true;
-        this.runAbortController?.abort();
-
-        // Stop trying to renew
-        this.stopLockRenewal();
+        // The row no longer matches our locked_by — another process took the
+        // lock over. This is an unambiguous loss regardless of timing.
+        this.handleLockLost(
+          "Failed to renew migration lock - it may have been taken by another process",
+        );
       }
     } catch (error) {
+      // The renewal query itself failed (e.g. connection drop, pool
+      // exhaustion). A single transient failure is harmless — the lease is
+      // still valid and a later tick can renew it. But if the lease window has
+      // already lapsed without a successful renewal, we can no longer assume we
+      // hold the lock, so we must treat it as lost rather than retrying forever
+      // while another process potentially runs. (Without this, repeated
+      // exceptions would never trip the rowCount===0 path and loss would go
+      // undetected.)
       this.logger.error({
         message: "Error renewing lock:",
         error,
       });
+
+      if (this.lockId && Date.now() >= this.lockExpiresAtMs) {
+        this.handleLockLost(
+          "Migration lock lease lapsed while renewals were failing - assuming the lock is lost",
+        );
+      }
     } finally {
       client.release();
     }
+  }
+
+  /**
+   * Handle a detected loss of the migration lock: warn, flag it so the run is
+   * reported as the unsafe lock_lost status, abort the in-flight run so we stop
+   * doing work without a valid lock, and stop the renewal timer. Idempotent.
+   */
+  private handleLockLost(message: string): void {
+    if (this.logger.warn) {
+      this.logger.warn({ message });
+    } else {
+      this.logger.info({ message });
+    }
+
+    this.lockLost = true;
+    this.runAbortController?.abort();
+    this.stopLockRenewal();
   }
 
   /**
@@ -1746,6 +2078,7 @@ export class MigrationManager {
       }
 
       this.lockId = null;
+      this.lockExpiresAtMs = 0;
     } catch (error) {
       this.logger.error({
         message: "Error releasing migration lock:",
