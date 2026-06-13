@@ -336,6 +336,19 @@ export class MigrationManager {
     const client = await this.pool.connect();
 
     try {
+      // Serialize initialization across processes. `CREATE TABLE IF NOT EXISTS`
+      // is not race-free in Postgres: two processes running it concurrently on a
+      // fresh database can collide in the catalog and raise a duplicate-key error
+      // ("pg_type_typname_nsp_index"). A transaction-scoped advisory lock makes
+      // concurrent first-boots wait their turn; the second one then finds the
+      // tables already present and its IF NOT EXISTS statements no-op. The lock
+      // auto-releases on COMMIT/ROLLBACK. (ensureInitialized runs before the
+      // migration lock is acquired, so it can't rely on that for mutual exclusion.)
+      await client.query("BEGIN");
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtext('strataline:migration_init'))",
+      );
+
       // Create migration status table
       await client.query(`
         CREATE TABLE IF NOT EXISTS migration_status (
@@ -372,6 +385,11 @@ export class MigrationManager {
           lock_expires_at TIMESTAMP WITH TIME ZONE
         )
       `);
+
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
     } finally {
       client.release();
     }
@@ -645,11 +663,14 @@ export class MigrationManager {
           );
 
           if (result.status !== "success") {
-            // If the run was interrupted while this migration ran, that takes
-            // precedence over however the migration itself ended (it may have
-            // cooperatively deferred in response to the abort). Report the
-            // interruption ("error" if the lock was lost, otherwise "aborted")
-            // rather than a benign defer.
+            // An interruption (shutdown or lock loss) takes precedence over
+            // however this migration's phases ended, so check it FIRST. The phase
+            // result may be a real failure, a cooperative defer, OR the
+            // non-"success" sentinel our schema-phase guards return on abort — we
+            // deliberately don't inspect which. buildInterruptedResult() produces
+            // the authoritative outcome ("lock_lost" if the lock was lost,
+            // otherwise "aborted"); whatever status the phase returned is
+            // discarded here. This is the single place that label is decided.
             if (this.runAbortController?.signal.aborted) {
               return buildInterruptedResult();
             }
@@ -712,7 +733,8 @@ export class MigrationManager {
           // don't fall through and report "completed", which would mask a
           // graceful abort or (critically) an unsafe lock-loss condition. The
           // just-completed migration is already in completedMigrations, so the
-          // result's lists stay accurate. lockLost -> "error", else "aborted".
+          // result's lists stay accurate. buildInterruptedResult() picks the
+          // status: lockLost -> "lock_lost", else "aborted".
           if (this.runAbortController?.signal.aborted) {
             return buildInterruptedResult();
           }
@@ -860,6 +882,26 @@ export class MigrationManager {
       [migration.id, attemptNow],
     );
 
+    // If the run was signalled to stop before this library-controlled schema
+    // phase, stop here rather than running DDL.
+    //
+    // NOTE: the status/reason returned here is NOT what the caller sees. After we
+    // return, runSchemaChanges checks the aborted signal (the same signal we test)
+    // and replaces our result with buildInterruptedResult() — the single place
+    // that decides the user-facing "aborted" vs "lock_lost" (only the manager
+    // knows which, via lockLost). So this return just has to be non-"success" to
+    // route there. We use "deferred" rather than "error" only as the harmless
+    // fallback disposition ("not done, will resume") on the off chance it were
+    // ever read: the migration stays pending (this phase's flag unset) and resumes
+    // next run, exactly like a data migration that defers in response to abort.
+    if (signal?.aborted) {
+      return {
+        status: "deferred",
+        reason:
+          "[beforeSchema] Run stopped before schema phase; deferring to resume on the next run",
+      };
+    }
+
     // Step 1: Run schema changes before data migration if provided
     if (migration.beforeSchema) {
       try {
@@ -926,6 +968,26 @@ export class MigrationManager {
       });
 
       await this.markStatus(migration.id, { migrationComplete: true });
+    }
+
+    // Critical guard: the data migration may have ignored ctx.signal and called
+    // complete() even though the run was signalled to stop mid-flight — most
+    // importantly on lock loss, where continuing into afterSchema would run DDL
+    // without a valid lock, possibly concurrent with another process. Stop before
+    // the schema phase so afterSchema (and the completedAt write below) never run
+    // without exclusivity. The data phase is already marked complete, so the
+    // migration simply resumes at afterSchema on the next run.
+    //
+    // As with the beforeSchema guard above, the status/reason returned here is
+    // never what the caller sees — runSchemaChanges intercepts on the aborted
+    // signal and returns buildInterruptedResult() ("aborted"/"lock_lost"). The
+    // "deferred" here is just the safe non-"success" fallback.
+    if (signal?.aborted) {
+      return {
+        status: "deferred",
+        reason:
+          "[afterSchema] Run stopped before schema phase; deferring to resume on the next run",
+      };
     }
 
     // Step 3: Run schema changes after data migration if needed

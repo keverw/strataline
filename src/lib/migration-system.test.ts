@@ -951,6 +951,7 @@ describe("MigrationManager", () => {
         proceed = r;
       });
 
+      let afterSchemaRan = false;
       const m: Migration = {
         id: "abort_on_success_001",
         description: "Ignores ctx.signal and completes anyway",
@@ -960,6 +961,9 @@ describe("MigrationManager", () => {
           await canProceed;
           // Deliberately does NOT check ctx.signal — completes regardless.
           ctx.complete();
+        },
+        afterSchema: async () => {
+          afterSchemaRan = true;
         },
       };
 
@@ -976,11 +980,15 @@ describe("MigrationManager", () => {
 
       const result = await runPromise;
 
-      // The migration finished, but the run was aborted mid-flight — that must
-      // be surfaced, not masked as "completed".
+      // The data migration ignored the signal and completed, but the run was
+      // aborted before the schema phase. That must be surfaced as "aborted", and
+      // afterSchema must NOT have run — the migration is left pending so it
+      // resumes (and finishes afterSchema) on the next run rather than applying
+      // DDL after the run was told to stop.
       expect(result.status).toBe("aborted");
-      expect(result.completedMigrations).toContain("abort_on_success_001");
-      expect(result.pendingMigrations).toEqual([]);
+      expect(afterSchemaRan).toBe(false);
+      expect(result.completedMigrations).toEqual([]);
+      expect(result.pendingMigrations).toContain("abort_on_success_001");
     },
     TEST_TIMEOUT,
   );
@@ -1001,6 +1009,7 @@ describe("MigrationManager", () => {
         proceed = r;
       });
 
+      let afterSchemaRan = false;
       const m: Migration = {
         id: "lock_loss_on_success_001",
         description: "Ignores ctx.signal and completes despite lock loss",
@@ -1010,6 +1019,9 @@ describe("MigrationManager", () => {
           await canProceed;
           // Ignores the abort signal and completes anyway.
           ctx.complete();
+        },
+        afterSchema: async () => {
+          afterSchemaRan = true;
         },
       };
 
@@ -1032,10 +1044,14 @@ describe("MigrationManager", () => {
       const result = await runPromise;
 
       // Even though the migration completed, exclusivity was lost — this must be
-      // reported as the unsafe lock_lost status, not masked as "completed".
+      // reported as the unsafe lock_lost status, not masked as "completed". And
+      // critically, afterSchema must NOT have run: applying DDL after losing the
+      // lock could collide with whichever process now holds it.
       expect(result.success).toBe(false);
       expect(result.status).toBe("lock_lost");
       expect(result.reason).toMatch(/lock/i);
+      expect(afterSchemaRan).toBe(false);
+      expect(result.completedMigrations).toEqual([]);
     },
     TEST_TIMEOUT,
   );
@@ -1724,6 +1740,58 @@ describe("MigrationManager", () => {
     TEST_TIMEOUT,
   );
 
+  test(
+    "reports an error if persisting completion fails after complete()",
+    async () => {
+      const m: Migration = {
+        id: "complete_persist_fail_001",
+        description: "complete() but the status write fails",
+        migration: async (pool, ctx) => {
+          // Break the metadata write specifically: complete(data) writes to the
+          // metadata column, so dropping it makes that UPDATE throw — exercising
+          // the post-complete() DB-failure path. (The subsequent last_error
+          // write touches different columns and still succeeds.)
+          await pool.query("ALTER TABLE migration_status DROP COLUMN metadata");
+          ctx.complete({ done: true });
+        },
+      };
+
+      migrationManager.register([m]);
+      const result = await migrationManager.runSchemaChanges("job");
+
+      // complete() was called, but recording it failed — surfaced as an error so
+      // the migration is retried (and stays idempotent-by-contract) next run.
+      expect(result.success).toBe(false);
+      expect(result.status).toBe("error");
+      expect(result.reason).toMatch(/Failed to update migration status/i);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "defer() still succeeds if persisting its metadata fails (best-effort)",
+    async () => {
+      const m: Migration = {
+        id: "defer_persist_fail_001",
+        description: "defer(data) but the metadata write fails",
+        migration: async (pool, ctx) => {
+          // Same trick: dropping the metadata column makes the defer-time
+          // metadata write throw. That write is best-effort, so the defer must
+          // still be reported as deferred, not turned into an error.
+          await pool.query("ALTER TABLE migration_status DROP COLUMN metadata");
+          ctx.defer("paused", { checkpoint: 5 });
+        },
+      };
+
+      migrationManager.register([m]);
+      const result = await migrationManager.runSchemaChanges("job");
+
+      expect(result.status).toBe("deferred");
+      expect(result.reason).toMatch(/paused/);
+    },
+    TEST_TIMEOUT,
+  );
+
   // Add a new describe block for schema helpers
   describe("SchemaHelpers", () => {
     let helpers: ReturnType<typeof createSchemaHelpers>;
@@ -1934,6 +2002,46 @@ describe("MigrationManager", () => {
       ).rejects.toThrow();
     });
 
+    test("addIndex existence check is scoped to the target table, not search_path", async () => {
+      // Regression: the index existence check must be scoped to the target
+      // table's schema, NOT resolved from the bare index name via search_path.
+      // CREATE INDEX places the index in the table's schema. If a same-named
+      // index exists in a different schema that happens to be earlier on
+      // search_path, a name-only check would false-positive and wrongly skip
+      // creating the index on the target table.
+      try {
+        await client.query(`
+          CREATE SCHEMA IF NOT EXISTS idx_scope_a;
+          CREATE SCHEMA IF NOT EXISTS idx_scope_b;
+          CREATE TABLE idx_scope_a.t (a INT);
+          CREATE TABLE idx_scope_b.t (a INT);
+          CREATE INDEX shared_idx ON idx_scope_a.t (a);
+        `);
+
+        // Put schema a first so a bare "shared_idx" resolves to idx_scope_a's.
+        await client.query(`SET search_path = idx_scope_a, idx_scope_b, public;`);
+
+        // Must still create the index on idx_scope_b.t despite the same-named
+        // index already existing in idx_scope_a (which is earlier on the path).
+        await helpers.addIndex(client, "idx_scope_b.t", "shared_idx", ["a"]);
+
+        const { rows } = await client.query(
+          `SELECT 1
+           FROM pg_index i
+           JOIN pg_class idx ON idx.oid = i.indexrelid
+           WHERE i.indrelid = 'idx_scope_b.t'::regclass
+             AND idx.relname = 'shared_idx'`,
+        );
+        expect(rows.length).toBe(1);
+      } finally {
+        // Reset session state and drop the schemas — the pooled connection
+        // retains search_path between tests otherwise.
+        await client.query(`RESET search_path;`);
+        await client.query(`DROP SCHEMA IF EXISTS idx_scope_a CASCADE;`);
+        await client.query(`DROP SCHEMA IF EXISTS idx_scope_b CASCADE;`);
+      }
+    });
+
     // --- Tests for removeIndex ---
     test("removeIndex should remove an existing index", async () => {
       const indexName = "idx_to_remove";
@@ -1952,6 +2060,14 @@ describe("MigrationManager", () => {
       expect(
         helpers.removeIndex(client, "non_existent_index"),
       ).resolves.toBeUndefined();
+    });
+
+    test("removeIndex should log and rethrow if the lookup errors", async () => {
+      // A malformed identifier ("too many dotted names") makes to_regclass raise
+      // rather than return NULL, exercising removeIndex's catch/rethrow path.
+      expect(
+        helpers.removeIndex(client, "a.b.c.d"),
+      ).rejects.toThrow(/too many dotted names/i);
     });
 
     // --- Tests for addForeignKey ---
@@ -2136,6 +2252,36 @@ describe("MigrationManager", () => {
           "id",
         ),
       ).rejects.toThrow();
+    });
+
+    test("addDeferrableForeignKey should throw error for non-existent table", async () => {
+      expect(
+        helpers.addDeferrableForeignKey(
+          client,
+          "non_existent_table",
+          "fk_def_fail",
+          "col",
+          "helper_test_table_ref",
+          "ref_id",
+        ),
+      ).rejects.toThrow(/Table non_existent_table does not exist/);
+    });
+
+    test("addDeferrableForeignKey should throw error for non-existent referenced table", async () => {
+      await client.query(
+        `ALTER TABLE helper_test_table ADD COLUMN bad_ref_col_def INT;`,
+      );
+
+      expect(
+        helpers.addDeferrableForeignKey(
+          client,
+          "helper_test_table",
+          "fk_def_fail_ref",
+          "bad_ref_col_def",
+          "non_existent_ref_table",
+          "id",
+        ),
+      ).rejects.toThrow(/Referenced table non_existent_ref_table does not exist/);
     });
 
     // --- Tests for removeConstraint ---

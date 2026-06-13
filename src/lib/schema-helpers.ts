@@ -75,6 +75,30 @@ export function createSchemaHelpers(
   const prefixedLogger = createPrefixedLogger(logger, prefix);
 
   /**
+   * Resolve whether a table (or other relation) exists, the way Postgres itself
+   * would resolve `ALTER TABLE <name>`: through `to_regclass`, which honours the
+   * current `search_path` and accepts schema-qualified names ("schema.table").
+   * Returns true if the relation exists, false otherwise.
+   *
+   * This is preferable to `information_schema.tables WHERE table_name = $1`,
+   * which ignores the schema entirely and can false-positive against a
+   * same-named table in another schema. All helpers route their existence checks
+   * through here (and the pg_catalog lookups below) so they agree with where the
+   * subsequent DDL will actually land.
+   */
+  async function tableExists(
+    client: PoolClient,
+    tableName: string,
+  ): Promise<boolean> {
+    const { rows } = await client.query(
+      `SELECT to_regclass($1) IS NOT NULL AS "exists"`,
+      [tableName],
+    );
+
+    return rows[0]?.exists === true;
+  }
+
+  /**
    * Create a table if it doesn't exist
    */
   async function createTable(
@@ -115,12 +139,21 @@ export function createSchemaHelpers(
     defaultValue?: string,
   ): Promise<void> {
     try {
-      // Check if column exists
+      // Fail fast with a clear message if the table is missing, rather than
+      // letting ALTER TABLE throw a raw Postgres error (mirrors removeColumn).
+      if (!(await tableExists(client, tableName))) {
+        throw new Error(`Table ${tableName} does not exist.`);
+      }
+
+      // Check if column exists (schema-aware: scoped to the resolved table OID).
       const { rows } = await client.query(
         `
-        SELECT column_name 
-        FROM information_schema.columns 
-        WHERE table_name = $1 AND column_name = $2
+        SELECT 1
+        FROM pg_attribute
+        WHERE attrelid = to_regclass($1)
+          AND attname = $2
+          AND attnum > 0
+          AND NOT attisdropped
       `,
         [tableName, columnName],
       );
@@ -159,21 +192,19 @@ export function createSchemaHelpers(
   ): Promise<void> {
     try {
       // First, check if the table exists
-      const { rows: tableExistsRows } = await client.query(
-        `SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = $1)`,
-        [tableName],
-      );
-
-      if (!tableExistsRows[0]?.exists) {
+      if (!(await tableExists(client, tableName))) {
         throw new Error(`Table ${tableName} does not exist.`);
       }
 
-      // Check if column exists
+      // Check if column exists (schema-aware: scoped to the resolved table OID).
       const { rows } = await client.query(
         `
-        SELECT column_name
-        FROM information_schema.columns 
-        WHERE table_name = $1 AND column_name = $2
+        SELECT 1
+        FROM pg_attribute
+        WHERE attrelid = to_regclass($1)
+          AND attname = $2
+          AND attnum > 0
+          AND NOT attisdropped
       `,
         [tableName, columnName],
       );
@@ -181,7 +212,7 @@ export function createSchemaHelpers(
       if (rows.length > 0) {
         // Column exists, remove it
         await client.query(`
-          ALTER TABLE ${tableName} 
+          ALTER TABLE ${tableName}
           DROP COLUMN ${columnName}
         `);
         prefixedLogger.info({
@@ -212,13 +243,29 @@ export function createSchemaHelpers(
     unique: boolean = false,
   ): Promise<void> {
     try {
-      // Check if index exists
+      // Fail fast with a clear message if the table is missing (mirrors the
+      // remove* helpers) rather than letting CREATE INDEX throw a raw error.
+      if (!(await tableExists(client, tableName))) {
+        throw new Error(`Table ${tableName} does not exist.`);
+      }
+
+      // Check whether an index of this name already exists ON THIS TABLE, scoped
+      // to the target table (indrelid = to_regclass(tableName)) rather than
+      // resolving the bare index name through search_path. CREATE INDEX always
+      // creates the index in the *table's* schema, which may not be the first
+      // schema on search_path — so resolving the name independently could
+      // false-positive against a same-named index in another schema (wrongly
+      // skipping creation) or miss the real index when the table's schema isn't on
+      // search_path (then attempting a duplicate CREATE INDEX). Scoping to the
+      // resolved table keeps the check consistent with where the index will land.
       const { rows } = await client.query(
         `
-        SELECT indexname 
-        FROM pg_indexes 
-        WHERE tablename = $1 AND indexname = $2
-      `,
+        SELECT 1
+        FROM pg_index i
+        JOIN pg_class idx ON idx.oid = i.indexrelid
+        WHERE i.indrelid = to_regclass($1)
+          AND idx.relname = $2
+        `,
         [tableName, indexName],
       );
 
@@ -254,17 +301,14 @@ export function createSchemaHelpers(
     indexName: string,
   ): Promise<void> {
     try {
-      // Check if index exists
+      // Check if the index exists, resolving the name through search_path the
+      // same way DROP INDEX will (schema-aware).
       const { rows } = await client.query(
-        `
-        SELECT indexname 
-        FROM pg_indexes 
-        WHERE indexname = $1
-      `,
+        `SELECT to_regclass($1) IS NOT NULL AS "exists"`,
         [indexName],
       );
 
-      if (rows.length > 0) {
+      if (rows[0]?.exists) {
         // Index exists, drop it
         await client.query(`DROP INDEX ${indexName}`);
         prefixedLogger.info({
@@ -297,12 +341,22 @@ export function createSchemaHelpers(
     onDelete: "CASCADE" | "SET NULL" | "RESTRICT" | "NO ACTION" = "NO ACTION",
   ): Promise<void> {
     try {
-      // Check if constraint exists
+      // Both ends of the constraint must exist; fail fast with clear messages
+      // rather than letting ALTER TABLE throw a raw error.
+      if (!(await tableExists(client, tableName))) {
+        throw new Error(`Table ${tableName} does not exist.`);
+      }
+
+      if (!(await tableExists(client, referencedTable))) {
+        throw new Error(`Referenced table ${referencedTable} does not exist.`);
+      }
+
+      // Check if constraint exists (schema-aware: scoped to the resolved table OID).
       const { rows } = await client.query(
         `
-        SELECT constraint_name
-        FROM information_schema.table_constraints
-        WHERE table_name = $1 AND constraint_name = $2
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = to_regclass($1) AND conname = $2
       `,
         [tableName, constraintName],
       );
@@ -348,12 +402,22 @@ export function createSchemaHelpers(
     initiallyDeferred: boolean = true,
   ): Promise<void> {
     try {
-      // Check if constraint exists
+      // Both ends of the constraint must exist; fail fast with clear messages
+      // rather than letting ALTER TABLE throw a raw error.
+      if (!(await tableExists(client, tableName))) {
+        throw new Error(`Table ${tableName} does not exist.`);
+      }
+
+      if (!(await tableExists(client, referencedTable))) {
+        throw new Error(`Referenced table ${referencedTable} does not exist.`);
+      }
+
+      // Check if constraint exists (schema-aware: scoped to the resolved table OID).
       const { rows } = await client.query(
         `
-        SELECT constraint_name
-        FROM information_schema.table_constraints
-        WHERE table_name = $1 AND constraint_name = $2
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = to_regclass($1) AND conname = $2
       `,
         [tableName, constraintName],
       );
@@ -398,21 +462,16 @@ export function createSchemaHelpers(
   ): Promise<void> {
     try {
       // First, check if the table exists
-      const { rows: tableExistsRows } = await client.query(
-        `SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = $1)`,
-        [tableName],
-      );
-
-      if (!tableExistsRows[0]?.exists) {
+      if (!(await tableExists(client, tableName))) {
         throw new Error(`Table ${tableName} does not exist.`);
       }
 
-      // Check if constraint exists
+      // Check if constraint exists (schema-aware: scoped to the resolved table OID).
       const { rows } = await client.query(
         `
-        SELECT constraint_name
-        FROM information_schema.table_constraints
-        WHERE table_name = $1 AND constraint_name = $2
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = to_regclass($1) AND conname = $2
       `,
         [tableName, constraintName],
       );

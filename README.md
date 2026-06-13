@@ -90,7 +90,7 @@ Whether you're building a side project or orchestrating millions of rows in prod
 
 > **Transaction model:** The `beforeSchema` and `afterSchema` phases each run inside their own `BEGIN`/`COMMIT` transaction and receive a dedicated `PoolClient` — if the callback throws, that phase is rolled back automatically. The `migration` (data) phase instead receives the raw `Pool` and is responsible for managing its own transactions. This is intentional: long, batched, or resumable data work should not run inside a single giant transaction.
 >
-> **Resuming after a failure:** each of the three phases is tracked independently (`before_schema_applied`, `migration_complete`, `after_schema_applied`). When a migration is re-run, every phase that already completed is skipped and only the unfinished phase(s) run. So if `afterSchema` fails, the next run skips `beforeSchema` and the data migration (both already done) and retries **only** `afterSchema`. A data migration that `defer()`s or errors before completing _will_ run again on the next pass, so **write your data migration to be idempotent** — but once it calls `complete()` it is marked done and is never re-run, even if a later `afterSchema` then fails.
+> **Resuming after a failure:** each of the three phases is tracked independently (`before_schema_applied`, `migration_complete`, `after_schema_applied`). When a migration is re-run, every phase that already completed is skipped and only the unfinished phase(s) run. So if `afterSchema` fails, the next run skips `beforeSchema` and the data migration (both already done) and retries **only** `afterSchema`. A data migration that `defer()`s or errors before completing _will_ run again on the next pass, so **write your data migration to be idempotent** — but once it calls `complete()` **and that completion is persisted**, it is marked done and is never re-run, even if a later `afterSchema` then fails. (For example, if the database write that records completion itself fails right after `complete()`, the run is reported as an error and the data migration runs again on the next pass — yet another reason to keep it idempotent.)
 
 - **Flexible Execution Modes**:
 
@@ -938,6 +938,8 @@ prefixedLogger.info({ message: "Starting process" });
 ### Schema Helpers
 
 The `helpers` object, passed as the second argument to `beforeSchema` and `afterSchema` functions, provides a set of safe, idempotent methods for common schema modifications. These helpers automatically log their actions using the configured logger and perform existence checks before attempting changes, preventing errors if an object already exists or doesn't exist when trying to remove it.
+
+> **Schema resolution:** existence checks resolve relations through Postgres's `to_regclass` / `pg_catalog`, so they honour the connection's `search_path` and accept schema-qualified names (e.g. `"reporting.users"`) — the check looks in the same place the subsequent DDL will run, not blindly across every schema. Note that table, column, index, and constraint **names are written directly into the SQL statement** — SQL placeholders (`$1`, `$2`, …) can only stand in for _values_ (data), never for identifiers like table or column names, so those names can't be parameterized and must be concatenated in. Treat them as trusted, code-defined values — don't build them from untrusted input.
 
 **Available Helpers:**
 
