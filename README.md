@@ -1,6 +1,4 @@
-# Strataline v3.0.1
-
-todo: bump to v4.0.0 since imports changed....
+# Strataline v4.0.0
 
 [![npm version](https://badge.fury.io/js/strataline.svg)](https://badge.fury.io/js/strataline)
 
