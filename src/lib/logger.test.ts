@@ -12,6 +12,8 @@ import {
   ConsoleLogger,
   MutableLogger,
   PrefixedLogger,
+  createPrefixedLogger,
+  getErrorMessage,
   type LogData,
   type LogDataInput,
   type Logger,
@@ -305,6 +307,63 @@ describe("Logger Utilities", () => {
         message: "Prefixed error msg",
         error: errorObj,
       });
+    });
+  });
+
+  describe("createPrefixedLogger", () => {
+    it("delegates to BaseLogger.createPrefixed for class-based loggers", () => {
+      const base = new ConsoleLogger();
+      const prefixed = createPrefixedLogger(base, { task: "PT" });
+
+      // BaseLogger.createPrefixed returns a PrefixedLogger that wraps the base.
+      expect(prefixed).toBeInstanceOf(PrefixedLogger);
+
+      const logSpy = spyOn(base, "info").mockImplementation(() => {});
+      prefixed.info({ message: "hi" });
+      expect(logSpy).toHaveBeenCalledWith({
+        task: "PT",
+        stage: undefined,
+        message: "hi",
+      });
+      logSpy.mockRestore();
+    });
+
+    it("falls back to a PrefixedLogger for plain object loggers", () => {
+      const logSpy = mock(() => {});
+      const plain: Logger = {
+        info: logSpy,
+        warn: mock(() => {}),
+        error: mock(() => {}),
+      };
+
+      const prefixed = createPrefixedLogger(plain, { stage: "PS" });
+      expect(prefixed).toBeInstanceOf(PrefixedLogger);
+
+      prefixed.info({ message: "hello" });
+      expect(logSpy).toHaveBeenCalledWith({
+        task: undefined,
+        stage: "PS",
+        message: "hello",
+      });
+    });
+  });
+
+  describe("getErrorMessage", () => {
+    it("returns the message from an Error instance", () => {
+      expect(getErrorMessage(new Error("boom"))).toBe("boom");
+    });
+
+    it("returns the message from an error-like object", () => {
+      expect(getErrorMessage({ message: "custom failure" })).toBe(
+        "custom failure",
+      );
+    });
+
+    it("coerces non-error values with String()", () => {
+      expect(getErrorMessage("just a string")).toBe("just a string");
+      expect(getErrorMessage(42)).toBe("42");
+      expect(getErrorMessage(null)).toBe("null");
+      expect(getErrorMessage({ code: 500 })).toBe("[object Object]");
     });
   });
 });

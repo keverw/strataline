@@ -44,6 +44,9 @@
     "lint": "eslint src",
     "update-docs": "markdown-toc-gen update README.md && bun run scripts/update-readme-version.ts && bun run format:docs"
   },
+  "engines": {
+    "node": ">=18"
+  },
   "keywords": [
     "postgresql",
     "migrations",
