@@ -498,17 +498,15 @@ The example above works with both Node.js and Bun, with one difference:
 
 For more control over the migration process, you can create your own custom migration script. This approach gives you complete flexibility in how migrations are executed, logged, and managed.
 
-Here's an example of a simple migration script that you can add to your project:
+The recommended structure is one migration per file, a single `index.ts` that re-exports them as an ordered array, and a runner script that imports that array and drives the run. Here's the runner:
 
 ```typescript
 // migrate.ts
 import { Pool } from "pg";
 import { MigrationManager } from "strataline/migration";
 
-// Import your migrations directly to ensure correct ordering
-import { migration001 } from "./migrations/001-add-users-table";
-import { migration002 } from "./migrations/002-add-posts-table";
-// ... import additional migrations as needed
+// Import the ordered migrations array (defined in ./migrations/index.ts, shown below)
+import { migrations } from "./migrations";
 
 async function main() {
   // Parse command line arguments
@@ -525,12 +523,8 @@ async function main() {
   const migrationManager = new MigrationManager(pool);
 
   try {
-    // Register migrations in the order you want them to run
-    migrationManager.register([
-      migration001,
-      migration002,
-      // ... add additional migrations in order
-    ]);
+    // Register the migrations (they run in array order)
+    migrationManager.register(migrations);
 
     // Run migrations
     console.log(`Running migrations in ${mode} mode...`);
@@ -602,40 +596,42 @@ async function main() {
 main().catch(console.error);
 ```
 
-Alternatively, you can create an index file that exports all migrations in the correct order:
+The `migrations` array imported above comes from one migration per file, each a typed `Migration`, collected by a single index file.
+
+Define each migration in its own file, typed with `Migration` so the object's shape is checked as you write it:
+
+```typescript
+// migrations/001-add-users-table.ts
+import type { Migration } from "strataline/migration";
+
+export const migration001: Migration = {
+  id: "001-add-users-table",
+  description: "Create users table",
+  beforeSchema: async (client, helpers) => {
+    await helpers.createTable(client, "users", {
+      id: "SERIAL PRIMARY KEY",
+      email: "VARCHAR(255) NOT NULL",
+    });
+  },
+  // migration / afterSchema as needed...
+};
+```
+
+Then aggregate them in an index file, **typing the array as `Migration[]`** — this validates every migration at the point you collect them and gives `register()` a fully typed array:
 
 ```typescript
 // migrations/index.ts
+import type { Migration } from "strataline/migration";
 import { migration001 } from "./001-add-users-table";
 import { migration002 } from "./002-add-posts-table";
 // ... import additional migrations
 
 // Export migrations in the order they should run
-export const migrations = [
+export const migrations: Migration[] = [
   migration001,
   migration002,
-  // ... add additional migrations
+  // ... add additional migrations in order
 ];
-```
-
-Then your migration script becomes simpler:
-
-```typescript
-// migrate.ts
-import { Pool } from "pg";
-import { MigrationManager } from "strataline/migration";
-import { migrations } from "./migrations";
-
-async function main() {
-  // ... same setup code as above
-
-  // Register migrations from the imported array
-  migrationManager.register(migrations);
-
-  // ... rest of the script
-}
-
-main().catch(console.error);
 ```
 
 You can then add scripts to your `package.json`:
@@ -1513,7 +1509,7 @@ When preparing a new release:
 bun run build
 ```
 
-The build process uses the `update-readme` script defined in package.json, which runs `scripts/update-readme-version.ts`. This script synchronizes the version number in the README with the one in package.json. Afterwards, you can publish the package to npm:
+The build process runs the `update-docs` script defined in package.json before bundling. It regenerates the README table of contents (`markdown-toc-gen`), synchronizes the README version with package.json (`scripts/update-readme-version.ts`), and formats the docs (`format:docs`). Afterwards, you can publish the package to npm:
 
 ```bash
 # Publish to npm
