@@ -1,6 +1,6 @@
 {
   "name": "strataline",
-  "version": "4.0.2",
+  "version": "4.0.3",
   "type": "module",
   "description": "A structured migration runner for PostgreSQL that treats database changes as layered, resumable operations",
   "exports": {

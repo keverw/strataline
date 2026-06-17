@@ -95,6 +95,25 @@ function getCurrentUser(): string {
 }
 
 /**
+ * Configuration for {@link LocalDevDBServer}. Unlike {@link TestDatabaseOptions},
+ * the connection fields (`port`, `user`, `password`, `database`, `dataDir`,
+ * `pidFile`) are required — the dev server runs on a fixed, predictable port and
+ * data directory rather than a throwaway one. Only `logger`, `onExit`, and
+ * `logConnections` are optional.
+ */
+export interface LocalDevDBServerConfig {
+  port: number;
+  user: string;
+  password: string;
+  database: string;
+  dataDir: string;
+  pidFile: string;
+  logger?: DevDBLoggerFunction;
+  onExit?: DevDBExitHandler;
+  logConnections?: boolean;
+}
+
+/**
  * LocalDevDBServer class for managing a local PostgreSQL server for development.
  * This class handles initialization, starting, and proper termination of a PostgreSQL server.
  */
@@ -126,17 +145,7 @@ export class LocalDevDBServer {
    *
    * @param config Configuration parameters
    */
-  constructor(config: {
-    port: number;
-    user: string;
-    password: string;
-    database: string;
-    dataDir: string;
-    pidFile: string;
-    logger?: DevDBLoggerFunction;
-    onExit?: DevDBExitHandler;
-    logConnections?: boolean;
-  }) {
+  constructor(config: LocalDevDBServerConfig) {
     // Initialize with provided config
     this.pgPort = config.port;
     this.pgUser = config.user;
@@ -256,7 +265,9 @@ export class LocalDevDBServer {
         return;
       }
       this.log("error", `Uncaught exception: ${err}`);
-      process.exit(1);
+      // Route through handleExit so a caller-supplied onExit handler is honored
+      // (tests/embedders can override the default process.exit).
+      this.handleExit(1);
     });
 
     // Additional handlers to ensure cleanup when process exits
@@ -813,7 +824,63 @@ export class LocalDevDBServer {
       this.log("info", "Press Ctrl+C to stop the server");
     } catch (error) {
       this.log("error", `Error starting PostgreSQL server: ${error}`);
-      process.exit(1);
+      // Tear down anything we already spawned before rejecting. A startup step
+      // after startPostgresServer() (waitForServerReady / setupUsersAndDatabases)
+      // can throw with PostgreSQL already running; since we now reject instead of
+      // exiting the process, a caller that catches the rejection keeps running, so
+      // leaving the child alive would leak a server holding the port + PID file.
+      await this.cleanupFailedStart();
+      // Surface startup failures by rejecting start() rather than calling
+      // process.exit() here. Exiting directly would bypass a caller-supplied
+      // onExit handler (which exists precisely so tests/embedders can avoid
+      // killing the process) and would make the documented
+      // `server.start().catch(...)` pattern dead code. The caller's .catch owns
+      // how a failed start terminates; onExit governs termination of an
+      // already-running server (signals, PostgreSQL process exit, cleanup).
+      throw error instanceof Error ? error : new Error(String(error));
+    }
+  }
+
+  /**
+   * Tear down a partially-started server after a failed start(). Stops the
+   * spawned PostgreSQL process (escalating to SIGKILL if it doesn't exit) and
+   * removes the PID file, so a caught start() rejection doesn't leave a server
+   * holding the port. Deliberately does NOT route through cleanupAndExit() /
+   * handleExit(): a failed start rejects the promise rather than exiting, so the
+   * close handler that would call onExit/process.exit is detached first.
+   */
+  private async cleanupFailedStart(): Promise<void> {
+    const proc = this.pgProcess;
+
+    if (proc && proc.pid) {
+      const pid = proc.pid;
+
+      // Detach the close handler so killing the process here doesn't trigger
+      // cleanupAndExit() -> onExit/process.exit.
+      proc.removeAllListeners("close");
+      this.pgProcess = null;
+
+      this.killProcess(pid, "SIGTERM");
+
+      // Give it a moment to stop, then force-kill so we don't return while it
+      // still holds the port.
+      let attempts = 0;
+
+      while (this.isProcessRunning(pid) && attempts < 10) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        attempts++;
+      }
+
+      if (this.isProcessRunning(pid)) {
+        this.killProcess(pid, "SIGKILL");
+      }
+    }
+
+    // Remove the PID file we may have written during startup.
+    try {
+      await unlink(this.pidFile);
+    } catch {
+      // File may not exist; ignore.
     }
   }
 }

@@ -137,9 +137,11 @@ class TestDBStratalineLogger extends BaseLogger implements StratalineLogger {
 }
 
 /**
- * TestDatabase options interface
+ * Configuration options for {@link TestDatabaseInstance}. All fields are
+ * optional — an omitted `port` is auto-assigned and the user/password/database
+ * fall back to the `test_*` defaults.
  */
-interface TestDatabaseOptions {
+export interface TestDatabaseOptions {
   port?: number;
   logger?: TestDBLoggerFunction;
   user?: string;

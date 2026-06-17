@@ -1,4 +1,4 @@
-# Strataline v4.0.2
+# Strataline v4.0.3
 
 [![npm version](https://badge.fury.io/js/strataline.svg)](https://badge.fury.io/js/strataline)
 
@@ -352,8 +352,11 @@ Create a script file to run your migrations:
 import { RunStratalineCLI, createCLIConsoleLogger } from "strataline/cli";
 import { migrations } from "../path/to/your/migrations";
 
-// Use the built-in CLI console logger
-// You can customize this or implement your own logger if needed
+// Use the built-in CLI console logger. The single argument is `migrateVerbose`
+// (default `true`): it gates only the verbose per-migration `[MIGRATE-INFO]`
+// lines. Migration errors/warnings and the CLI's own info always print, so
+// passing `false` quiets the chatter without hiding problems. You can customize
+// this or implement your own logger if needed.
 const logger = createCLIConsoleLogger(true);
 
 // Run the CLI with environment variables.
@@ -983,7 +986,7 @@ Strataline includes a dedicated logger module that provides:
 
 The logger system automatically formats messages with task and stage prefixes, making it easy to trace the origin of each log message in complex migration scenarios.
 
-A few lower-level building blocks are also exported from `strataline/migration` for advanced use: the `LogData` / `LogLevel` / `LogDataInput` types, the `buildLogPrefix` and `getErrorMessage` helpers, a `MutableLogger` (wraps another logger and can be toggled on/off via `setVerbose`, with `isVerbose()` to read the current state, handy in tests), `createPrefixedLogger` (a standalone function that creates a prefixed logger. Handles both `BaseLogger` subclasses and plain `Logger` objects), and `PrefixedLogger` (the internal class behind `createPrefixed`/`createPrefixedLogger` — prefer those over constructing it directly). Most users only need `BaseLogger`, `ConsoleLogger`, and `consoleLogger`.
+A few lower-level building blocks are also exported from `strataline/migration` for advanced use: the `LogData` / `LogLevel` / `LogDataInput` types, the `buildLogPrefix` and `getErrorMessage` helpers, a `MutableLogger` (wraps another logger and can be toggled on/off via `setVerbose`, with `isVerbose()` to read the current state, handy in tests), `createPrefixedLogger` (a standalone function that creates a prefixed logger. Handles both `BaseLogger` subclasses and plain `Logger` objects), and `PrefixedLogger` (the internal class behind `createPrefixed`/`createPrefixedLogger`. Prefer those over constructing it directly). Most users only need `BaseLogger`, `ConsoleLogger`, and `consoleLogger`.
 
 ##### Creating Custom Loggers
 
@@ -1309,7 +1312,7 @@ const customLogger = (
 };
 ```
 
-This logger signature is exported as `TestDBLoggerFunction` if you prefer to annotate your logger with the named type instead of writing the shape inline.
+This logger signature is exported as `TestDBLoggerFunction` if you prefer to annotate your logger with the named type instead of writing the shape inline. The constructor's options object is likewise exported as `TestDatabaseOptions`.
 
 ##### Migration Logging
 
@@ -1484,7 +1487,9 @@ const server = new LocalDevDBServer({
 
 **Note:** The server automatically creates the specified user, password, and database during startup. You don't need to create these manually - just specify the credentials you want to use and the server will set them up for you.
 
-**Exit Handling:** By default, the server calls `process.exit()` when it needs to terminate (e.g., when the PostgreSQL process exits or during cleanup). For testing or custom scenarios, you can provide an `onExit` callback to handle termination differently.
+> **Heads up: a `postgres` superuser is also created.** Besides the user you configure, startup ensures a `postgres` superuser exists with the well-known password `postgres` (it's created if missing, or its password is reset to `postgres` if it already exists). This is a local-development convenience, but it means the cluster has a predictable superuser login. Keep the dev server bound to localhost (it is, by default) and **don't expose its port** on shared or untrusted networks.
+
+**Exit Handling:** `onExit` governs how an **already-running** server terminates when PostgreSQL's process exits, on `SIGINT`/`SIGTERM`/`SIGHUP`, or during cleanup. By default these call `process.exit()`. Provide an `onExit` callback (e.g. in tests) to intercept termination instead of exiting the process. A **failed `start()`** is handled differently: it does **not** call `onExit`, it **rejects the returned promise**, so handle startup errors with `server.start().catch(...)` (as in the example above). The `stop()` method triggers the same graceful shutdown as `SIGTERM`.
 
 #### Logging
 
@@ -1512,7 +1517,7 @@ const customLogger = (
 };
 ```
 
-This logger signature is exported as `DevDBLoggerFunction`, and the `onExit` callback type as `DevDBExitHandler` (`(exitCode: number) => void`), if you prefer the named types over writing the shapes inline.
+This logger signature is exported as `DevDBLoggerFunction`, and the `onExit` callback type as `DevDBExitHandler` (`(exitCode: number) => void`), if you prefer the named types over writing the shapes inline. The constructor's configuration object is exported as `LocalDevDBServerConfig`.
 
 #### Data Persistence
 
