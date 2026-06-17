@@ -212,7 +212,7 @@ async function runMigrations(
     // Always show migrations that were already applied in previous runs (even if none)
     logger(
       "info",
-      `Previously applied: ${result.previouslyAppliedMigrations?.join(", ") || "none"}`,
+      `Previously applied: ${result.previouslyAppliedMigrations.join(", ") || "none"}`,
     );
 
     // Always show pending migrations (even if none)

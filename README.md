@@ -1,4 +1,4 @@
-# Strataline v4.0.1
+# Strataline v4.0.2
 
 [![npm version](https://badge.fury.io/js/strataline.svg)](https://badge.fury.io/js/strataline)
 
@@ -983,7 +983,7 @@ Strataline includes a dedicated logger module that provides:
 
 The logger system automatically formats messages with task and stage prefixes, making it easy to trace the origin of each log message in complex migration scenarios.
 
-A few lower-level building blocks are also exported from `strataline/migration` for advanced use: the `LogData` / `LogLevel` / `LogDataInput` types, the `buildLogPrefix` and `getErrorMessage` helpers, a `MutableLogger` (wraps another logger and can be toggled on/off via `setVerbose`, with `isVerbose()` to read the current state, handy in tests), and `PrefixedLogger` (the internal class behind `createPrefixed`. Prefer `createPrefixed`/`createPrefixedLogger` over constructing it directly). Most users only need `BaseLogger`, `ConsoleLogger`, and `consoleLogger`.
+A few lower-level building blocks are also exported from `strataline/migration` for advanced use: the `LogData` / `LogLevel` / `LogDataInput` types, the `buildLogPrefix` and `getErrorMessage` helpers, a `MutableLogger` (wraps another logger and can be toggled on/off via `setVerbose`, with `isVerbose()` to read the current state, handy in tests), `createPrefixedLogger` (a standalone function that creates a prefixed logger. Handles both `BaseLogger` subclasses and plain `Logger` objects), and `PrefixedLogger` (the internal class behind `createPrefixed`/`createPrefixedLogger` — prefer those over constructing it directly). Most users only need `BaseLogger`, `ConsoleLogger`, and `consoleLogger`.
 
 ##### Creating Custom Loggers
 
@@ -1149,7 +1149,7 @@ CREATE TABLE IF NOT EXISTS migration_status (
 )
 ```
 
-The `started_at`, `attempts`, and `last_error` columns are observability aids that make a stuck or repeatedly-deferred migration debuggable straight from the table. The `metadata` column holds freeform JSON the migration persists for itself. See [Metadata & Checkpoints](#metadata--checkpoints). `attempts` increments at the start of every attempt that actually begins work, including attempts that `defer()` or error, not just successful ones. There are two exceptions: an attempt that is already aborted, via shutdown signal or lock loss, _before_ this migration's schema phase starts does no work, so it does **not** increment `attempts` and leaves the prior `last_error` intact. The distributed-mode `runDataMigrationJobOnly` path also never increments it. `started_at` is stamped once on the first attempt, and `last_error` is set on any failure or `defer()` and cleared on successful completion. Existing tables created by older versions (prior to 4.0.0) are upgraded automatically (`ADD COLUMN IF NOT EXISTS`) the next time the migration system initializes.
+The `started_at`, `attempts`, and `last_error` columns are observability aids that make a stuck or repeatedly-deferred migration debuggable straight from the table. The `metadata` column holds freeform JSON the migration persists for itself. See [Metadata & Checkpoints](#metadata--checkpoints). `attempts` increments at the start of every attempt that actually begins work, including attempts that `defer()` or error, not just successful ones. There are two exceptions: an attempt that is already aborted, via shutdown signal or lock loss, _before_ this migration's schema phase starts does no work, so it does **not** increment `attempts` and leaves the prior `last_error` intact. The distributed-mode `runDataMigrationJobOnly` path also never increments it. `started_at` is stamped once on the first attempt, and `last_error` is set on any failure or `defer()` and cleared at the **start** of the next attempt (so it appears `NULL` for the duration of any in-progress run, even if prior attempts failed) and is `NULL` once the migration completes cleanly. Existing tables created by older versions (prior to 4.0.0) are upgraded automatically (`ADD COLUMN IF NOT EXISTS`) the next time the migration system initializes.
 
 You can also read these rows programmatically with `await manager.getMigrationStatus()`, which returns a typed `MigrationStatus[]` (the same data the CLI `status` command renders), useful for building your own dashboards or health checks. It reflects the raw table, ordered by `completed_at`, so it returns **every** row in `migration_status` rather than filtering to your currently registered list. In practice these are the same set, since migrations are normally kept around once applied. The only time they diverge is if you've renamed or deleted an old migration. In that case, its row lingers, so cross-reference against your migrations array if you need to exclude those.
 
