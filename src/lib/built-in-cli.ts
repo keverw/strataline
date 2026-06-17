@@ -515,8 +515,10 @@ export async function RunStratalineCLI(config: {
     const idleTimeoutValue = env[prefix + "POSTGRES_IDLE_TIMEOUT"];
     const connectionTimeoutValue = env[prefix + "POSTGRES_CONNECTION_TIMEOUT"];
 
-    // Parse and validate port (required)
-    const port = parseInt(portValue || "5432", 10);
+    // Parse and validate port. POSTGRES_PORT is required and already confirmed
+    // present by the missing-vars check above; the `?? ""` only satisfies the
+    // type (an empty string parses to NaN, which the range check below rejects).
+    const port = parseInt(portValue ?? "", 10);
 
     if (isNaN(port) || port <= 0 || port > 65535) {
       throw new Error(
@@ -584,10 +586,14 @@ export async function RunStratalineCLI(config: {
       connectionTimeoutMillis: connectionTimeout,
     });
   } else if (config.loadFrom === "pool") {
+    // Validate *before* adopting the pool. Once poolInstance is set, the
+    // try/finally below owns it and calls pool.end() — including on the
+    // caller-supplied pool. A validation throw here happens before that block, so
+    // assigning poolInstance first would leave a caller's pool open on the
+    // envPrefix misconfiguration. Check everything up front, then adopt.
+
     // Ensure pool is provided
-    if (config.pool) {
-      poolInstance = config.pool;
-    } else {
+    if (!config.pool) {
       throw new Error("Must provide pool when loadFrom='pool'");
     }
 
@@ -595,6 +601,8 @@ export async function RunStratalineCLI(config: {
     if (config.envPrefix) {
       throw new Error("Cannot provide envPrefix when loadFrom='pool'");
     }
+
+    poolInstance = config.pool;
   }
 
   // set up migration manager
@@ -667,6 +675,7 @@ Strataline Database Migration CLI
 Available commands:
   run         Run pending migrations
   status      Show migration status
+  help        Show this help (default when no command is given)
 
 Options:
   --distributed  Run migrations in distributed mode

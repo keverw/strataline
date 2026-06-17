@@ -375,9 +375,11 @@ describe("RunStratalineCLI", () => {
           argv: ["node", "script.js", "run"],
         });
 
-        const expectedInfoMessage = `[${migrationId}] ${logMessage}`;
-        const expectedWarnMessage = `[${migrationId}] ${warnMessage}`;
-        const expectedErrorMessage = `[${migrationId}] ${errorMessage}: ${errorObject.message}`;
+        // ctx.logger is tagged with both the migration id (task) and the
+        // "dataMigration" phase (stage), so output is `[id] [dataMigration] ...`.
+        const expectedInfoMessage = `[${migrationId}] [dataMigration] ${logMessage}`;
+        const expectedWarnMessage = `[${migrationId}] [dataMigration] ${warnMessage}`;
+        const expectedErrorMessage = `[${migrationId}] [dataMigration] ${errorMessage}: ${errorObject.message}`;
 
         const infoLog = logEntries.find(
           (entry) =>

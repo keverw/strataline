@@ -1,4 +1,4 @@
-# Strataline v4.0.0
+# Strataline v4.0.1
 
 [![npm version](https://badge.fury.io/js/strataline.svg)](https://badge.fury.io/js/strataline)
 
@@ -29,7 +29,7 @@ Whether you're building a side project or orchestrating millions of rows in prod
   - [Job Mode (Single Machine)](#job-mode-single-machine)
   - [Distributed Mode (Orchestrated)](#distributed-mode-orchestrated)
 - [Running Migrations](#running-migrations)
-  - [Using the Built-in CLI Helper](#using-the-built-in-cli-helper)
+  - [Using the Built-In CLI Helper](#using-the-built-in-cli-helper)
     - [Basic Setup](#basic-setup)
     - [Configuration Options](#configuration-options)
     - [Environment Variables](#environment-variables)
@@ -45,6 +45,7 @@ Whether you're building a side project or orchestrating millions of rows in prod
   - [Distributed Mode](#distributed-mode)
 - [Migration Results](#migration-results)
   - [Error Handling](#error-handling)
+  - [Exported Types](#exported-types)
 - [Backpressure Handling](#backpressure-handling)
 - [Graceful Shutdown & Cancellation](#graceful-shutdown--cancellation)
 - [Metadata & Checkpoints](#metadata--checkpoints)
@@ -71,7 +72,7 @@ Whether you're building a side project or orchestrating millions of rows in prod
     - [Logging](#logging-2)
     - [Data Persistence](#data-persistence)
     - [Process Management](#process-management)
-    - [Using with Your Application](#using-with-your-application)
+    - [Using With Your Application](#using-with-your-application)
     - [Git Configuration](#git-configuration)
   - [Locale and Collation](#locale-and-collation)
 - [Development](#development)
@@ -112,6 +113,8 @@ npm add strataline
 # or
 yarn add strataline
 ```
+
+> **Note:** `pg` is a peer dependency, so install it alongside Strataline if it isn't already in your project (`bun add pg` / `npm add pg` / `yarn add pg`). Every example below imports `Pool` from it.
 
 ## Basic Usage
 
@@ -159,11 +162,11 @@ migrationManager.register([
     migration: async (pool, ctx) => {
       // Check the migration mode
       if (ctx.mode === "job") {
-        // In job mode, we process all data unless a specific payload is provided
-        const { startId, endId } = ctx.payload || {
-          startId: 0,
-          endId: Number.MAX_SAFE_INTEGER,
-        };
+        // In job mode, we process all data unless a specific payload provides a
+        // range. `ctx.payload` is always at least `{}` (never undefined), so read
+        // the bounds with default values rather than an `|| { ... }` fallback
+        // (which would never trigger, leaving startId/endId undefined).
+        const { startId = 0, endId = Number.MAX_SAFE_INTEGER } = ctx.payload;
 
         ctx.logger.info({
           message: `Processing users from ID ${startId} to ${endId}`,
@@ -292,8 +295,16 @@ migration: async (pool, ctx) => {
       ctx.complete(); // All jobs finished, allow afterSchema and next migrations
     }
   } else if (ctx.mode === "job") {
-    // Do the actual work for this batch (or all data if no payload)
-    const { startId = 0, endId = Number.MAX_SAFE_INTEGER } = ctx.payload || {};
+    // Heads up: `ctx.mode === "job"` is true in BOTH a single-machine
+    // runSchemaChanges("job") run (the orchestrator — here complete() IS
+    // authoritative and marks the migration done) AND inside a worker via
+    // runDataMigrationJobOnly (where complete() only reports success to your
+    // job system and marks nothing). ctx.mode can't tell them apart — the call
+    // path does. See "The Orchestrator Owns Migration State. Workers Don't."
+    //
+    // Do the actual work for this batch (or all data if no payload).
+    // `ctx.payload` is always at least `{}`, so default the bounds here.
+    const { startId = 0, endId = Number.MAX_SAFE_INTEGER } = ctx.payload;
 
     ctx.logger.info({
       message: `Processing users from ID ${startId} to ${endId}`,
@@ -315,7 +326,7 @@ migration: async (pool, ctx) => {
 > - The migration function should always check `ctx.mode` and process accordingly:
 >   - In `distributed` mode, orchestrate the work and use `ctx.defer('reason', data?)` to pause, retry, or indicate that jobs were scheduled for background work, potentially passing back relevant data.
 >   - In `job` mode, process all data at once, or a specific range if a payload is provided. You can also use `ctx.defer(reason, data?)` to implement staged rollouts or pause for backpressure.
-> - If you call `ctx.defer(reason, data?)`, the migration will be paused. `afterSchema` and any subsequent migrations will not run until you rerun the job and it calls `ctx.complete()`. This enables staged rollouts, retries, or background processing. The optional `data` is returned to the **immediate caller**. From a **worker** it comes back in `DataMigrationJobResult.data` (you forward/aggregate it however you like), and from the **orchestrator** pass it lands in `MigrationResult.migrationData`. To carry worker state across runs, the **orchestrator** may persist it via the [metadata column](#metadata--checkpoints), while a worker cannot, as described below.
+> - If you call `ctx.defer(reason, data?)`, the migration will be paused. `afterSchema` and any subsequent migrations will not run until you rerun the job and it calls `ctx.complete()`. This enables staged rollouts, retries, or background processing. The optional `data` is returned to the **immediate caller**. From a **worker** it comes back in `DataMigrationJobResult.data` (you forward/aggregate it however you like). On the **orchestrator** pass a `defer(reason, data)` halts the run, so that `data` is **not** surfaced in `MigrationResult.migrationData` (only data from migrations that `complete()`d earlier in the same run appears there). Instead the orchestrator persists the deferred `data` to the [metadata column](#metadata--checkpoints), where you read it back via `ctx.metadata` on the next run. A worker cannot persist metadata, as described below.
 > - Strataline is backend-agnostic: you can use any job scheduler, queue system, thread pool, or orchestration framework to schedule and monitor jobs as needed.
 >
 > **The Orchestrator Owns Migration State. Workers Don't.** `runDataMigrationJobOnly` is a thin wrapper that runs your migration function for one batch (pass the batch via `payload`) and **returns the result to you**. It writes **nothing** to `migration_status`, including `migration_complete`, `metadata`, `attempts`, `last_error`, or anything else, and it **never touches the migration lock**. There is no acquire, renew, or release because your job system controls worker concurrency. So when a worker calls `ctx.complete()`, that just tells _your_ job system its batch succeeded. It does **not** mark the whole migration done. Only the orchestrator pass (`runSchemaChanges`) writes migration state. It marks `migration_complete` and persists `metadata` once _it_ confirms all jobs finished. This is deliberate: it prevents the footgun where one finished batch would prematurely flip the whole migration complete and let `afterSchema` run early. (A worker can still _read_ `ctx.metadata` as read-only data, but for a worker the `payload` you pass in is usually the better way to hand it its slice/checkpoint, since you control it directly per call.)
@@ -324,7 +335,7 @@ migration: async (pool, ctx) => {
 
 Strataline provides flexible options for running database migrations. Since it's designed as a library rather than a CLI tool, you have complete control over how migrations are executed. You can either use our convenient built-in CLI helper to get started quickly or create a custom migration script for more advanced scenarios.
 
-### Using the Built-in CLI Helper
+### Using the Built-In CLI Helper
 
 For quick development or simpler use cases, Strataline provides a convenient CLI helper function called `RunStratalineCLI`. This function handles command parsing and execution for you with minimal setup.
 
@@ -420,6 +431,10 @@ The CLI supports the following commands:
 - `status`: Show migration status
 - `help`: Display help information (default if no command is provided)
 
+> **Note:** Any unrecognized command falls through to `help` (printed, exit code `0`). An unknown command is not treated as an error, and the returned `result.command` is normalized to `"help"` (not the raw unknown string), matching the `run | status | help` set the type documents. The `--distributed` flag and the `signal` option only affect `run`, and they are ignored by `status` and `help`.
+
+> **Note:** Every command, including `help`, first resolves the database configuration and tests the connection before it runs. With `loadFrom: "env"` that means missing/invalid env vars throw, and an unreachable database aborts, _before_ any command output. So even `help` requires a working connection in env mode. If you just want the help text without a database, print it yourself rather than relying on the CLI.
+
 #### Exit Codes
 
 `RunStratalineCLI` resolves with a `StratalineCLIResult` that includes a suggested `exitCode`, so a wrapper script can distinguish outcomes. A genuine **error is thrown** (not returned), so callers that only `.catch()` still exit non-zero.
@@ -446,6 +461,21 @@ RunStratalineCLI({ migrations, loadFrom: "env", logger })
 
 The codes are also exported as `STRATALINE_EXIT_CODES`.
 
+The full result shape (exported as `StratalineCLIResult`) is:
+
+```typescript
+interface StratalineCLIResult {
+  command: string; // The command that ran: "run", "status", or "help".
+  status?: MigrationResult["status"]; // Only populated for "run". Undefined for "status"/"help".
+  exitCode: number; // Suggested process exit code for this outcome.
+  reason?: string; // Only populated for "run", when it did not simply complete.
+}
+```
+
+> **`status` and `reason` are populated only for the `run` command.** The `status`/`help` commands resolve with just `{ command, exitCode: 0 }`, so `result.status` and `result.reason` are `undefined` for them. Branch on `result.command` (or check for `undefined`) before reading `status`.
+
+The CLI logger type is exported as `CLILoggerFunction` (the signature of the `logger` you pass to `RunStratalineCLI`, and what `createCLIConsoleLogger` returns).
+
 #### Graceful Shutdown
 
 The CLI does **not** trap OS signals itself (so it won't interfere with however your app handles them). Instead, pass an `AbortSignal` and wire it to your own handler. The CLI forwards it down to the migration run:
@@ -470,6 +500,8 @@ When the signal aborts, an in-flight `run` stops at the next safe point and reso
 **Note**: The CLI automatically manages the PostgreSQL pool lifecycle. It will create a pool if using environment variables or use your provided pool, and will properly end the pool when the operation completes. You do not need to end the pool yourself after calling `RunStratalineCLI`.
 
 > **Heads up, it ends a pool you passed too.** When `loadFrom: "pool"`, `RunStratalineCLI` calls `pool.end()` in a `finally` block on the **pool you supplied**, not just on pools it created. The pool is dead after the call resolves, so don't plan to reuse it afterward. Create a dedicated pool for the CLI, or let it create one via `loadFrom: "env"`.
+>
+> The one exception is a **synchronous configuration error**, e.g. passing `envPrefix` together with `loadFrom: "pool"`, which throws `Cannot provide envPrefix when loadFrom='pool'`. These checks run _before_ the CLI adopts your pool, so on such a throw the pool is **left open** (it was never touched, and you still own the reference). That's deliberate: you can fix the config and retry with the same pool. Once the CLI gets past validation, the `finally` owns it and will end it.
 
 #### package.json Scripts
 
@@ -536,9 +568,10 @@ async function main() {
         `Applied during this run: ${result.completedMigrations.join(", ") || "none"}`,
       );
 
-      // Always show migrations that were already applied in previous runs (even if none)
+      // Always show migrations that were already applied in previous runs (even if none).
+      // previouslyAppliedMigrations is always present (never undefined), so no `?.` is needed.
       console.log(
-        `Previously applied: ${result.previouslyAppliedMigrations?.join(", ") || "none"}`,
+        `Previously applied: ${result.previouslyAppliedMigrations.join(", ") || "none"}`,
       );
 
       // Always show pending migrations (even if none)
@@ -557,15 +590,38 @@ async function main() {
         );
       }
     } else {
-      console.error(`❌ Migration failed: ${result.reason}`);
+      // `success` is false for several distinct outcomes, and NOT all of them
+      // are failures. `locked` (another process holds the lock), `deferred` (a
+      // migration paused itself), and `aborted` (graceful shutdown) are benign;
+      // only `error` and `lock_lost` are real problems. Branch on `result.status`
+      // rather than treating every `!success` as an error so you don't exit 1 on
+      // a benign skip. (This is exactly what the built-in CLI does — see the
+      // Exit Codes table; reuse `STRATALINE_EXIT_CODES` if you want the same map.)
+      switch (result.status) {
+        case "deferred":
+          console.log(`⏸ Migration run paused (deferred): ${result.reason}`);
+          break;
+        case "locked":
+          console.log(
+            `⏭ Skipped — another process is running: ${result.reason}`,
+          );
+          break;
+        case "aborted":
+          console.log(`⏹ Migration run aborted: ${result.reason}`);
+          break;
+        case "lock_lost":
+          console.error(`✗ Migration lock lost mid-run: ${result.reason}`);
+          break;
+        default:
+          console.error(`❌ Migration failed: ${result.reason}`);
+          break;
+      }
+
       console.log(
         `Completed migrations in this run: ${result.completedMigrations.join(", ") || "none"}`,
       );
 
-      if (
-        result.previouslyAppliedMigrations &&
-        result.previouslyAppliedMigrations.length > 0
-      ) {
+      if (result.previouslyAppliedMigrations.length > 0) {
         console.log(
           `Previously applied migrations: ${result.previouslyAppliedMigrations.join(", ")}`,
         );
@@ -581,7 +637,10 @@ async function main() {
         );
       }
 
-      process.exit(1);
+      // Only `error` and `lock_lost` are non-zero failures here; benign
+      // outcomes exit 0. Map to whatever exit codes suit your tooling.
+      const failed = result.status === "error" || result.status === "lock_lost";
+      process.exit(failed ? 1 : 0);
     }
   } catch (error) {
     console.error("Error running migrations:", error);
@@ -593,6 +652,8 @@ async function main() {
 
 main().catch(console.error);
 ```
+
+> **`success: false` is not always a failure.** `runSchemaChanges` returns `success: false` for `locked`, `deferred`, and `aborted` too, all benign outcomes, alongside the genuine `error` and `lock_lost`. Branch on `result.status` (as above) when you need to tell them apart. The [built-in CLI](#using-the-built-in-cli-helper) already does this and maps each status to a distinct [exit code](#exit-codes), so prefer it if you don't want to hand-roll the distinction.
 
 The `migrations` array imported above comes from one migration per file, each a typed `Migration`, collected by a single index file.
 
@@ -631,6 +692,8 @@ export const migrations: Migration[] = [
   // ... add additional migrations in order
 ];
 ```
+
+> **`register()` replaces, and rejects duplicates.** Each call to `register()` _replaces_ any previously registered list (it does not append), and it throws if two migrations share the same `id`, so accidental duplicates fail fast at registration rather than silently running twice.
 
 You can then add scripts to your `package.json`:
 
@@ -685,13 +748,24 @@ In `distributed` mode, your infrastructure acts as a router/scheduler/monitor, w
 
 The distributed mode works like this:
 
-1. You run `runSchemaChanges('distributed')` to apply schema changes. The result may contain `migrationData` from any migrations that completed during this run, which could include data returned by migrations that ran inline that called `ctx.complete(data)` or `ctx.defer(reason, data)`.
+1. You run `runSchemaChanges('distributed')` to apply schema changes. This is the **orchestrator** pass. Its result's `migrationData` holds the data from any migrations that **finished** via `ctx.complete(data)` during this run. A migration that calls `ctx.defer(reason, data)` instead **stops the run**, so its `data` is **not** in `migrationData`. Because this is the orchestrator pass, that `data` is saved to the [metadata column](#metadata--checkpoints) (read it back via `ctx.metadata` on the next run). (Standalone `runDataMigrationJobOnly` workers are different: they never persist metadata. They return their `data` in `DataMigrationJobResult.data`. See the [orchestrator/worker note](#distributed-mode-orchestrated) above.)
 2. Your infrastructure determines how to split the data (e.g., by user ID ranges).
 3. For each batch, you call `runDataMigrationJobOnly(migrationId, payload)`. This function executes the `migration` part of your defined migration for that specific `migrationId` and `payload`.
    - If the migration calls `ctx.complete(data)` or `ctx.defer(reason, data)`, the `data` provided there will be returned in the `data` field of the `DataMigrationJobResult`.
    - The overall result will be an object like `{ status: 'success', reason?: string, data?: TReturn }`.
 4. Each batch runs as a separate job, processing just its portion of the data. The `data` returned in the `DataMigrationJobResult` can be used for logging, monitoring, or further orchestration.
 5. Your infrastructure handles scheduling, retries, and monitoring based on the `status`, `reason`, and `data` from `runDataMigrationJobOnly`.
+
+> **`runDataMigrationJobOnly` status values:** the returned `status` is one of:
+>
+> - `success`: the data function ran and called `ctx.complete()` (or the migration has no `migration` function, so there was nothing to run). Note a worker never marks `migration_complete`. Only the orchestrator pass does.
+> - `deferred`: the data function called `ctx.defer()` (retry this batch later).
+> - `error`: the data function threw or finished without calling `complete()`/`defer()`.
+> - `already_complete`: the data phase was already marked complete, so there is nothing to do.
+> - `not_found`: no migration is registered with that ID.
+> - `invalid_state`: the migration isn't ready for a data-only run (e.g. `beforeSchema` hasn't been applied yet, or `afterSchema` is applied while the data phase isn't complete).
+>
+> Only `success`/`deferred`/`error` can carry `data`.
 
 This approach allows you to:
 
@@ -725,7 +799,7 @@ interface MigrationResult {
   pendingMigrations: string[]; // IDs of migrations still pending (including partially-applied ones resuming)
   lastAttemptedMigration?: string; // ID of the last migration attempted
   error?: Error; // Raw error object for debugging (unhandled exceptions only)
-  migrationData?: Record<string, any>; // Data returned by successful migrations
+  migrationData: Record<string, unknown>; // Data returned by successful migrations. Always present — an empty object when no migration returned data.
 }
 ```
 
@@ -737,6 +811,17 @@ Strataline provides two levels of error information:
 - **`error`**: Raw Error object with stack trace, only present for unhandled exceptions (not for controlled migration phase errors)
 
 The built-in CLI shows both the `reason` (always) and `error` details with stack trace (when available) to help with debugging.
+
+### Exported Types
+
+Alongside `MigrationResult`, `MigrationStatus`, `DataMigrationJobResult`, and `DataMigrationJobStatus`, a few smaller types are exported from `strataline/migration` for when you want to annotate things explicitly (e.g. a wrapper function or a variable that holds the mode):
+
+- **`MigrationMode`** (`"job" | "distributed"`): the value you pass to `runSchemaChanges`/`runDataMigrationJobOnly` and read back as `ctx.mode`.
+- **`MigrationCompletionCallback<TReturn>` / `MigrationDeferCallback<TReturn>`**: the types of `ctx.complete` and `ctx.defer`. Usually inferred for you when you write the inline `migration` callback, and exported for the rare case you annotate them by hand.
+
+> **`Migration` is generic: `Migration<TPayload, TReturn>`.** The examples use the bare `Migration` (which defaults to `Migration<Record<string, unknown>, unknown>`), but you can parameterize it to type the two values that flow through a single migration: `TPayload` types `ctx.payload` (the per-batch input you pass to `runDataMigrationJobOnly`), and `TReturn` types the `data` argument to `ctx.complete(data)` / `ctx.defer(reason, data)` (and `ctx.updateMetadata`). For example, `Migration<{ startId: number; endId: number }, { processed: number }>` gives you a fully typed `ctx.payload` and a checked `ctx.complete({ processed })`. `register<TPayload, TReturn>()` and `runDataMigrationJobOnly<TPayload, TReturn>()` carry the same parameters.
+
+The logger the `MigrationManager` constructor accepts is the [`Logger`](#logger-module) interface. If `Logger` collides with a type already in your codebase, alias it on import: `import type { Logger as StratalineLogger } from "strataline/migration"`.
 
 ## Backpressure Handling
 
@@ -756,6 +841,8 @@ When a migration calls `defer(reason, data?)`, the current execution stops and s
 4. **Handle External Dependencies**: Defer when dependent systems are unavailable or rate-limited
 
 The `defer()` function accepts an optional `reason` parameter and an optional `data` parameter. The `reason` provides context for why the migration was paused, useful for monitoring and debugging. The `data` allows for returning structured information to the calling orchestrator.
+
+> **Call exactly one, exactly once.** A data migration must call **either** `ctx.complete()` **or** `ctx.defer()` per run, not both, and not the same one twice. A second call (or calling both) throws `complete() or defer() already called`. Finishing the function _without_ calling either is also an error (`Migration function finished without calling complete() or defer()`), so always end on one of them. See [Graceful Shutdown & Cancellation](#graceful-shutdown--cancellation).
 
 ## Graceful Shutdown & Cancellation
 
@@ -850,6 +937,14 @@ migration: async (pool, ctx) => {
 
 **Ownership:** what matters is the **call path, not the mode**. Any `runSchemaChanges` call is the orchestrator and writes `metadata` (and `migration_complete`). This includes single-machine **job mode** (`runSchemaChanges("job")`), not just distributed. Only `runDataMigrationJobOnly` (a worker) has no-op writes, though it can still **read** `ctx.metadata`. Watch out: `ctx.mode === "job"` is true in _both_ a single-machine `runSchemaChanges("job")` run _and_ inside a worker (which forces `mode: "job"`), so `ctx.mode` alone doesn't tell you whether your writes persist. The call path does. See the distributed-mode note below for why.
 
+| You called                        | `ctx.mode`       | `complete()` marks done? | `metadata` persists? |
+| --------------------------------- | ---------------- | ------------------------ | -------------------- |
+| `runSchemaChanges("job")`         | `"job"`          | Yes                      | Yes                  |
+| `runSchemaChanges("distributed")` | `"distributed"`  | Yes                      | Yes                  |
+| `runDataMigrationJobOnly(...)`    | `"job"` (forced) | No                       | No                   |
+
+The first and third rows both run with `ctx.mode === "job"` yet differ on persistence, proof that the **call path** (which method you invoked), not `ctx.mode`, decides ownership. A worker just returns its value in `DataMigrationJobResult.data`. Your orchestrator pass decides whether to save it.
+
 ## Logging & Schema Helpers
 
 Strataline provides robust logging and schema helper utilities to make migrations safer and more traceable:
@@ -860,7 +955,7 @@ Strataline provides robust logging and schema helper utilities to make migration
 - By default, logs are sent to the console, but you can provide your own logger by passing it to the `MigrationManager`.
 - The migration system automatically adds contextual information to logs:
   - The migration ID is used as the `task` field
-  - The current phase (beforeSchema, migration, afterSchema) is used as the `stage` field
+  - The current phase (`beforeSchema`, `dataMigration`, `afterSchema`) is used as the `stage` field, both on the `ctx.logger` passed to your data migration and on the `helpers` passed to your schema phases
   - This provides built-in traceability without manual configuration
 
 Example:
@@ -888,7 +983,7 @@ Strataline includes a dedicated logger module that provides:
 
 The logger system automatically formats messages with task and stage prefixes, making it easy to trace the origin of each log message in complex migration scenarios.
 
-A few lower-level building blocks are also exported from `strataline/migration` for advanced use: the `LogData` / `LogLevel` / `LogDataInput` types, the `buildLogPrefix` and `getErrorMessage` helpers, a `MutableLogger` (wraps another logger and can be toggled on/off via `setVerbose`, handy in tests), and `PrefixedLogger` (the internal class behind `createPrefixed`. Prefer `createPrefixed`/`createPrefixedLogger` over constructing it directly). Most users only need `BaseLogger`, `ConsoleLogger`, and `consoleLogger`.
+A few lower-level building blocks are also exported from `strataline/migration` for advanced use: the `LogData` / `LogLevel` / `LogDataInput` types, the `buildLogPrefix` and `getErrorMessage` helpers, a `MutableLogger` (wraps another logger and can be toggled on/off via `setVerbose`, with `isVerbose()` to read the current state, handy in tests), and `PrefixedLogger` (the internal class behind `createPrefixed`. Prefer `createPrefixed`/`createPrefixedLogger` over constructing it directly). Most users only need `BaseLogger`, `ConsoleLogger`, and `consoleLogger`.
 
 ##### Creating Custom Loggers
 
@@ -960,7 +1055,7 @@ prefixedLogger.info({ message: "Starting process" });
 
 The `helpers` object, passed as the second argument to `beforeSchema` and `afterSchema` functions, provides a set of safe, idempotent methods for common schema modifications. These helpers automatically log their actions using the configured logger and perform existence checks before attempting changes, preventing errors if an object already exists or doesn't exist when trying to remove it.
 
-> **Schema Resolution:** Existence checks resolve relations through Postgres's `to_regclass` / `pg_catalog`, so they honour the connection's `search_path` and accept schema-qualified names (e.g. `"reporting.users"`). The check looks in the same place the subsequent DDL will run, not blindly across every schema. Note that table, column, index, and constraint **names are written directly into the SQL statement**. SQL placeholders (`$1`, `$2`, …) can only stand in for _values_ (data), never for identifiers like table or column names, so those names can't be parameterized and must be concatenated in. Treat them as trusted, code-defined values. Don't build them from untrusted input.
+> **Schema Resolution:** Existence checks resolve relations through Postgres's `to_regclass` / `pg_catalog`, so they honour the connection's `search_path` and accept schema-qualified names (e.g. `"reporting.users"`). The check looks in the same place the subsequent DDL will run, not blindly across every schema. Note that table, column, index, and constraint **names are written directly into the SQL statement**. SQL placeholders (`$1`, `$2`, …) can only stand in for _values_ (data), never for identifiers like table or column names, so those names can't be parameterized and must be concatenated in. The same is true of the **column types, default values, and constraint definitions** you pass (e.g. `columnType`, `defaultValue`, the `columns` map values, and the `constraints` strings). These are interpolated directly too, **not** parameterized, so a value-shaped argument like `defaultValue` is _not_ safe to build from user input. Treat all of them as trusted, code-defined values. Don't build them from untrusted input.
 
 **Available Helpers:**
 
@@ -970,7 +1065,7 @@ The `helpers` object, passed as the second argument to `beforeSchema` and `after
 - **`addColumn(client, tableName, columnName, columnType, defaultValue?)`**: Adds a column to a table if it doesn't exist. Throws an error if the table does not exist.
   - `defaultValue` (optional): A default value for the new column.
 - **`removeColumn(client, tableName, columnName)`**: Removes a column from a table if it exists. Throws an error if the table does not exist. Logs a message if the column doesn't exist.
-- **`addIndex(client, tableName, indexName, columns, unique?)`**: Adds an index to a table if it doesn't exist. Throws an error if the table does not exist.
+- **`addIndex(client, tableName, indexName, columns, unique?)`**: Adds an index to a table if it doesn't exist. Throws an error if the table does not exist, or if the `indexName` collides with an existing relation in the table's schema that isn't this index. (In Postgres, indexes share one namespace with tables, views, sequences, etc. per schema, so an index name must be unique across all of them. A clash with another table's index _or_ a non-index relation is a conflict.)
   - `columns`: An array of column names to include in the index.
   - `unique` (optional, default `false`): Whether to create a unique index.
 - **`removeIndex(client, indexName)`**: Removes an index if it exists. Logs a message if the index doesn't exist.
@@ -1054,7 +1149,9 @@ CREATE TABLE IF NOT EXISTS migration_status (
 )
 ```
 
-The `started_at`, `attempts`, and `last_error` columns are observability aids that make a stuck or repeatedly-deferred migration debuggable straight from the table. The `metadata` column holds freeform JSON the migration persists for itself. See [Metadata & Checkpoints](#metadata--checkpoints). `attempts` increments at the start of every attempt, including attempts that `defer()` or error, not just successful ones (note: the distributed-mode `runDataMigrationJobOnly` path does not increment it). `started_at` is stamped once on the first attempt, and `last_error` is set on any failure or `defer()` and cleared on successful completion. Existing tables created by older versions (prior to 4.0.0) are upgraded automatically (`ADD COLUMN IF NOT EXISTS`) the next time the migration system initializes.
+The `started_at`, `attempts`, and `last_error` columns are observability aids that make a stuck or repeatedly-deferred migration debuggable straight from the table. The `metadata` column holds freeform JSON the migration persists for itself. See [Metadata & Checkpoints](#metadata--checkpoints). `attempts` increments at the start of every attempt that actually begins work, including attempts that `defer()` or error, not just successful ones. There are two exceptions: an attempt that is already aborted, via shutdown signal or lock loss, _before_ this migration's schema phase starts does no work, so it does **not** increment `attempts` and leaves the prior `last_error` intact. The distributed-mode `runDataMigrationJobOnly` path also never increments it. `started_at` is stamped once on the first attempt, and `last_error` is set on any failure or `defer()` and cleared on successful completion. Existing tables created by older versions (prior to 4.0.0) are upgraded automatically (`ADD COLUMN IF NOT EXISTS`) the next time the migration system initializes.
+
+You can also read these rows programmatically with `await manager.getMigrationStatus()`, which returns a typed `MigrationStatus[]` (the same data the CLI `status` command renders), useful for building your own dashboards or health checks. It reflects the raw table, ordered by `completed_at`, so it returns **every** row in `migration_status` rather than filtering to your currently registered list. In practice these are the same set, since migrations are normally kept around once applied. The only time they diverge is if you've renamed or deleted an old migration. In that case, its row lingers, so cross-reference against your migrations array if you need to exclude those.
 
 ### migration_lock
 
@@ -1073,12 +1170,23 @@ The lock system ensures that only one `runSchemaChanges` process can execute at 
 
 #### Lock Lifecycle and Cleanup
 
-- **Owner (`locked_by`)** is a per-process identifier of the form `<host>-<pid>-<timestamp>`, where `<host>` is `process.env.HOSTNAME`, falling back to `os.hostname()`. `lock_name` is a separate column and is always the constant `"database_migrations"`.
+Both lock knobs are optional and ship with sensible defaults. Pass them as the third argument to the `MigrationManager` constructor (`new MigrationManager(pool, logger?, opts?)`) only when you need to tune the lock's timing, for example, lengthening the lease for unusually long-running phases:
+
+```typescript
+const manager = new MigrationManager(pool, consoleLogger, {
+  lockExpirySeconds: 600, // lease window — how long the lock stays valid (default 300)
+  lockRenewalSeconds: 120, // how often it's renewed (default 60); must be ≤ half the lease
+});
+```
+
+Each knob is detailed below.
+
+- **Owner (`locked_by`)** is a per-process identifier of the form `<host>-<pid>-<timestamp>`, where `<host>` is `process.env.HOSTNAME`, falling back to `os.hostname()` (and to the literal `"unknown"` if both are empty). `lock_name` is a separate column and is always the constant `"database_migrations"`.
 - **Lease Window (`lockExpirySeconds`):** How long an acquired lock stays valid before another process may take it over. Default `300` (5 minutes), configurable via the `MigrationManager` constructor.
 - **Renewal (`lockRenewalSeconds`):** While `runSchemaChanges` is running, the lock's `lock_expires_at` is pushed forward every `lockRenewalSeconds` (default `60`, configurable via the `MigrationManager` constructor). The constructor **validates** this against the lease: `lockRenewalSeconds` must be a positive, finite number no greater than **half** `lockExpirySeconds`, so the lease can survive at least one missed renewal. A value outside that range (or a non-positive/non-finite `lockExpirySeconds`) throws at construction rather than silently risking concurrent migrations.
 - **Normal Release:** The lock row is deleted in a `finally` block when `runSchemaChanges` finishes (success or failure).
 - **Crash Recovery:** If a process dies without releasing the lock, the row remains until `lock_expires_at` passes. The next runner then takes it over (the stale row is overwritten, not left forever). The takeover hinges on detecting the unique-violation on re-insert by its SQLSTATE code (`23505`), not by parsing the error text, so it works regardless of the server's `lc_messages` locale. In practice the lock self-heals within one lease window (`lockExpirySeconds`, default ~5 minutes) of a crash.
-- **Caveat:** If a single data migration runs longer than `lockExpirySeconds` **and** renewal stops (e.g. the renewal timer is starved or the event loop is blocked long enough to miss every renewal), another process could acquire the lock and run concurrently. Lock-loss is detected at phase boundaries (and renewals are reactive, not preventive), so keep individual phases well under the lease window, or raise the renewal cadence / lengthen the lease, for long-running work. **Long-running data migrations should also poll `ctx.signal.aborted` (or listen for its `"abort"` event) and wind down promptly. Stop work and return.** A migration that watches the signal shrinks the concurrency window. One that ignores it keeps running on the pool until it finishes, since **its own in-flight data SQL isn't fenced by the lock**. That's the one thing Strataline can't gate. Strataline's own state writes _are_ fenced (a write after the lock is lost no-ops, see [Graceful Shutdown & Cancellation](#graceful-shutdown--cancellation)), and it won't run `afterSchema` or mark completion without the lock. So the worst case is duplicated/again-idempotent data work, never a half-applied schema or a falsely-completed migration.
+- **Caveat:** If a single data migration runs longer than `lockExpirySeconds` **and** renewal stops (e.g. the renewal timer is starved or the event loop is blocked long enough to miss every renewal), another process could acquire the lock and run concurrently. Lock loss is detected three converging ways: at renewal, on a lapsed lease during renewal failures, and synchronously at every Strataline state write (the write fence). See the full list under [Graceful Shutdown & Cancellation](#graceful-shutdown--cancellation). Renewals are reactive, not preventive, so keep individual phases well under the lease window, or raise the renewal cadence / lengthen the lease, for long-running work. **Long-running data migrations should also poll `ctx.signal.aborted` (or listen for its `"abort"` event) and wind down promptly. Stop work and return.** A migration that watches the signal shrinks the concurrency window. One that ignores it keeps running on the pool until it finishes, since **its own in-flight data SQL isn't fenced by the lock**. That's the one thing Strataline can't gate. Strataline's own state writes _are_ fenced (a write after the lock is lost no-ops, see [Graceful Shutdown & Cancellation](#graceful-shutdown--cancellation)), and it won't run `afterSchema` or mark completion without the lock. So the worst case is duplicated/again-idempotent data work, never a half-applied schema or a falsely-completed migration.
 
 ## Development and Test Database Instances Utilities
 
@@ -1156,10 +1264,13 @@ testDb.isReady();
 // so guard the result if you call them outside the normal start()/stop() flow.
 const pool = testDb.getPool();
 
-// Or get connection credentials for direct connection
+// Or get connection credentials for direct connection. Returns
+// { host, port, database, user, password }, or null until start() has completed.
 const credentials = testDb.getCredentials();
 
-// Reset the database (drops all tables and reapplies migrations if provided)
+// Reset the database (drops all tables in the `public` schema and reapplies
+// migrations if provided). Note: only the `public` schema is cleared — tables
+// in other schemas (e.g. schema-qualified migrations) are left in place.
 await testDb.reset();
 
 // Stop the database and clean up resources
@@ -1171,7 +1282,9 @@ await testDb.stop();
 You can use the built-in console logger or implement your own:
 
 ```typescript
-// Use the built-in console logger with options
+// Use the built-in console logger with options.
+// Defaults: createTestDBConsoleLogger(pgVerbose = false, migrateVerbose = true),
+// so PostgreSQL server logs are hidden unless you opt in (errors always show).
 const testDb = new TestDatabaseInstance({
   logger: createTestDBConsoleLogger(
     true, // true enables verbose PostgreSQL logs
@@ -1195,6 +1308,8 @@ const customLogger = (
   console.log(`[${type.toUpperCase()}] ${message}`);
 };
 ```
+
+This logger signature is exported as `TestDBLoggerFunction` if you prefer to annotate your logger with the named type instead of writing the shape inline.
 
 ##### Migration Logging
 
@@ -1276,6 +1391,7 @@ It uses the same embedded PostgreSQL binaries as Strataline's Test DB Instance, 
 
 - **For local development, you do _not_ need to install PostgreSQL manually.**
 - The dev database server (`bun run dev:db`) uses [@embedded-postgres](https://www.npmjs.com/package/@embedded-postgres) to provide platform-specific PostgreSQL 18 binaries via npm.
+  - _Note: Strataline currently depends on a **pre-release** (beta) of `embedded-postgres` for its PostgreSQL 18 binaries, and the version range (`^18.4.0-beta.17`) can resolve forward to later 18.x betas. This only affects the local embedded dev/test databases, never your production instance, but pin the exact version in your own `package.json` if you want fully reproducible local builds._
 - _Note: The embedded dev database does **not** bundle `pg_upgrade`. When we bump the embedded version in the future, you may need to delete your local data directory (`pgdata/`) and let it reinitialize. This is usually fine for dev/test workflows._
 - **Production deployments** still require a managed PostgreSQL 18+ instance, and upgrades must be handled manually by your ops team.
 
@@ -1377,7 +1493,10 @@ You can customize logging behavior using the built-in console logger:
 ```typescript
 import { createDevDBConsoleLogger } from "strataline/local-dev-db-server";
 
-// Create a logger with custom verbosity settings
+// Create a logger with custom verbosity settings.
+// Defaults: createDevDBConsoleLogger(pgVerbose = true, setupVerbose = true) —
+// note both default to verbose here, unlike createTestDBConsoleLogger whose
+// pgVerbose defaults to false.
 const logger = createDevDBConsoleLogger(
   true, // pgVerbose: show PostgreSQL server logs
   true, // setupVerbose: show setup/initialization logs
@@ -1392,6 +1511,8 @@ const customLogger = (
   console.log(`[${type.toUpperCase()}] ${message}`);
 };
 ```
+
+This logger signature is exported as `DevDBLoggerFunction`, and the `onExit` callback type as `DevDBExitHandler` (`(exitCode: number) => void`), if you prefer the named types over writing the shapes inline.
 
 #### Data Persistence
 
@@ -1417,7 +1538,7 @@ The dev server includes robust process management:
 - **PID File Management**: Tracks the server process ID for reliable cleanup
 - **Signal Handling**: Responds to `SIGINT`, `SIGTERM`, and `SIGHUP` signals
 
-#### Using with Your Application
+#### Using With Your Application
 
 Once the dev server is running, configure your application to connect to it:
 

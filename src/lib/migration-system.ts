@@ -9,7 +9,11 @@ import { type SchemaHelpers, createSchemaHelpers } from "./schema-helpers";
  */
 
 // Migration phase types
-export type SchemaPhase = "beforeSchema" | "afterSchema";
+// SchemaPhase is internal-only: it labels the two transactional schema phases
+// for runMigrationPhase. It is intentionally NOT exported — it isn't the type of
+// any public field (the logger's `stage`, for instance, is a free-form string and
+// the data phase logs "dataMigration", which isn't a SchemaPhase member).
+type SchemaPhase = "beforeSchema" | "afterSchema";
 export type MigrationMode = "job" | "distributed";
 
 // Migration callback types. Generic over the migration's return type so the
@@ -149,7 +153,10 @@ export interface DataMigrationJobResult<D = unknown> {
   data?: D;
 }
 
-export interface DataMigrationPhaseResult<D = unknown> {
+// Internal result of the data-migration phase. Only ever returned by the
+// private runDataMigration; not part of the public surface (the public
+// equivalent for workers is DataMigrationJobResult).
+interface DataMigrationPhaseResult<D = unknown> {
   status: "success" | "deferred" | "error";
   reason?: string;
   data?: D;
@@ -201,14 +208,10 @@ export interface MigrationResult<D_ALL = Record<string, unknown>> {
   // Note: Not present for controlled migration phase errors (those only populate 'reason')
   error?: Error;
 
-  // Data returned by successful migrations in this run
-  migrationData?: D_ALL;
+  // Data returned by successful migrations in this run. Always present (every
+  // return path sets it); it is an empty object when no migration returned data.
+  migrationData: D_ALL;
 }
-
-/**
- * Migration logger interface
- */
-export type MigrationLogger = Logger;
 
 /**
  * Migration Manager - handles running migrations and tracking their status
@@ -229,15 +232,15 @@ export class MigrationManager {
   // different payload/return type — there's no single generic that fits a mix
   // of them, so the element type is intentionally `any`. (`unknown` doesn't
   // work here: it can't satisfy each migration's specific payload type.)
-  // Type-safety is kept where it matters: the public register() and
-  // runSchemaChanges() generics check each migration as it's added and run.
+  // Type-safety is kept where it matters: the public register() generic checks
+  // each migration as it's added.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private migrations: Migration<any, any>[] = [];
   private lockId: string | null = null;
   private lockRenewalInterval: NodeJS.Timeout | null = null;
   private lockRenewalSeconds: number; // Configurable lock renewal interval in seconds
   private lockExpirySeconds: number; // Configurable lock lease window in seconds
-  private logger: MigrationLogger;
+  private logger: Logger;
   private initialized = false;
   // Abort controller scoped to a single runSchemaChanges call. Aborted on a
   // caller-supplied shutdown signal or when the lock is lost during renewal.
@@ -411,7 +414,7 @@ export class MigrationManager {
    */
   constructor(
     pool: Pool,
-    logger: MigrationLogger = consoleLogger,
+    logger: Logger = consoleLogger,
     opts?: { lockRenewalSeconds?: number; lockExpirySeconds?: number },
   ) {
     this.pool = pool;
@@ -610,7 +613,7 @@ export class MigrationManager {
 
   /**
    * Run schema changes for all pending migrations
-   * @param mode Optional migration mode that will be passed to data migrations
+   * @param mode Migration mode ("job" | "distributed") passed to data migrations
    * @returns A structured result object with details about the migration run
    */
 
@@ -667,7 +670,7 @@ export class MigrationManager {
     // Set up the run-scoped abort controller now that we hold the lock. A run
     // can be aborted by either:
     //  - the caller's shutdown signal (graceful -> reported as "aborted")
-    //  - lock loss detected during renewal (unsafe -> reported as "error")
+    //  - lock loss detected during renewal (unsafe -> reported as "lock_lost")
     this.lockLost = false;
     this.runAbortController = new AbortController();
     const externalSignal = opts?.signal;
@@ -740,7 +743,7 @@ export class MigrationManager {
       let lastAttemptedMigration: string | undefined;
 
       // Builds the result when a run is interrupted (aborted or lock lost).
-      // Lock loss is unsafe, so it's surfaced as "error"; a caller-requested
+      // Lock loss is unsafe, so it's surfaced as "lock_lost"; a caller-requested
       // shutdown is a benign "aborted".
       const buildInterruptedResult = (): MigrationResult => {
         const previouslyAppliedMigrations = fullyAppliedIds.filter(
@@ -951,7 +954,7 @@ export class MigrationManager {
   /**
    * Run a single migration's schema changes
    * @param migration The migration to run
-   * @param mode Optional migration mode to pass to data migration
+   * @param mode Migration mode to pass to data migration
    * @returns A promise that resolves to a status object with optional data
    */
 
@@ -970,9 +973,6 @@ export class MigrationManager {
     taskLogger.info({
       message: `Running migration: ${migration.description}`,
     });
-
-    // Create schema helpers with the task-specific logger
-    const helpers = createSchemaHelpers(taskLogger);
 
     // Ensure migration record exists in the status table, and capture the
     // current phase flags so we can skip phases that are already applied.
@@ -1023,7 +1023,11 @@ export class MigrationManager {
       // hold the lock means we no longer do — treat it as a lock loss rather than
       // creating a tracking row (or erroring) without exclusivity.
       const now = Math.floor(Date.now() / 1000);
-      const insertParams: unknown[] = [migration.id, migration.description, now];
+      const insertParams: unknown[] = [
+        migration.id,
+        migration.description,
+        now,
+      ];
       let insertFence = "";
 
       if (this.lockId) {
@@ -1108,12 +1112,7 @@ export class MigrationManager {
     // Step 1: Run schema changes before data migration if provided
     if (migration.beforeSchema) {
       try {
-        await this.runMigrationPhase(
-          migration,
-          "beforeSchema",
-          helpers,
-          taskLogger,
-        );
+        await this.runMigrationPhase(migration, "beforeSchema", taskLogger);
       } catch (err: unknown) {
         taskLogger.error({
           message: `[beforeSchema] Error in beforeSchema for migration ${migration.id}:`,
@@ -1220,12 +1219,7 @@ export class MigrationManager {
     // Step 3: Run schema changes after data migration if needed
     if (migration.afterSchema) {
       try {
-        await this.runMigrationPhase(
-          migration,
-          "afterSchema",
-          helpers,
-          taskLogger,
-        );
+        await this.runMigrationPhase(migration, "afterSchema", taskLogger);
       } catch (err: unknown) {
         taskLogger.error({
           message: `[afterSchema] Error in afterSchema for migration ${migration.id}:`,
@@ -1295,9 +1289,18 @@ export class MigrationManager {
   private async runMigrationPhase<P = Record<string, unknown>>(
     migration: Migration<P>,
     phase: SchemaPhase,
-    helpers: SchemaHelpers,
     logger: Logger,
   ): Promise<void> {
+    // The helpers handed to the user's phase callback are tagged with this
+    // phase as the `stage`, so their logs come out as `[id] [phase] ...`
+    // automatically, without the callback having to set anything. Internal
+    // phase logging below stays on `logger` (task only); those lines already
+    // embed the phase name in the message text, and the [phase]-prefixed
+    // reason/last_error strings elsewhere are a parsed contract we don't touch.
+    const phaseHelpers: SchemaHelpers = createSchemaHelpers(
+      createPrefixedLogger(logger, { stage: phase }),
+    );
+
     const client = await this.pool.connect();
 
     try {
@@ -1325,9 +1328,9 @@ export class MigrationManager {
 
       // Run the appropriate phase function
       if (phase === "beforeSchema" && migration.beforeSchema) {
-        await migration.beforeSchema(client, helpers);
+        await migration.beforeSchema(client, phaseHelpers);
       } else if (phase === "afterSchema" && migration.afterSchema) {
-        await migration.afterSchema(client, helpers);
+        await migration.afterSchema(client, phaseHelpers);
       }
 
       // Mark the phase applied, fenced on still holding the lock — and because
@@ -1454,6 +1457,13 @@ export class MigrationManager {
       });
       loadedMetadata = null;
     }
+
+    // The logger handed to the migration function as ctx.logger is tagged with
+    // the data phase as `stage`, so the migration's own log calls come out as
+    // `[id] [dataMigration] ...` without it having to set anything. Internal
+    // bookkeeping logs in this method keep using `logger` (task only) and embed
+    // the phase in the message text themselves, to avoid a doubled prefix.
+    const ctxLogger = createPrefixedLogger(logger, { stage: "dataMigration" });
 
     return new Promise<DataMigrationPhaseResult<TReturn>>((resolve) => {
       let callbackCalled = false;
@@ -1602,7 +1612,7 @@ export class MigrationManager {
 
           // Pass the task-specific logger that already prefixes messages with the task ID
           const migrationFnExecution = migrationFn(this.pool, {
-            logger, // This is the task-specific logger created in runSingleMigration
+            logger: ctxLogger, // task logger, additionally tagged with stage "dataMigration"
             complete: completeCallback,
             defer: deferCallback,
             mode,

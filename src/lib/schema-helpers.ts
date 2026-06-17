@@ -65,7 +65,12 @@ export interface SchemaHelpers {
 }
 
 /**
- * Create schema helpers with the specified logger
+ * Create schema helpers with the specified logger.
+ *
+ * @internal Used by the migration system to build the `helpers` object passed
+ * to beforeSchema/afterSchema callbacks. Not part of the public package surface
+ * (only the `SchemaHelpers` type is exported); migrations receive a ready-made
+ * `helpers` object and should not call this directly.
  */
 export function createSchemaHelpers(
   logger: Logger = consoleLogger,
@@ -281,8 +286,7 @@ export function createSchemaHelpers(
 
       const existing = rows[0];
       // Both ordinary ('i') and partitioned ('I') indexes count as an index.
-      const isIndex =
-        existing?.relkind === "i" || existing?.relkind === "I";
+      const isIndex = existing?.relkind === "i" || existing?.relkind === "I";
 
       if (!existing) {
         // Nothing of this name in the table's schema — create it.

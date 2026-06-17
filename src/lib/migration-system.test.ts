@@ -1136,7 +1136,8 @@ describe("MigrationManager", () => {
       let afterSchemaRan = false;
       const m: Migration = {
         id: "fence_zombie_001",
-        description: "Ignores the signal and completes after the lock is stolen",
+        description:
+          "Ignores the signal and completes after the lock is stolen",
         migration: async (_pool, ctx) => {
           resolveStarted();
           await canProceed;
@@ -1393,7 +1394,8 @@ describe("MigrationManager", () => {
 
       const m: Migration = {
         id: "fence_phase_001",
-        description: "Creates a table, then loses the lock before the flag write",
+        description:
+          "Creates a table, then loses the lock before the flag write",
         beforeSchema: async (client) => {
           // Real DDL inside the phase transaction.
           await client.query(
@@ -2169,42 +2171,63 @@ describe("MigrationManager", () => {
   test("constructor rejects a renewal interval that is too long for the lease", () => {
     // Renewal must be at most half the lease window, otherwise the lock can
     // expire before a renewal fires. Default lease is 300s -> max renewal 150s.
-    expect(() => new MigrationManager(pool, testLogger, {
-      lockRenewalSeconds: 200,
-    })).toThrow(/lockRenewalSeconds/);
+    expect(
+      () =>
+        new MigrationManager(pool, testLogger, {
+          lockRenewalSeconds: 200,
+        }),
+    ).toThrow(/lockRenewalSeconds/);
 
     // Non-positive renewal is also invalid.
-    expect(() => new MigrationManager(pool, testLogger, {
-      lockRenewalSeconds: 0,
-    })).toThrow(/lockRenewalSeconds/);
+    expect(
+      () =>
+        new MigrationManager(pool, testLogger, {
+          lockRenewalSeconds: 0,
+        }),
+    ).toThrow(/lockRenewalSeconds/);
 
     // Non-finite values are rejected for both knobs, each with its own message.
-    expect(() => new MigrationManager(pool, testLogger, {
-      lockRenewalSeconds: Number.POSITIVE_INFINITY,
-    })).toThrow(/lockRenewalSeconds must be a positive, finite number/);
+    expect(
+      () =>
+        new MigrationManager(pool, testLogger, {
+          lockRenewalSeconds: Number.POSITIVE_INFINITY,
+        }),
+    ).toThrow(/lockRenewalSeconds must be a positive, finite number/);
 
-    expect(() => new MigrationManager(pool, testLogger, {
-      lockExpirySeconds: Number.NaN,
-    })).toThrow(/lockExpirySeconds must be a positive, finite number/);
+    expect(
+      () =>
+        new MigrationManager(pool, testLogger, {
+          lockExpirySeconds: Number.NaN,
+        }),
+    ).toThrow(/lockExpirySeconds must be a positive, finite number/);
   });
 
   test("constructor validates a custom lease and the renewal relative to it", () => {
     // A custom (shorter) lease is allowed...
-    expect(() => new MigrationManager(pool, testLogger, {
-      lockExpirySeconds: 20,
-      lockRenewalSeconds: 5,
-    })).not.toThrow();
+    expect(
+      () =>
+        new MigrationManager(pool, testLogger, {
+          lockExpirySeconds: 20,
+          lockRenewalSeconds: 5,
+        }),
+    ).not.toThrow();
 
     // ...but the renewal must still be <= half of THAT lease (10s here).
-    expect(() => new MigrationManager(pool, testLogger, {
-      lockExpirySeconds: 20,
-      lockRenewalSeconds: 15,
-    })).toThrow(/lockRenewalSeconds/);
+    expect(
+      () =>
+        new MigrationManager(pool, testLogger, {
+          lockExpirySeconds: 20,
+          lockRenewalSeconds: 15,
+        }),
+    ).toThrow(/lockRenewalSeconds/);
 
     // A non-positive lease is invalid.
-    expect(() => new MigrationManager(pool, testLogger, {
-      lockExpirySeconds: 0,
-    })).toThrow(/lockExpirySeconds/);
+    expect(
+      () =>
+        new MigrationManager(pool, testLogger, {
+          lockExpirySeconds: 0,
+        }),
+    ).toThrow(/lockExpirySeconds/);
   });
 
   test(
@@ -2486,7 +2509,9 @@ describe("MigrationManager", () => {
         `);
 
         // Put schema a first so a bare "shared_idx" resolves to idx_scope_a's.
-        await client.query(`SET search_path = idx_scope_a, idx_scope_b, public;`);
+        await client.query(
+          `SET search_path = idx_scope_a, idx_scope_b, public;`,
+        );
 
         // Must still create the index on idx_scope_b.t despite the same-named
         // index already existing in idx_scope_a (which is earlier on the path).
@@ -2594,9 +2619,9 @@ describe("MigrationManager", () => {
     test("removeIndex should log and rethrow if the lookup errors", async () => {
       // A malformed identifier ("too many dotted names") makes to_regclass raise
       // rather than return NULL, exercising removeIndex's catch/rethrow path.
-      expect(
-        helpers.removeIndex(client, "a.b.c.d"),
-      ).rejects.toThrow(/too many dotted names/i);
+      expect(helpers.removeIndex(client, "a.b.c.d")).rejects.toThrow(
+        /too many dotted names/i,
+      );
     });
 
     // --- Tests for addForeignKey ---
@@ -2810,7 +2835,9 @@ describe("MigrationManager", () => {
           "non_existent_ref_table",
           "id",
         ),
-      ).rejects.toThrow(/Referenced table non_existent_ref_table does not exist/);
+      ).rejects.toThrow(
+        /Referenced table non_existent_ref_table does not exist/,
+      );
     });
 
     // --- Tests for removeConstraint ---
