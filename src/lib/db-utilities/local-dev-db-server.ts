@@ -143,6 +143,21 @@ export type DevDBLoggerFunction = TaggedLoggerFunction<
 export type DevDBExitHandler = (exitCode: number) => void;
 
 /**
+ * Which lifecycle a {@link LocalDevDBServer} instance is in.
+ *
+ * About this instance, not about the machine: a server left behind by a
+ * previous run reads as `stopped` here, because this object has never held it.
+ * See {@link LocalDevDBServer.getLifecycleState}.
+ */
+export type DevDBLifecycleState =
+  | "stopped"
+  | "starting"
+  | "running"
+  | "stopping"
+  /** A failed `start()` left a child that outlived even SIGKILL. */
+  | "unstoppable";
+
+/**
  * Console-based logger implementation for LocalDevDBServer
  * @param pgVerbose Whether to log verbose PostgreSQL messages
  * @param setupVerbose Whether to log verbose setup messages
@@ -314,18 +329,23 @@ export class LocalDevDBServer {
   // to be added to the on-disk format to get one.
   private pidRecord: string | null = null;
 
-  // Concurrent callers share the same shutdown.
+  // Concurrent callers share the same shutdown. Joined rather than refused,
+  // unlike startInFlight — see stop() for why the two differ.
   private shutdownInFlight: Promise<void> | null = null;
 
-  // Concurrent callers share the same start, for the reason stop() shares a
-  // shutdown and then some. The already-running guard reads pgProcess, which
-  // nothing sets until the spawn several awaits in, so without this two
-  // overlapping calls both find the data directory free and both spawn: the
-  // second reference overwrites the first, and the first postmaster is then
-  // reachable by nothing — not stop(), not the "exit" hook, not
-  // cleanupFailedStart — so it outlives this process still holding the port
-  // and the data directory. Which is the outcome this whole module exists to
-  // prevent, arrived at from inside rather than from a previous run.
+  // What start() refuses a second start against, rather than what a second
+  // start joins. The already-running guard reads pgProcess, which nothing sets
+  // until the spawn several awaits in, so without this record two overlapping
+  // calls both find the data directory free and both spawn: the second
+  // reference overwrites the first, and the first postmaster is then reachable
+  // by nothing — not stop(), not the "exit" hook, not cleanupFailedStart — so
+  // it outlives this process still holding the port and the data directory.
+  // Which is the outcome this whole module exists to prevent, arrived at from
+  // inside rather than from a previous run.
+  //
+  // Refused rather than joined, unlike shutdownInFlight. A second start is
+  // the shape a lost lifecycle takes and costs only a retry to report, while
+  // a stop that refused would leave a server running. See stop().
   private startInFlight: Promise<void> | null = null;
 
   // The child a deliberate shutdown is aimed at, held until its close handler
@@ -400,8 +420,7 @@ export class LocalDevDBServer {
     this.pidFile = config.pidFile;
     // Wrapped on the way in, so nothing below has to remember to guard it and
     // a failure degrades instead of ending the process. See makeSafeTaggedLogger.
-    this.logger =
-      config.logger && makeSafeTaggedLogger(config.logger, "error");
+    this.logger = config.logger && makeSafeTaggedLogger(config.logger, "error");
     this.onExit = config.onExit;
     this.logConnections = config.logConnections ?? false;
     this.currentUser = getCurrentUser();
@@ -1636,7 +1655,6 @@ export class LocalDevDBServer {
     );
   }
 
-
   /** Stops a verified previous server or rejects when its identity is unsafe. */
   private async cleanupExistingProcess(): Promise<void> {
     const postmasterPidFile = join(this.pgDataDir, "postmaster.pid");
@@ -1887,17 +1905,119 @@ export class LocalDevDBServer {
     }
   }
 
+  /**
+   * Which lifecycle this instance is in, decided the same way `start()` and
+   * `stop()` decide whether to refuse.
+   *
+   * There to be asked BEFORE either of them, since both refuse an overlap by
+   * throwing and neither is a way to find out. A host with more than one route
+   * into a stop — a signal handler and its own teardown, say — has no other
+   * way to tell "a shutdown is already running" from "a start is, and this
+   * call is about to throw".
+   *
+   * A snapshot, and only the instance's own view. It says nothing about a
+   * server left by a previous run, which is {@link getLocalDevDBServerStatus}'s
+   * question and is answered from the PID records rather than from memory. Nor
+   * does it survive an await: the answer can be stale by the time it is read,
+   * so it belongs in a log line or a branch that tolerates being wrong, not in
+   * a check that a subsequent call is relied on to pass.
+   *
+   * - `stopped` — nothing running. `start()` starts, `stop()` resolves with
+   *   nothing to do.
+   * - `starting` — `start()` and `stop()` both throw. Await the start.
+   * - `running` — `stop()` stops it, `start()` logs and resolves.
+   * - `stopping` — `start()` throws, `stop()` joins the shutdown in flight.
+   * - `unstoppable` — a failed start left a child that outlived even SIGKILL.
+   *   `start()` throws, `stop()` runs the escalation against it again.
+   *
+   * `stopping` is the one asymmetric row, and {@link stop} says why: a stop
+   * that refuses would leave a server running, so it waits instead.
+   *
+   * `running` is decided from what Node reports about the child rather than
+   * from holding a reference to it, for the reason `start()` gives: a
+   * postmaster that died without signaling its children leaves them holding
+   * the inherited stdio pipes, and the reference outlives the server.
+   */
+  public getLifecycleState(): DevDBLifecycleState {
+    // Ordered as the guards are, so the answer and the refusal cannot
+    // disagree: a shutdown that is winding down a child still reads
+    // `stopping` rather than `running`.
+    if (this.shutdownInFlight || this.isCleaningUp) {
+      return "stopping";
+    }
+
+    if (this.startInFlight || this.startingUp) {
+      return "starting";
+    }
+
+    const proc = this.pgProcess;
+
+    // Ahead of the handle, which cannot see this. A failed start that could
+    // not kill its child keeps the reference deliberately, and start() refuses
+    // on it whether or not the child has since died — so reading the handle
+    // here would answer `running`, or `stopped` once it exits with its `close`
+    // still held back by an orphaned backend, and both of those rows promise a
+    // start() that in fact throws. This is exactly the state the method exists
+    // to report, since the call that would otherwise reveal it is the one
+    // throwing.
+    if (proc && this.unstoppableChild === proc) {
+      return "unstoppable";
+    }
+
+    return proc && proc.exitCode === null && proc.signalCode === null
+      ? "running"
+      : "stopped";
+  }
+
+  /**
+   * Stops the server. Idempotent, and joins a shutdown already running.
+   *
+   * Deliberately more forgiving than {@link start}, which refuses every
+   * overlap. Teardown is idempotent nearly everywhere for a reason — Node's
+   * own `net.Server.close()`, Go's `http.Server.Shutdown` — and it is a
+   * sharper reason here than convention: the two refusals fail in opposite
+   * directions. A `start()` that refuses leaves no server, which is visible
+   * and costs a retry. A `stop()` that refuses leaves a postmaster running,
+   * holding the port and the data directory, which is the exact outcome this
+   * module exists to prevent, and it would be produced by the one call whose
+   * whole job was to prevent it. So a second stop waits for the first rather
+   * than throwing into a host that may have nowhere left to handle it.
+   *
+   * What a joined caller gives up is knowing whose request stopped the server:
+   * the escalation belongs to whoever asked first, so a `stop()` joined to a
+   * `shutdown("SIGTERM")` resolves for a stop it had no part in, and a failure
+   * rejects both. Ask {@link getLifecycleState} before calling where that
+   * distinction matters. Nobody has to ask in order to be correct, which is
+   * the point of the leniency.
+   *
+   * Refused only against a start, which is not an overlap this can wait out:
+   * the escalation would race the spawn it is trying to stop. Await `start()`
+   * first.
+   */
   public async stop(): Promise<void> {
     if (this.startInFlight || this.startingUp) {
-      throw new Error("Cannot stop PostgreSQL server: server is currently starting.");
+      throw new Error(
+        "Cannot stop PostgreSQL server: server is currently starting.",
+      );
     }
+
     return this.handleGracefulShutdown(null);
   }
 
+  /**
+   * {@link stop} with `signal` recorded in the log, for a host stopping the
+   * server because it was itself signaled. The same call otherwise: identical
+   * refusals, and what reaches PostgreSQL is always the SIGINT to SIGQUIT to
+   * SIGKILL escalation, since `signal` says what happened to the host rather
+   * than what this server needs.
+   */
   public async shutdown(signal: NodeJS.Signals): Promise<void> {
     if (this.startInFlight || this.startingUp) {
-      throw new Error("Cannot stop PostgreSQL server: server is currently starting.");
+      throw new Error(
+        "Cannot stop PostgreSQL server: server is currently starting.",
+      );
     }
+
     return this.handleGracefulShutdown(signal);
   }
 
@@ -2655,22 +2775,23 @@ export class LocalDevDBServer {
   /**
    * Starts the PostgreSQL server and sets up users and databases.
    *
-   * Concurrent callers join the start already running rather than begin a
-   * second one — see {@link startInFlight}.
+   * A second call while one is already running, or while a shutdown is, is
+   * refused rather than queued — see {@link startInFlight}. An overlap is a
+   * caller that has lost track of which lifecycle it is in, and the two
+   * requests describe different end states; answering one of them silently
+   * would pick for the caller. Sequence them instead: await the first.
    */
   public async start(): Promise<void> {
     if (this.shutdownInFlight || this.isCleaningUp) {
-      throw new Error("Cannot start PostgreSQL server: server is currently stopping.");
+      throw new Error(
+        "Cannot start PostgreSQL server: server is currently stopping.",
+      );
     }
-    if (this.startInFlight || this.startingUp) {
-      throw new Error("Cannot start PostgreSQL server: server is already starting.");
-    }
-    return this.startOnce();
-  }
 
-  private async startOnce(): Promise<void> {
-    if (this.startInFlight) {
-      return this.startInFlight;
+    if (this.startInFlight || this.startingUp) {
+      throw new Error(
+        "Cannot start PostgreSQL server: server is already starting.",
+      );
     }
 
     // `finally` rather than the two-armed `then` handleGracefulShutdown uses:
@@ -2686,13 +2807,9 @@ export class LocalDevDBServer {
   }
 
   private async performStart(): Promise<void> {
-    // A start requested after a stop belongs to the next lifecycle. The child
-    // reference remains populated until shutdown's finalizer releases its PID
-    // record, so checking it before the shutdown settles would report the old
-    // server as already running and then fulfill while that server disappears.
-    if (this.shutdownInFlight) {
-      await this.shutdownInFlight;
-    }
+    // Nothing waits for a shutdown here. start() refuses one that is in
+    // flight, so this is only ever entered from a settled lifecycle: waiting
+    // would be waiting for a promise that has to be null to get this far.
 
     // On for the duration of this cycle, so the shared exit hook protects any
     // child created during startup. Shutdown removes it once no child remains.

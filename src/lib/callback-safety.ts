@@ -56,14 +56,14 @@ function reportLoggerFailure(error: unknown, description: string): void {
     }
 
     if (event !== null) {
-      let uncancelled = true;
+      let uncanceled = true;
       try {
-        uncancelled = scope.dispatchEvent(event);
+        uncanceled = scope.dispatchEvent(event);
       } catch {
-        // Dispatch failed, treat as uncancelled
+        // Dispatch failed, treat as uncanceled
       }
 
-      reportToConsole(uncancelled, error, description);
+      reportToConsole(uncanceled, error, description);
       return;
     }
   }

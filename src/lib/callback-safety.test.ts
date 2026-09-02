@@ -496,7 +496,7 @@ describe("reportLoggerFailure, through logSafely's last rung", () => {
     }
   });
 
-  it("does not fall on to reportError after an uncancelled dispatch", () => {
+  it("does not fall on to reportError after an uncanceled dispatch", () => {
     // In a browser reportError dispatches an error event of its own, so
     // calling it after our dispatch would notify every listener twice. The
     // console is the tail because it is the one place that cannot double.

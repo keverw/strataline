@@ -1536,7 +1536,7 @@ const customLogger = (
 
 > **If your process _is_ the server, you own every way it can end.** This library never exits your process, so a script whose whole job is to run the dev server has two things to wire: a signal handler that stops the server and exits, and an `onExit` that exits when PostgreSQL dies on its own. Omit the second and ordinary flow control takes over. With nothing left pending the script exits by itself, but with code `0`, reporting a crashed database as a clean run. Callers that legitimately carry on afterwards, such as tests or a provisioning step that stops the server and moves on, are exactly the ones that should not exit from there.
 
-This logger signature is exported as `DevDBLoggerFunction`, and the `onExit` callback type as `DevDBExitHandler` (`(exitCode: number) => void`), if you prefer the named types over writing the shapes inline. The constructor's configuration object is exported as `LocalDevDBServerConfig`.
+This logger signature is exported as `DevDBLoggerFunction`, and the `onExit` callback type as `DevDBExitHandler` (`(exitCode: number) => void`), if you prefer the named types over writing the shapes inline. The constructor's configuration object is exported as `LocalDevDBServerConfig`, and `getLifecycleState()`'s return type as `DevDBLifecycleState`.
 
 #### Data Persistence
 
@@ -1585,7 +1585,36 @@ On Windows, where Node maps these names to unconditional process termination rat
 
 `SIGKILL` is the exception there, and stays with Node. `pg_ctl` delivers signals through PostgreSQL's own emulated-signal pipe, which the server has to be healthy enough to service. The one signal that exists for a server too wedged to service anything is the one `pg_ctl` cannot deliver, and it reports success either way. Node maps `SIGKILL` to `TerminateProcess`, which is what a last resort has to be.
 
-`stop()` resolves once the server has actually stopped, rather than once shutdown has merely been requested, and it never exits the host process or calls `onExit`. That holds whether or not there was anything to stop, so a defensive `stop()` in test teardown is safe. Opposing lifecycle requests run in invocation order. A `start()` requested during shutdown waits and starts the next server, while a later `stop()` applies to that queued restart, so the last fulfilled request describes the final state.
+`stop()` resolves once the server has actually stopped, rather than once shutdown has merely been requested, and it never exits the host process or calls `onExit`. That holds whether or not there was anything to stop, so a defensive `stop()` in test teardown is safe as long as the start it is tearing down has been awaited.
+
+Overlapping lifecycle requests are not queued. `start()` rejects while a start or a shutdown is in flight, and `stop()` and `shutdown(signal)` reject while a start is. A second `stop()` is the exception: it joins the shutdown already running. Sequence them by awaiting the first, and ask `getLifecycleState()` when you need to know which one that is:
+
+```ts
+type DevDBLifecycleState =
+  | "stopped"
+  | "starting"
+  | "running"
+  | "stopping"
+  | "unstoppable";
+
+server.getLifecycleState(); // "running"
+```
+
+| State         | `start()`         | `stop()` / `shutdown(signal)` |
+| ------------- | ----------------- | ----------------------------- |
+| `stopped`     | starts a server   | resolves, nothing to stop     |
+| `starting`    | **rejects**       | **rejects**                   |
+| `running`     | logs and resolves | stops it                      |
+| `stopping`    | **rejects**       | joins the shutdown in flight  |
+| `unstoppable` | **rejects**       | runs the escalation again     |
+
+`unstoppable` is the state a failed `start()` leaves when the partially started server outlived even `SIGKILL`. The instance keeps the child rather than forgetting it, so `stop()` can try again, and `start()` refuses until it is gone. It is reported separately because the child's own exit status cannot distinguish it: an orphaned backend holding the inherited stdio pipes keeps the reference alive after the postmaster has died, which would otherwise read as `running` or `stopped` and promise a `start()` that in fact throws.
+
+Stopping is deliberately the forgiving one. The two refusals fail in opposite directions: a `start()` that rejects leaves no server, which is visible and costs a retry, while a `stop()` that rejected would leave a postmaster holding the port and the data directory, produced by the one call whose whole job was to prevent that. Teardown is idempotent nearly everywhere for the same reason, `net.Server.close()` and Go's `http.Server.Shutdown` included.
+
+What a joined caller gives up is knowing whose request stopped the server. The escalation belongs to whoever asked first, so a `stop()` joined to a `shutdown("SIGTERM")` resolves for a stop it had no part in, and a failure rejects both. Check `getLifecycleState()` first where that matters. Nothing has to check in order to be correct, which is the point.
+
+This is the instance's own view and nothing more. A server left behind by a previous run reads as `stopped`, because this object has never held it. That question is `getLocalDevDBServerStatus()`, exported from `strataline/local-dev-db-server`, which reads the PID records rather than memory. It is also a snapshot that does not survive an `await`, so use it for a log line or a branch that tolerates being wrong, not as a check that some later call is relied on to pass.
 
 `stop()` waits for the child's `close` event rather than only for the PID to disappear, so the PID file has been released by the time it resolves. That wait is bounded. `close` reports the stdio pipes closed as well as the process exited, and PostgreSQL's backends inherit those pipes: a postmaster wedged badly enough to need `SIGKILL` dies without signaling its children, which go on holding them with nothing left to reap them. Once the process itself is confirmed gone, strataline finishes the cleanup itself rather than wait on an event that may never arrive, so a shutdown that worked is never reported as one that failed.
 
@@ -1594,15 +1623,37 @@ On Windows, where Node maps these names to unconditional process termination rat
 ```ts
 const server = new LocalDevDBServer(config);
 
+// Held, not just awaited. A signal can arrive during startup, and shutdown()
+// rejects while a start is in flight, so the handler has to wait for the start
+// to settle rather than call shutdown() into a refusal.
+const startup = server.start().then(
+  () => null,
+  (error: unknown) => error,
+);
+
+startup.then((error) => {
+  if (error !== null) {
+    console.error(`Fatal error: ${error}`);
+    process.exit(1);
+  }
+});
+
 let stopping: Promise<void> | null = null;
 
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
   process.on(signal, () => {
     // Repeat signals join the shutdown already running. Ctrl+C twice must not
     // exit part-way through the first.
-    stopping ??= server
-      .shutdown(signal)
-      .then(() => process.exit(0))
+    stopping ??= startup
+      .then((error) => {
+        // A failed start has already torn its own child down, and the handler
+        // above is about to exit. Nothing here to stop.
+        if (error !== null) {
+          return;
+        }
+
+        return server.shutdown(signal).then(() => process.exit(0));
+      })
       // shutdown() rejects when the server could not be stopped. Handle it, or
       // the rejection is unhandled and what says which server is still running
       // arrives as the first line of a crash dump.
@@ -1612,9 +1663,9 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
       });
   });
 }
-
-await server.start();
 ```
+
+Waiting for the start is the point of that shape, not incidental to it. Calling `shutdown(signal)` straight from the handler rejects for the whole of `start()`, which on a cold run is its longest stretch, and a script that then exits leaves the postmaster to the synchronous `exit` hook. That hook only `SIGKILL`s: no shutdown checkpoint, a stale `postmaster.pid`, and the SysV shared memory and semaphores PostgreSQL releases on a clean exit and not on a hard kill. The cost is that a signal arriving during a first-run `initdb` waits for it, since trapping the signal suppresses Node's own termination.
 
 > **Wire this, or a supervisor orphans your database.** An untrapped `SIGTERM` terminates Node immediately without running any JavaScript, including the force-kill hook below. `docker stop`, systemd, or any process manager then leaves the postmaster running, holding the port and the data directory. `Ctrl+C` at a terminal usually survives it because the signal goes to the whole foreground process group and PostgreSQL gets its own copy, but that is luck rather than design.
 

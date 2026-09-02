@@ -562,6 +562,37 @@ describe("LocalDevDBServer", () => {
     await stopping;
   }, 30000);
 
+  it("refuses overlapping lifecycle calls and reports which one is running", async () => {
+    // The refusals throw, so getLifecycleState() is the only way to tell a
+    // shutdown already in flight from a start that is about to reject.
+    expect(server.getLifecycleState()).toBe("stopped");
+
+    const starting = server.start();
+
+    expect(server.getLifecycleState()).toBe("starting");
+    await expect(server.start()).rejects.toThrow(/already starting/);
+    await expect(server.stop()).rejects.toThrow(/currently starting/);
+    await expect(server.shutdown("SIGTERM")).rejects.toThrow(
+      /currently starting/,
+    );
+
+    await starting;
+
+    expect(server.getLifecycleState()).toBe("running");
+
+    const stopping = server.stop();
+
+    expect(server.getLifecycleState()).toBe("stopping");
+    // A start still refuses, but a second stop joins rather than throwing: a
+    // stop that refused would leave the server running, which is the failure
+    // the call exists to prevent.
+    await expect(server.start()).rejects.toThrow(/currently stopping/);
+    await Promise.all([stopping, server.stop(), server.shutdown("SIGINT")]);
+
+    expect(server.getLifecycleState()).toBe("stopped");
+    expect(exitCalled).toBe(false);
+  }, 60000);
+
   it("rejects a failed shutdown rather than reporting success", async () => {
     // The caller owns what a failed shutdown means, so it has to reach them.
     // This used to settle through .finally, which runs on rejection too, and a
@@ -809,7 +840,9 @@ describe("LocalDevDBServer", () => {
 
   it("joins an explicit stop() when a signal arrives during it", async () => {
     // A host that traps SIGINT while a stop() is already running. The second
-    // caller waits for the same shutdown rather than starting a second one.
+    // caller waits for the same shutdown rather than starting a second one,
+    // and rather than being refused: a stop is the one call that must not
+    // leave a server running because it was asked for twice.
     const instance = new LocalDevDBServer({
       port: await findFreePort(),
       user: "late_signal_user",
@@ -1027,9 +1060,9 @@ describe("LocalDevDBServer", () => {
     // rather than being told to go clearing IPC objects.
     internals.serverOutput = ["FATAL:  database files are incompatible"];
 
-    expect(internals.withServerOutput("PostgreSQL failed to start")).not.toContain(
-      "ipcrm",
-    );
+    expect(
+      internals.withServerOutput("PostgreSQL failed to start"),
+    ).not.toContain("ipcrm");
   });
 
   it("registers no signal handlers of its own", async () => {
@@ -2205,6 +2238,11 @@ describe("LocalDevDBServer", () => {
     expect(await internals.cleanupFailedStart()).toBe(false);
 
     internals.terminateProcess = originalTerminate;
+
+    // Reported as its own state rather than through the child's exit status,
+    // which cannot tell this apart from a healthy server or an absent one:
+    // both of those rows promise a start() that in fact throws.
+    expect(server.getLifecycleState()).toBe("unstoppable");
 
     await expect(server.start()).rejects.toThrow(/could not be stopped/i);
 
