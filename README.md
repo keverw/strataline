@@ -74,6 +74,7 @@ Whether you're building a side project or orchestrating millions of rows in prod
     - [Process Management](#process-management)
     - [How Shutdown Works](#how-shutdown-works)
     - [Who Exits](#who-exits)
+    - [Probing for a Running Server](#probing-for-a-running-server)
     - [Using With Your Application](#using-with-your-application)
     - [Git Configuration](#git-configuration)
   - [Locale and Collation](#locale-and-collation)
@@ -1614,7 +1615,7 @@ Stopping is deliberately the forgiving one. The two refusals fail in opposite di
 
 What a joined caller gives up is knowing whose request stopped the server. The escalation belongs to whoever asked first, so a `stop()` joined to a `shutdown("SIGTERM")` resolves for a stop it had no part in, and a failure rejects both. Check `getLifecycleState()` first where that matters. Nothing has to check in order to be correct, which is the point.
 
-This is the instance's own view and nothing more. A server left behind by a previous run reads as `stopped`, because this object has never held it. That question is `getLocalDevDBServerStatus()`, exported from `strataline/local-dev-db-server`, which reads the PID records rather than memory. It is also a snapshot that does not survive an `await`, so use it for a log line or a branch that tolerates being wrong, not as a check that some later call is relied on to pass.
+This is the instance's own view and nothing more. A server left behind by a previous run reads as `stopped`, because this object has never held it. That question is [`getLocalDevDBServerStatus()`](#probing-for-a-running-server), which reads the PID records rather than memory. It is also a snapshot that does not survive an `await`, so use it for a log line or a branch that tolerates being wrong, not as a check that some later call is relied on to pass.
 
 `stop()` waits for the child's `close` event rather than only for the PID to disappear, so the PID file has been released by the time it resolves. That wait is bounded. `close` reports the stdio pipes closed as well as the process exited, and PostgreSQL's backends inherit those pipes: a postmaster wedged badly enough to need `SIGKILL` dies without signaling its children, which go on holding them with nothing left to reap them. Once the process itself is confirmed gone, strataline finishes the cleanup itself rather than wait on an event that may never arrive, so a shutdown that worked is never reported as one that failed.
 
@@ -1626,9 +1627,19 @@ const server = new LocalDevDBServer(config);
 // Held, not just awaited. A signal can arrive during startup, and shutdown()
 // rejects while a start is in flight, so the handler has to wait for the start
 // to settle rather than call shutdown() into a refusal.
+let settled = false;
+
 const startup = server.start().then(
-  () => null,
-  (error: unknown) => error,
+  (): unknown => {
+    settled = true;
+
+    return null;
+  },
+  (error: unknown) => {
+    settled = true;
+
+    return error;
+  },
 );
 
 startup.then((error) => {
@@ -1638,14 +1649,42 @@ startup.then((error) => {
   }
 });
 
+// Bounded, because trapping a signal suppresses Node's own termination: an
+// unbounded wait through a first-run initdb lets a supervisor's grace period
+// expire and SIGKILL the script instead.
+const START_WAIT_MS = 5000;
+
 let stopping: Promise<void> | null = null;
+
+function abandonStartup(reason: string): void {
+  console.error(`${reason} Exiting without a clean shutdown.`);
+  process.exit(1);
+}
 
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
   process.on(signal, () => {
-    // Repeat signals join the shutdown already running. Ctrl+C twice must not
-    // exit part-way through the first.
-    stopping ??= startup
+    // A second signal while the first is still WAITING gives up on the wait.
+    // Once the shutdown is running it is left alone: cutting an escalation off
+    // part-way can leave a data directory needing recovery.
+    if (stopping) {
+      if (!settled) {
+        abandonStartup("Signaled again while still waiting for startup.");
+      }
+
+      return;
+    }
+
+    const startWait = setTimeout(
+      () => abandonStartup("Timed out waiting for startup to finish."),
+      START_WAIT_MS,
+    );
+
+    startWait.unref();
+
+    stopping = startup
       .then((error) => {
+        clearTimeout(startWait);
+
         // A failed start has already torn its own child down, and the handler
         // above is about to exit. Nothing here to stop.
         if (error !== null) {
@@ -1658,6 +1697,7 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
       // the rejection is unhandled and what says which server is still running
       // arrives as the first line of a crash dump.
       .catch((error: unknown) => {
+        clearTimeout(startWait);
         console.error(`Shutdown failed: ${error}`);
         process.exit(1);
       });
@@ -1665,7 +1705,9 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
 }
 ```
 
-Waiting for the start is the point of that shape, not incidental to it. Calling `shutdown(signal)` straight from the handler rejects for the whole of `start()`, which on a cold run is its longest stretch, and a script that then exits leaves the postmaster to the synchronous `exit` hook. That hook only `SIGKILL`s: no shutdown checkpoint, a stale `postmaster.pid`, and the SysV shared memory and semaphores PostgreSQL releases on a clean exit and not on a hard kill. The cost is that a signal arriving during a first-run `initdb` waits for it, since trapping the signal suppresses Node's own termination.
+Waiting for the start is the point of that shape, not incidental to it. Calling `shutdown(signal)` straight from the handler rejects for the whole of `start()`, which on a cold run is its longest stretch, and a script that then exits leaves the postmaster to the synchronous `exit` hook. That hook only `SIGKILL`s: no shutdown checkpoint, a stale `postmaster.pid`, and the SysV shared memory and semaphores PostgreSQL releases on a clean exit and not on a hard kill.
+
+The wait needs a bound for the same reason it needs to exist. Trapping a signal suppresses Node's own termination, so an unwaited-out `start()` becomes a script that ignores `SIGTERM`. A first-run `initdb` is unbounded and is the one step here that can be, so without the timer a supervisor's grace period expires and `SIGKILL`s the script, reaching the ungraceful ending more slowly than not waiting would have. Giving up is no worse than never having waited, so the bound only trades away the startups that would have finished later than it.
 
 > **Wire this, or a supervisor orphans your database.** An untrapped `SIGTERM` terminates Node immediately without running any JavaScript, including the force-kill hook below. `docker stop`, systemd, or any process manager then leaves the postmaster running, holding the port and the data directory. `Ctrl+C` at a terminal usually survives it because the signal goes to the whole foreground process group and PostgreSQL gets its own copy, but that is luck rather than design.
 
@@ -1705,6 +1747,48 @@ Because the lifecycle already does this, `dispose()` is rarely needed: `start()`
 Stop the server before disposing it, as the example does. Disposing one that still holds a child takes it out of the set the `exit` hook protects, so that server can outlive the program that started it. It is allowed rather than an error, since an instance being torn down for some other reason should not be made to throw, and it warns to the logger.
 
 Keep your own handler's shutdown to a single `await`. Calling `process.exit()` on `SIGINT` while `shutdown()` is still escalating cuts it off part-way through, which can leave a data directory needing recovery. Exit from the `.then`, as the example does, not alongside it.
+
+#### Probing for a Running Server
+
+`getLocalDevDBServerStatus()` answers the question a `LocalDevDBServer` instance cannot: whether a server is running for a data directory right now, including one left by a previous run or started by another process. It reads PostgreSQL's own `postmaster.pid` and Strataline's PID record rather than any in-memory state, so it works from a fresh process, a different tool, or a script that never constructs a server at all. Both it and the PID utilities it is built on are exported from `strataline/local-dev-db-server`.
+
+```ts
+import { getLocalDevDBServerStatus } from "strataline/local-dev-db-server";
+
+const status = await getLocalDevDBServerStatus({
+  pidFile: PID_FILE,
+  dataDir: DATA_DIR,
+  // Optional. Only consulted when the file and process checks cannot decide,
+  // and then the server is asked for its own data_directory, which is identity
+  // rather than inference.
+  connection: {
+    port: 5433,
+    user: "myapp_user",
+    password: "myapp_pass",
+    database: "myapp_dev",
+  },
+});
+
+if (status.running || status.indeterminate) {
+  throw new Error(`Refusing to reset the data directory: ${status.reason}`);
+}
+```
+
+**Three answers, not two.** This is the whole point of the shape, and the reason `running: false` is not a license to do anything destructive:
+
+| Field | Meaning |
+| --- | --- |
+| `running: true` | A process was found **and** positively verified as this cluster's server |
+| `indeterminate: true` | Something is alive at the recorded PID and it could not be tied to this server either way |
+| `stale: true` | A record was found that could not be verified, with `staleKind` saying why |
+
+A caller about to do something irreversible, dropping a data directory or deleting a PID record, should refuse on `running || indeterminate`. `running: false` on its own means "no server was verified", never "nothing is running", and treating the second as the first is how a live server's data directory gets deleted out from under it.
+
+`staleKind` says what kind of evidence produced a stale answer, and the difference is the same one: `process-gone`, `recycled`, and `different-cluster` are positive evidence that the recorded server is gone, while `indeterminate` is the absence of evidence.
+
+The rest of the result carries what was found: `pid`, `startedAt`, `dataDir`, `port`, a `source` of `"postmaster"`, `"pid-file"`, `"connection"`, or `"none"` saying which check settled it, and a `reason` phrased for a person and suitable for dropping straight into a log line or the refusal message above. `observedStartTime` is the operating system's own start time for `pid`, sampled during the verification that identified it, for a caller that intends to signal the process: sampling it again afterwards would be a fresh observation that may describe a different process, since a PID is reused the moment its owner exits.
+
+Identification uses the process command line, start time, current boot, data directory, and owning uid, whichever the platform supplies. `DevDBServerStatus`, `DevDBStatusOptions`, `DevDBStaleKind`, and `DevDBStatusSource` are all exported if you want the named types.
 
 #### Using With Your Application
 

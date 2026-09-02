@@ -41,9 +41,19 @@ const server = new LocalDevDBServer({
 // postmaster.pid, and leaks the SysV IPC objects PostgreSQL frees only on a
 // clean exit. Startup is the longest part of a cold run, so it is exactly
 // when Ctrl+C lands.
+let settled = false;
+
 const startup = server.start().then(
-  () => null,
-  (error: unknown) => error,
+  (): unknown => {
+    settled = true;
+
+    return null;
+  },
+  (error: unknown) => {
+    settled = true;
+
+    return error;
+  },
 );
 
 startup.then((error) => {
@@ -53,14 +63,59 @@ startup.then((error) => {
   }
 });
 
+/**
+ * How long a signal waits for an in-flight `start()` before giving up.
+ *
+ * The wait needs a bound because trapping a signal suppresses Node's own
+ * termination: without one, a `SIGTERM` during a first-run `initdb` — which is
+ * unbounded, and the one step here that can be — leaves the supervisor's grace
+ * period to expire and `SIGKILL` the script, which is the ungraceful ending the
+ * wait was there to avoid, arrived at more slowly.
+ *
+ * Short enough to leave a shutdown room inside `docker stop`'s ten seconds.
+ * The give-up path is no worse than not waiting at all, so the only thing the
+ * bound trades away is the startups that would have finished later than this.
+ */
+const START_WAIT_MS = 5000;
+
 let stopping: Promise<void> | null = null;
+
+/** Ends the process without a clean stop, saying why and what it costs. */
+function abandonStartup(reason: string): void {
+  console.error(
+    `${reason} Exiting without a clean shutdown: any PostgreSQL this started ` +
+      "will be force-killed, which can leave a stale postmaster.pid and leaked " +
+      "SysV IPC objects behind.",
+  );
+  process.exit(1);
+}
 
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
   process.on(signal, () => {
-    // Repeat signals join the shutdown already running rather than starting a
-    // second one, and Ctrl+C twice must not exit part-way through the first.
-    stopping ??= startup
+    // A second signal while the first is still WAITING gives up on the wait.
+    // Once the shutdown itself is running it is left alone: cutting an
+    // escalation off part-way can leave a data directory needing recovery, so
+    // Ctrl+C twice must not do that.
+    if (stopping) {
+      if (!settled) {
+        abandonStartup("Signaled again while still waiting for startup.");
+      }
+
+      return;
+    }
+
+    const startWait = setTimeout(
+      () => abandonStartup("Timed out waiting for startup to finish."),
+      START_WAIT_MS,
+    );
+
+    // Unref'd so the bound never itself keeps the process alive.
+    startWait.unref();
+
+    stopping = startup
       .then((error) => {
+        clearTimeout(startWait);
+
         // A start that failed has already torn its own child down and is
         // about to exit(1) from the handler above, so there is nothing here
         // to stop and nothing to add.
@@ -71,6 +126,7 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
         return server.shutdown(signal).then(() => process.exit(0));
       })
       .catch((error: unknown) => {
+        clearTimeout(startWait);
         console.error(`Shutdown failed: ${error}`);
         process.exit(1);
       });
