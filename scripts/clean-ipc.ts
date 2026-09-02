@@ -49,7 +49,12 @@ function isAlive(pid: number): boolean {
 }
 
 /**
- * Live PostgreSQL postmasters, by executable name rather than command line.
+ * Live PostgreSQL processes, by executable name rather than command line.
+ *
+ * Postmasters and their backends alike, since a backend keeps its parent's
+ * `comm` however it rewrites its process title. Counting both is what this
+ * wants: a backend is a server's, so one being up is the same reason to leave
+ * the semaphores alone.
  *
  * A command-line match would count this script, and anything else that merely
  * mentions postgres, as a running server and refuse to clean when it is safe.
