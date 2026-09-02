@@ -28,6 +28,8 @@ import {
   readFileSync,
   chmodSync,
   copyFileSync,
+  symlinkSync,
+  lstatSync,
 } from "fs";
 import { spawn, execFileSync } from "child_process";
 import { createServer } from "net";
@@ -781,6 +783,42 @@ describe("LocalDevDBServer", () => {
     await server.start();
 
     expect(existsSync(join(dataDir, "postgresql.conf"))).toBe(true);
+  }, 180000);
+
+  it("initializes a data directory that is a symlink to somewhere else", async () => {
+    // Parking pgdata on another volume through a symlink is an ordinary thing
+    // to do, and initdb handles it by simply following the link. rename() does
+    // not: it refuses to replace a symlink's final component, so publishing a
+    // staged cluster onto one fails with ENOTDIR however good the directory
+    // behind it is, and fails again on every later start because no
+    // postgresql.conf ever appears.
+    const realDataDir = join(tempDir.name, "elsewhere");
+    const linkedDataDir = join(tempDir.name, "linked-pgdata");
+
+    mkdirSync(realDataDir, { recursive: true });
+    symlinkSync(realDataDir, linkedDataDir);
+
+    const linkedServer = new LocalDevDBServer({
+      port: await findFreePort(),
+      user: "test_dev_user",
+      password: "test_dev_password",
+      database: "test_dev_database",
+      dataDir: linkedDataDir,
+      pidFile: join(tempDir.name, ".pg_pid_linked"),
+    });
+
+    try {
+      await linkedServer.start();
+
+      // Through the link, and in the directory it points at rather than in
+      // place of the link.
+      expect(existsSync(join(linkedDataDir, "postgresql.conf"))).toBe(true);
+      expect(existsSync(join(realDataDir, "postgresql.conf"))).toBe(true);
+      expect(lstatSync(linkedDataDir).isSymbolicLink()).toBe(true);
+    } finally {
+      await linkedServer.stop();
+      linkedServer.dispose();
+    }
   }, 180000);
 
   it("says what is in the way when the data directory holds something else", async () => {

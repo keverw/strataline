@@ -9,6 +9,7 @@ import {
   unlink,
   mkdir,
   rm,
+  realpath,
 } from "fs/promises";
 import { constants } from "fs";
 import { dirname, isAbsolute, join, resolve } from "path";
@@ -1379,6 +1380,29 @@ export class LocalDevDBServer {
   }
 
   /**
+   * Where a newly initialized cluster actually has to land.
+   *
+   * The configured path, except that a symlink is followed to what it points
+   * at. `rename()` does not follow one in its final component, so publishing
+   * onto a symlinked data directory would fail with ENOTDIR against a
+   * perfectly good directory — and pointing `dataDir` at another volume
+   * through a symlink is an ordinary thing to do, which the in-place `initdb`
+   * this replaced handled by simply following it.
+   *
+   * A path that does not exist yet resolves to itself, which is the ordinary
+   * first run: there is no link to follow and `rename()` creates the name. So
+   * does a dangling symlink, whose target `realpath` cannot reach, and the
+   * ENOTDIR that then comes back from the rename is reported for what it is.
+   */
+  private async resolveDataDirDestination(): Promise<string> {
+    try {
+      return await realpath(this.pgDataDir);
+    } catch {
+      return this.pgDataDir;
+    }
+  }
+
+  /**
    * Removes a directory tree this instance created, ignoring a failure.
    *
    * Only ever called on the staging directory initdb was pointed at, whose
@@ -2219,11 +2243,21 @@ export class LocalDevDBServer {
       // so two starts racing for one data directory do not also race here.
       // What an interruption strands now is that sibling, which nothing looks
       // for and which no start consults.
-      const stagedDataDir = `${this.pgDataDir}.${randomUUID()}.init`;
+      //
+      // Sibling of the RESOLVED path, which is what makes a symlinked data
+      // directory keep working. rename() does not follow a symlink in its
+      // final component, so renaming onto one fails with ENOTDIR however good
+      // the directory behind it is — and parking pgdata on another volume
+      // through a symlink is an ordinary thing to do, which initdb itself
+      // handles by simply following it. Resolving first puts the cluster
+      // where the link points and leaves the link alone. sameDataDir already
+      // canonicalizes for the same reason.
+      const destination = await this.resolveDataDirDestination();
+      const stagedDataDir = `${destination}.${randomUUID()}.init`;
 
       // The parent, rather than the data directory itself. initdb creates its
       // own target and is where the directory now comes from.
-      await mkdir(dirname(this.pgDataDir), { recursive: true });
+      await mkdir(dirname(destination), { recursive: true });
 
       // Pin initdb's locale rather than inherit the host shell's: a
       // Linux-style LC_ALL=C.UTF-8 makes initdb fail on macOS, whose libc has
@@ -2259,24 +2293,51 @@ export class LocalDevDBServer {
       }
 
       try {
-        await rename(stagedDataDir, this.pgDataDir);
+        await rename(stagedDataDir, destination);
       } catch (e) {
         await this.removeDirectoryIfPresent(stagedDataDir);
 
+        const code = (e as NodeJS.ErrnoException)?.code;
+
+        // Another start got there first. Two of these racing for one fresh
+        // data directory both stage a cluster and both try to publish it, and
+        // the one that loses must not report the winner's work as rubble to
+        // be deleted. A config at the destination is that race and nothing
+        // else, since this branch only runs when there was none.
+        if (await fileExists(join(this.pgDataDir, "postgresql.conf"))) {
+          this.log(
+            "setup",
+            `Another start initialized ${this.pgDataDir} first. Using that cluster.`,
+          );
+
+          return;
+        }
+
         // An empty directory at the destination is renamed over on POSIX, so
-        // what reaches here is one holding something. That is not this start's
-        // to delete: it may be a data directory left half initialized by an
-        // older strataline, and it may equally be a directory the caller
+        // a directory reaching here is one holding something. That is not this
+        // start's to delete: it may be a data directory left half initialized
+        // by an older strataline, and it may equally be a directory the caller
         // pointed `dataDir` at by mistake, with files in it that are not
         // PostgreSQL's at all. Nothing here can tell those apart, and only one
         // of them is safe to remove, so say what is in the way instead.
-        const code = (e as NodeJS.ErrnoException)?.code;
-
         if (code === "ENOTEMPTY" || code === "EEXIST" || code === "EXDEV") {
           throw new Error(
             `${this.pgDataDir} already holds files but is not an initialized PostgreSQL cluster, so a new one could not be moved into place. ` +
               "It may be the remains of an interrupted first run, or a directory that is not meant to be a data directory at all. " +
               "Check what is in it, then remove it and try again.",
+            { cause: e },
+          );
+        }
+
+        // Not a directory at all. A regular file where the data directory
+        // should be is the everyday way to reach this, and a symlink pointing
+        // at nothing is the other: resolving above leaves a dangling one as
+        // itself, and rename will not replace it either.
+        if (code === "ENOTDIR") {
+          throw new Error(
+            `${this.pgDataDir} exists but is not a directory, so a PostgreSQL data directory could not be created there. ` +
+              "It may be a file, or a symlink pointing at something that is not there. " +
+              "Check that path, then remove it or point dataDir somewhere else and try again.",
             { cause: e },
           );
         }
