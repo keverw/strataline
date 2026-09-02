@@ -1741,8 +1741,10 @@ describe("LocalDevDBServer", () => {
     await new Promise((resolve) => setTimeout(resolve, 300));
     writeFileSync(otherPidFile, String(child.pid));
 
-    // A file where the data directory should be, so initdb fails and startup
-    // rejects after the refusal point.
+    // A file where the data directory should be. Scaffolding rather than the
+    // thing under test: it guarantees this start cannot succeed by any route,
+    // so a passing assertion below is the identity refusal and not a server
+    // that happened to come up. Nothing here reaches initdb at all.
     const brokenDataDir = join(tempDir.name, "not_a_directory");
 
     writeFileSync(brokenDataDir, "not a data directory");
