@@ -248,14 +248,30 @@ export class PrefixedLogger extends BaseLogger {
   }
 
   /**
-   * Log a warning message with prefix
+   * Log a warning message with prefix, or inform where the logger beneath
+   * cannot warn.
+   *
+   * This class is where a missing `warn` actually bites. `Logger` declares the
+   * method, but a JavaScript caller can hand over an object without it, and
+   * wrapping such a logger here produces a child that HAS `warn` — so a call
+   * site with nothing to feature-detect calls it, and it reaches the one that
+   * is not there. Falling back here means a prefixed child is never worse than
+   * what it wraps.
    */
   warn(data: LogDataInput): void {
-    this.baseLogger.warn({
+    const prefixed = {
       ...data,
       task: data.task || this.prefix.task,
       stage: data.stage || this.prefix.stage,
-    });
+    };
+
+    if (typeof this.baseLogger.warn === "function") {
+      this.baseLogger.warn(prefixed);
+
+      return;
+    }
+
+    this.baseLogger.info(prefixed);
   }
 }
 
@@ -272,10 +288,19 @@ export function createPrefixedLogger(
   baseLogger: Logger,
   prefix: { task?: string; stage?: string },
 ): Logger {
-  if (baseLogger instanceof BaseLogger) {
-    return baseLogger.createPrefixed(prefix);
+  // Asked for by the method rather than by the class. A logger that can prefix
+  // itself should be the one to do it, and whether it happens to descend from
+  // BaseLogger is a different question with a different answer: an `instanceof`
+  // check here silently sends anything else down the fallback, so a wrapper or
+  // a decorator around a logger loses that logger's own prefixing without
+  // anything failing — both branches return a working logger, so nothing shows
+  // up until someone notices the prefixes are wrong.
+  const own = (baseLogger as Partial<BaseLogger>).createPrefixed;
+
+  if (typeof own === "function") {
+    return own.call(baseLogger, prefix);
   }
 
-  // For non-class loggers, use the legacy approach
+  // A plain object with no prefixing of its own.
   return new PrefixedLogger(baseLogger, prefix);
 }

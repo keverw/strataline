@@ -1,0 +1,56 @@
+# Change Log
+
+<!-- toc -->
+
+- [Unreleased](#unreleased)
+
+<!-- tocstop -->
+
+## Unreleased
+
+This release hardens the local development database server around process identity and lifecycle races. A PID number alone is no longer treated as proof that a process is this cluster's PostgreSQL server. It also stops a callback you supply from being able to end your process by failing.
+
+**Breaking:** `stop()` no longer exits the host process, the library no longer installs operating-system signal handlers, `onExit` is now only a notification for an unrequested PostgreSQL exit, startup refuses ambiguous PID state, `dataDir` is resolved to an absolute path, shutdown uses PostgreSQL's fast-to-immediate escalation, and the PID file now contains structured JSON that older Strataline versions cannot read.
+
+**Process Identity**
+
+- Added `getLocalDevDBServerStatus()` and exported the PID utilities from `strataline/local-dev-db-server`. Status distinguishes verified, stale, and `indeterminate` records so callers can refuse destructive work when identity cannot be established.
+- Verification uses the process command, start time, current boot, data directory, and owning uid where the platform provides them. Linux uses `/proc`, macOS uses `ps`, and Windows uses one PowerShell CIM query. The probes that shell out are bounded, since they run synchronously and a hung one would block the event loop where no timer could recover it. A probe that times out reads as no answer, which is the cautious direction.
+- An optional connection probe can ask PostgreSQL for its own `data_directory` when file and process evidence cannot decide. The configured development user receives `pg_read_all_settings` so it can answer that query.
+- Live process identity takes precedence over wall-clock heuristics, preventing clock adjustments and restored virtual-machine snapshots from making a running server look as though it predates the current boot.
+
+**Starting and Stopping**
+
+- **Breaking:** startup now refuses an unreadable, changing, unclaimable, foreign, or otherwise ambiguous PID record instead of signaling a PID or deleting a record it cannot establish as stale. Record removal uses a rename-based claim protocol so a replacement record is never deleted by an earlier startup.
+- **Breaking:** shutdown now escalates through `SIGINT`, `SIGQUIT`, and `SIGKILL`. This avoids PostgreSQL's `SIGTERM` smart-shutdown mode, which can wait indefinitely for clients. Each step has its own budget, and `SIGINT` gets much the largest one, because it is the step that ends cleanly and its shutdown checkpoint takes as long as the database is dirty. A server that ignores every signal is given about 42 seconds in total before `stop()` reports failure. Windows uses `pg_ctl kill` for PostgreSQL signal semantics and Node for the final hard kill, and that call is bounded too, so a `pg_ctl` that never returns cannot outlast the shutdown it was part of.
+- `stop()` and `shutdown(signal)` resolve only after PostgreSQL has stopped and PID-record cleanup has finished. They reject failed shutdowns, never exit the host, and never call `onExit`.
+- Calling `start()` while starting or stopping, or calling `stop()` while starting, now rejects with a descriptive error instead of queueing conflicting background operations. Concurrent `stop()` or `shutdown()` calls coalesce into the active shutdown promise.
+- Clean startup no longer waits an arbitrary two seconds after confirming that there is no previous process to stop. Shutdown already waits for a process it actually terminates.
+- Startup rejects promptly when spawning, `initdb`, readiness, or final setup fails, includes captured PostgreSQL diagnostics, and cleans up any partially started child it can still identify. Readiness retries also close every attempted connection.
+- Shutdown revalidates a recorded process before every signal, waits for child lifecycle cleanup without hanging forever on inherited stdio, and ignores late events from a superseded child rather than applying them to a newer server.
+- `start()` decides whether a server is already running from what Node reports about the child rather than from holding a reference to it. A postmaster killed without signaling its children leaves them holding the inherited stdio pipes, which can hold back the `close` event indefinitely, and a `start()` in that window used to report the server as already running and resolve with no database behind it. It now finishes the dead child's cleanup and starts a new server.
+
+**PID Records**
+
+- **Breaking:** Strataline now writes an atomic JSON PID record containing the PID, start time, absolute data directory, port, boot time, and uid. Readers continue to accept the previous bare-integer format, so upgrades are transparent, but downgrades are not. The record is published without replacing an existing one, so a record that arrives while this server is starting refuses the start rather than being overwritten unseen.
+- A failed startup or delayed child cleanup removes only the exact record written or examined by that lifecycle. Failed boot-time probes are retried instead of being cached as permanently unavailable.
+
+**Host Integration**
+
+- **Breaking:** the library traps no `SIGINT`, `SIGTERM`, or `SIGHUP`. Hosts that want graceful signal shutdown must call `shutdown(signal)` and decide when to exit. The development script now demonstrates that wiring.
+- **Breaking:** `onExit` reports only a server that dies without being asked. A script whose whole purpose is the dev server should exit from that callback, while embedders can recover or continue.
+- The only installed `process` listener is a shared synchronous `exit` hook that force-kills surviving child processes. It is installed while at least one server owns a child, does not accumulate across instances, and can be released explicitly with `dispose()`.
+
+**Test Databases**
+
+- `TestDatabaseInstance` now picks its automatic port from a range below the ephemeral one, and from a random point in that range. An automatically assigned port used to come from the ephemeral range, which is also where the kernel draws the local port for outgoing connections, so one of the connections made while the database was starting could take the number before PostgreSQL bound it. The database then failed to start with "could not bind IPv4 address", intermittently and under load. Passing an explicit `port` is unaffected.
+
+**Diagnostics**
+
+- A PostgreSQL start that fails for want of SysV shared memory or semaphores now says so in its own terms. Both exhaustions are reported by PostgreSQL as "No space left on device", which reads as a full disk and is instead a per-machine kernel limit, usually reached because objects leaked from servers that were killed rather than shut down. The thrown error now says that and names `ipcs` and `ipcrm`.
+
+**Callbacks**
+
+- A callback you supply can no longer end the process by failing. `onExit` and every logger this library accepts are called from places that hold no promise: an exit handler, a `setInterval` body, a pool error listener, a voided chain. A throw from any of them used to escape as an unhandled rejection, which Node terminates the process over. These callbacks are also declared `=> void`, which an `async` function satisfies, so an asynchronous implementation could fail in a way no `try` at the call site could see. Both shapes are now absorbed, and every logger is guarded once where it is supplied rather than at each of the places it is called.
+- A failing logger degrades rather than going quiet. The failure is first re-reported through that same logger at its error level, since what broke is usually one level or one destination rather than the whole thing. Only when that fails too is the logger treated as unusable, and the failure goes out of band: dispatched as a cancelable `ErrorEvent` of type `error` where the host has already made `globalThis` an EventTarget, otherwise handed to `globalThis.reportError` where the runtime provides that instead, and to the console where there is neither or where nothing cancelled the event. Listen with `globalThis.addEventListener("error", ...)` to receive these, and call `preventDefault()` to take responsibility and suppress the console line. Those channels are detected and never installed, since making `globalThis` an EventTarget is a decision about the whole program rather than a library's to take. Nothing is written to the console until two calls to your own logger have failed.
+- A failing `onExit` is reported through the logger.

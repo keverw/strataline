@@ -1,5 +1,6 @@
 import { hostname } from "os";
 import { type Pool, type PoolClient } from "pg";
+import { makeSafeLogger } from "./callback-safety";
 import { type Logger, consoleLogger, createPrefixedLogger } from "./logger";
 import { type SchemaHelpers, createSchemaHelpers } from "./schema-helpers";
 
@@ -418,7 +419,15 @@ export class MigrationManager {
     opts?: { lockRenewalSeconds?: number; lockExpirySeconds?: number },
   ) {
     this.pool = pool;
-    this.logger = logger;
+    // Wrapped once here rather than guarded at each of the several dozen call
+    // sites below, none of which await it. A logger that throws — or that is
+    // an `async` one and rejects, which the `Logger` interface admits, being
+    // declared `=> void` — would otherwise escape from a `setInterval` body or
+    // a voided promise chain as an unhandled rejection, and Node ends the
+    // process over it. Losing a log line is the right cost; ending a
+    // long-running migration worker is not. Prefixed loggers delegate to this
+    // one, so they inherit the guarantee rather than needing their own.
+    this.logger = makeSafeLogger(logger);
     this.lockRenewalSeconds = opts?.lockRenewalSeconds ?? 60; // Default to 60 seconds if not specified
     this.lockExpirySeconds =
       opts?.lockExpirySeconds ?? MigrationManager.DEFAULT_LOCK_EXPIRY_SECONDS;
@@ -600,7 +609,7 @@ export class MigrationManager {
     `);
 
     // pg returns BIGINT columns as strings to avoid precision loss. Our epoch
-    // timestamps fit safely in a JS number, so coerce them here to honour the
+    // timestamps fit safely in a JS number, so coerce them here to honor the
     // numeric MigrationStatus type and keep numeric comparisons reliable.
     return rows.map((row) => ({
       ...row,
@@ -987,7 +996,7 @@ export class MigrationManager {
     const dataMigrationAlreadyComplete =
       rows.length > 0 && rows[0].migration_complete === true;
 
-    // If the run was already signalled to stop, bail before touching the status
+    // If the run was already signaled to stop, bail before touching the status
     // row at all — don't create a record, bump the attempt counter, or clear the
     // prior last_error for a resume that's going to do no work. (The earlier
     // last_error/attempts write used to happen first, which erased the previous
@@ -1197,7 +1206,7 @@ export class MigrationManager {
     }
 
     // Critical guard: the data migration may have ignored ctx.signal and called
-    // complete() even though the run was signalled to stop mid-flight — most
+    // complete() even though the run was signaled to stop mid-flight — most
     // importantly on lock loss, where continuing into afterSchema would run DDL
     // without a valid lock, possibly concurrent with another process. Stop before
     // the schema phase so afterSchema (and the completedAt write below) never run
@@ -1872,11 +1881,10 @@ export class MigrationManager {
    * doing work without a valid lock, and stop the renewal timer. Idempotent.
    */
   private handleLockLost(message: string): void {
-    if (this.logger.warn) {
-      this.logger.warn({ message });
-    } else {
-      this.logger.info({ message });
-    }
+    // No feature detection. `this.logger` is always wrapped, and the wrapper
+    // always has `warn` — falling back to `info` itself where the logger it
+    // wraps has none. See makeSafeLogger.
+    this.logger.warn({ message });
 
     this.lockLost = true;
     this.runAbortController?.abort();
@@ -1898,7 +1906,7 @@ export class MigrationManager {
    * @param migrationId The ID of the migration to run
    * @param payload Optional payload to pass to the data migration
    * @param opts.signal Optional AbortSignal exposed to the data migration as
-   *   ctx.signal, so distributed job workers can be cancelled cooperatively.
+   *   ctx.signal, so distributed job workers can be canceled cooperatively.
    * @returns A DataMigrationJobResult object indicating status and any returned data
    */
   async runDataMigrationJobOnly<

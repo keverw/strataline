@@ -1,13 +1,205 @@
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import {
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  afterAll,
+} from "bun:test";
 import {
   LocalDevDBServer,
   createDevDBConsoleLogger,
+  getLocalDevDBServerStatus,
+  getProcessStartTime,
+  getSystemBootTime,
+  identifyViaConnection,
+  type LocalDevDBServerConfig,
+  type ProcessProbes,
 } from "./local-dev-db-server";
 import { Pool } from "pg";
 import * as tmp from "tmp";
 import { join } from "path";
-import { existsSync, unlinkSync } from "fs";
-import getPort from "get-port";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  unlinkSync,
+  writeFileSync,
+  readFileSync,
+  chmodSync,
+  copyFileSync,
+} from "fs";
+import { spawn, execFileSync } from "child_process";
+import { createServer } from "net";
+import { findFreePort } from "./free-port";
+
+/** One SysV shared memory segment, as `ipcs` reports it. */
+interface ShmSegment {
+  id: string;
+  /** Derived by PostgreSQL from the data directory, so it identifies one. */
+  key: number;
+  attached: number;
+}
+
+/**
+ * Lists SysV shared memory segments, or nothing where there are none to list.
+ *
+ * macOS only, deliberately, and on the same reasoning as scripts/clean-ipc.ts.
+ * Linux defaults SHMMNI to 4096 rather than 32, so it does not exhaust and
+ * there is nothing to reclaim, and its `ipcs` prints different columns than
+ * the BSD one parsed below. Windows PostgreSQL does not use SysV shared memory
+ * at all. It takes named objects that the operating system frees with the last
+ * handle, so nothing leaks there to begin with.
+ *
+ * Never throws. This backs housekeeping rather than an assertion, so an `ipcs`
+ * that fails should leave the suite running rather than fail tests over
+ * cleanup.
+ */
+function listShmSegments(): ShmSegment[] {
+  if (process.platform !== "darwin") {
+    return [];
+  }
+
+  try {
+    const out = execFileSync("ipcs", ["-mo"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+
+    // BSD layout: "m <id> <key> <mode> <owner> <group> <nattch>" per segment.
+    return out
+      .split("\n")
+      .map((line) => line.trim().split(/\s+/))
+      .filter((fields) => fields[0] === "m" && fields.length >= 7)
+      .map((fields) => ({
+        id: fields[1],
+        // Printed as hex here and recorded in decimal by PostgreSQL, so both
+        // are read as numbers rather than compared as text.
+        key: Number(fields[2]),
+        attached: Number(fields[fields.length - 1]),
+      }))
+      .filter(
+        (segment) =>
+          Number.isFinite(segment.attached) && Number.isFinite(segment.key),
+      );
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The shared memory segment PostgreSQL created for a data directory, taken
+ * from PostgreSQL's own record of it, or null when there is none to read.
+ *
+ * Line 7 of postmaster.pid holds the segment's key and its id. That file is
+ * the only thing that ever ties a segment back to a cluster: the key is
+ * derived from the data directory's inode, so once the directory is gone there
+ * is no way left to work out which segment belonged to it. Read while the
+ * record is still there and the answer is exact, which is what allows the
+ * reclaim below to name its segments rather than sweep for them.
+ */
+function shmSegmentForDataDir(
+  dataDir: string,
+): { id: string; key: number } | null {
+  try {
+    const shmemLine = readFileSync(join(dataDir, "postmaster.pid"), "utf8")
+      .split("\n")[6]
+      ?.trim();
+    const [key, id] = shmemLine?.split(/\s+/) ?? [];
+
+    if (id === undefined || !/^\d+$/.test(id) || !/^\d+$/.test(key ?? "")) {
+      return null;
+    }
+
+    return { id, key: Number(key) };
+  } catch {
+    // No record, or none readable. Nothing identifiable to reclaim.
+    return null;
+  }
+}
+
+/**
+ * A stand-in for a spawned child whose `close` this test fires by hand.
+ *
+ * The event that matters here is one Node emits only once the stdio pipes are
+ * closed as well as the process, which is what lets it lag arbitrarily far
+ * behind the exit. Driving the listener directly is how a test reaches that
+ * lag without a wedged postmaster and an orphaned backend holding the pipes.
+ */
+function fakeChild(pid: number): {
+  proc: unknown;
+  close: (code: number | null) => void;
+} {
+  let onClose: ((code: number | null) => void) | undefined;
+
+  return {
+    proc: {
+      pid,
+      exitCode: null,
+      signalCode: null,
+      on(event: string, listener: (code: number | null) => void) {
+        if (event === "close") {
+          onClose = listener;
+        }
+      },
+    },
+    close: (code) => onClose?.(code),
+  };
+}
+
+/** The private state the superseded-child tests below drive and inspect. */
+interface ChildLifecycleInternals {
+  attachExitHandler(proc: unknown): void;
+  pgProcess: unknown;
+  stoppingProc: unknown;
+  startingUp: boolean;
+  startupFailure: Error | null;
+  pgProcessLifecycle: { finalize(): Promise<void> } | null;
+  releasePidRecord(): Promise<void>;
+}
+
+/**
+ * Reproduces the state a stop() that outran its `close` leaves behind: the
+ * child is confirmed gone and its cleanup has been run by the shutdown itself,
+ * but the event has not arrived and the next start() has already attached its
+ * own child.
+ *
+ * @returns The superseded child, whose `close` is still to come.
+ */
+async function supersedeAChild(
+  internals: ChildLifecycleInternals,
+  fresh: unknown,
+): Promise<{ close: (code: number | null) => void }> {
+  // Nothing on disk to release. What these tests are about is which child the
+  // close handler then speaks for.
+  internals.releasePidRecord = async () => {};
+
+  const superseded = fakeChild(999001);
+
+  internals.pgProcess = superseded.proc;
+  internals.attachExitHandler(superseded.proc);
+
+  // Aimed at by a deliberate shutdown, which then confirmed it gone and ran
+  // the lifecycle cleanup itself rather than wait out an event the pipes may
+  // hold back indefinitely.
+  internals.stoppingProc = superseded.proc;
+
+  const lifecycle = internals.pgProcessLifecycle;
+
+  if (lifecycle === null) {
+    throw new Error("attachExitHandler recorded no lifecycle to finalize");
+  }
+
+  await lifecycle.finalize();
+
+  expect(internals.pgProcess).toBeNull();
+
+  // The restart that follows, which takes over the instance.
+  internals.pgProcess = fresh;
+  internals.attachExitHandler(fresh);
+
+  return superseded;
+}
 
 describe("LocalDevDBServer", () => {
   let server: LocalDevDBServer;
@@ -15,7 +207,64 @@ describe("LocalDevDBServer", () => {
   let pidFile: string;
   let serverPort: number;
   let exitCalled = false;
+
   let lastExitCode: number | undefined;
+
+  /**
+   * Segments this suite created and then abandoned, named individually.
+   *
+   * PostgreSQL keys its interlock segment off the data directory and reclaims
+   * it on the next start against that same directory. Every test here gets a
+   * fresh temporary one that is deleted when it finishes, so a postmaster that
+   * was killed rather than shut down leaves a segment nothing will ever go
+   * back for. macOS ships SHMMNI at 32, which a handful of suite runs is
+   * enough to reach, and past it initdb fails with a "No space left on device"
+   * that has nothing to do with the disk.
+   *
+   * Killing is the point of several of these tests, so the fix is to account
+   * for the segments rather than to stop producing them.
+   *
+   * Each one is named rather than searched for. postmaster.pid records the
+   * segment PostgreSQL created, so reading it before the directory goes gives
+   * this exactly the ids it is responsible for, and nothing here can reach a
+   * segment belonging to anything else on the machine. scripts/clean-ipc.ts
+   * stays the blunt instrument for a run interrupted before it could tidy up,
+   * where these hooks never execute at all.
+   *
+   * The key is kept alongside the id because an id on its own is a slot that
+   * the kernel hands out again. One reclaimed and reissued before this runs
+   * would name somebody else's segment, and nothing about the id itself would
+   * say so. The key is derived from the data directory, so requiring both to
+   * match is what makes the name mean the segment rather than the slot.
+   */
+  const abandonedShm = new Map<string, number>();
+
+  afterAll(() => {
+    const live = new Map(
+      listShmSegments().map((segment) => [segment.id, segment]),
+    );
+
+    for (const [id, key] of abandonedShm) {
+      const segment = live.get(id);
+
+      // Gone already, or the slot has been handed to a different segment since
+      // and the key says so, or something is attached to it after all. None of
+      // the three is ours to force.
+      if (
+        segment === undefined ||
+        segment.key !== key ||
+        segment.attached !== 0
+      ) {
+        continue;
+      }
+
+      try {
+        execFileSync("ipcrm", ["-m", id], { stdio: "ignore" });
+      } catch {
+        // Already gone, or not ours to remove. Nothing to do either way.
+      }
+    }
+  });
 
   beforeEach(async () => {
     // Reset exit tracking
@@ -31,7 +280,7 @@ describe("LocalDevDBServer", () => {
     pidFile = join(tempDir.name, ".pg_pid");
 
     // Get an available port for this test
-    serverPort = await getPort();
+    serverPort = await findFreePort();
 
     // Create server instance with test configuration
     server = new LocalDevDBServer({
@@ -54,6 +303,10 @@ describe("LocalDevDBServer", () => {
     // Clean up the server
     if (server) {
       await server.stop();
+      // A fresh instance per test, and each one registers five `process`
+      // listeners. Without this the suite runs past Node's ten-listener
+      // warning threshold and every stale instance goes on answering signals.
+      server.dispose();
     }
 
     // Clean up PID file if it exists
@@ -62,6 +315,34 @@ describe("LocalDevDBServer", () => {
         unlinkSync(pidFile);
       } catch {
         // Ignore cleanup errors
+      }
+    }
+
+    // Before the directory goes, and with it the only record of which segment
+    // PostgreSQL made for it. A server that shut down cleanly took its own
+    // segment with it and has no postmaster.pid left, so this finds nothing
+    // and there is nothing to find.
+    //
+    // Every data directory under the temp directory, not just the one the
+    // shared `server` uses. Tests that need a second server of their own build
+    // it beside that one — "orphan-pgdata", "exit-pgdata", and the rest — and
+    // killing such a server is the whole point of several of them, so those
+    // are exactly the directories that leave a segment behind. Naming only
+    // "pgdata" here recorded none of them, and the one from the orphan test
+    // leaked a segment on every run until macOS ran out at SHMMNI and initdb
+    // began failing with "No space left on device" in whichever test happened
+    // to run first.
+    //
+    // Still named rather than searched for: this reads the segment ids out of
+    // postmaster.pid files inside this suite's own temp directory, so it
+    // cannot reach a segment belonging to anything else on the machine.
+    // Entries that are not data directories, the PID files among them, simply
+    // have no postmaster.pid to read.
+    for (const entry of readdirSync(tempDir.name)) {
+      const abandoned = shmSegmentForDataDir(join(tempDir.name, entry));
+
+      if (abandoned !== null) {
+        abandonedShm.set(abandoned.id, abandoned.key);
       }
     }
 
@@ -90,16 +371,2830 @@ describe("LocalDevDBServer", () => {
     // Stop the server
     await server.stop();
 
-    // Wait a brief moment for the exit handler to be called
-    await new Promise((resolve) => setTimeout(resolve, 100));
-
-    // Verify that the exit handler was called with code 0
-    expect(exitCalled).toBe(true);
-    expect(lastExitCode).toBe(0);
-
-    // Note: PID file cleanup happens in the cleanup method which is called by stop()
-    // The file might still exist briefly due to async cleanup
+    // stop() resolves only after the close handler has finished its lifecycle
+    // cleanup, so PID-file removal needs no extra wait — and it resolves
+    // rather than exiting. The default exit handler is process.exit(), so a
+    // stop() that routed through it would take the host process down with the
+    // server and never return to the line below.
+    expect(existsSync(pidFile)).toBe(false);
+    expect(exitCalled).toBe(false);
+    expect(lastExitCode).toBeUndefined();
   }, 30000); // Timeout for server operations
+
+  it("reports a server that died unasked, and does not end the process", async () => {
+    // Deliberately no onExit. Under the old contract this path called
+    // process.exit() when nothing intercepted it, so this test would take the
+    // whole runner down with it rather than fail — which is the point: a
+    // library that exits has taken a decision no caller can get back.
+    const logs: string[] = [];
+
+    const orphaned = new LocalDevDBServer({
+      port: await findFreePort(),
+      user: "orphan_user",
+      password: "orphan_password",
+      database: "orphan_database",
+      dataDir: join(tempDir.name, "orphan-pgdata"),
+      pidFile: join(tempDir.name, ".orphan_pg_pid"),
+      logger: (type, message) => logs.push(`${type}:${message}`),
+    });
+
+    await orphaned.start();
+
+    type Internals = { pgProcess: { pid: number } | null };
+    const pid = (orphaned as unknown as Internals).pgProcess?.pid;
+
+    expect(pid).toBeGreaterThan(0);
+
+    // Something outside stops it: the case the report exists for.
+    process.kill(pid as number, "SIGKILL");
+
+    // Polled rather than slept: `close` waits on the stdio pipes as well as
+    // the process, so how long it takes is a function of machine load and a
+    // fixed wait makes this test fail on a busy one.
+    const deadline = Date.now() + 30_000;
+
+    while (
+      Date.now() < deadline &&
+      !logs.some((line) => line.includes("without being asked to"))
+    ) {
+      await Bun.sleep(100);
+    }
+
+    expect(logs.some((line) => line.includes("without being asked to"))).toBe(
+      true,
+    );
+
+    // Said out loud, because with no handler this is where a dev script
+    // silently keeps running with no database behind it.
+    expect(logs.some((line) => line.includes("No onExit handler is set"))).toBe(
+      true,
+    );
+  }, 60000);
+
+  // Both shapes a failing handler can take, because only one of them is a
+  // throw. The report runs inside an `async` close listener, so a synchronous
+  // throw never surfaces as the uncaughtException a host could trap: it
+  // rejects a promise nothing holds, and Node ends the process over it. An
+  // `async` handler satisfies the `=> void` signature — TypeScript admits one
+  // — and rejects the same way while sailing straight through a try/catch.
+  // Either one is this library exiting, decided by a handler it only meant to
+  // call, and past every path that would otherwise have a say.
+  for (const [shape, onExit] of [
+    [
+      "throws",
+      (): void => {
+        throw new Error("onExit blew up");
+      },
+    ],
+    ["rejects", async (): Promise<void> => Promise.reject(new Error("nope"))],
+  ] as const) {
+    it(`survives an onExit handler that ${shape}`, async () => {
+      // Listened for rather than left to fire, because unhandled is exactly
+      // what it would be: with no listener this does not fail the test, it
+      // takes the runner down.
+      const rejections: unknown[] = [];
+      const onUnhandled = (reason: unknown): void => {
+        rejections.push(reason);
+      };
+
+      process.on("unhandledRejection", onUnhandled);
+
+      const logs: string[] = [];
+      const slug = `failing_${shape}`;
+
+      const failing = new LocalDevDBServer({
+        port: await findFreePort(),
+        user: `${slug}_user`,
+        password: `${slug}_password`,
+        database: `${slug}_database`,
+        dataDir: join(tempDir.name, `${slug}-pgdata`),
+        pidFile: join(tempDir.name, `.${slug}_pg_pid`),
+        logger: (type, message) => logs.push(`${type}:${message}`),
+        onExit,
+      });
+
+      try {
+        await failing.start();
+
+        type Internals = { pgProcess: { pid: number } | null };
+        const pid = (failing as unknown as Internals).pgProcess?.pid;
+
+        expect(pid).toBeGreaterThan(0);
+
+        // Something outside stops it: the case the report exists for.
+        process.kill(pid as number, "SIGKILL");
+
+        // Polled for the reason the unasked-exit test polls: `close` waits on
+        // the stdio pipes too, so how long it takes is a function of load.
+        const deadline = Date.now() + 30_000;
+
+        while (
+          Date.now() < deadline &&
+          !logs.some((line) => line.includes("The onExit handler failed"))
+        ) {
+          await Bun.sleep(100);
+        }
+
+        // Reported rather than swallowed: unlike a logger that fails, there is
+        // somewhere for this one to go.
+        expect(
+          logs.some((line) => line.includes("The onExit handler failed")),
+        ).toBe(true);
+
+        // And the exit it was being told about was still announced.
+        expect(
+          logs.some((line) => line.includes("without being asked to")),
+        ).toBe(true);
+
+        // Nothing escaped. This is the assertion that fails without callHost,
+        // and the process-ending behavior it stands in for.
+        await Bun.sleep(100);
+        expect(rejections).toEqual([]);
+      } finally {
+        process.off("unhandledRejection", onUnhandled);
+      }
+    }, 60000);
+  }
+
+  it("stops without exiting when a host forwards it a signal", async () => {
+    // The whole shape of the contract now: the host traps the signal, this
+    // stops the server and hands control back. Exiting from in here would take
+    // a decision that belongs to the program, and a caller cannot get it back
+    // once a library has made it.
+    let exitCode: number | undefined;
+
+    const signaled = new LocalDevDBServer({
+      port: await findFreePort(),
+      user: "signal_user",
+      password: "signal_password",
+      database: "signal_database",
+      dataDir: join(tempDir.name, "signal-pgdata"),
+      pidFile: join(tempDir.name, ".signal_pg_pid"),
+      onExit: (code) => {
+        exitCode = code;
+      },
+    });
+
+    await signaled.start();
+    await signaled.shutdown("SIGINT");
+
+    expect(exitCode).toBeUndefined();
+    expect(existsSync(join(tempDir.name, ".signal_pg_pid"))).toBe(false);
+  }, 60000);
+  it("can stop and start again on the same instance", async () => {
+    // stop() leaves the instance usable: the shutdown state is cleared once it
+    // has fully settled, so a second cycle is not refused as already-cleaning.
+    await server.start();
+    await server.stop();
+
+    await server.start();
+    await server.stop();
+
+    expect(exitCalled).toBe(false);
+    expect(existsSync(pidFile)).toBe(false);
+  }, 30000);
+
+  it("rejects calling start() while stopping", async () => {
+    await server.start();
+
+    const stopping = server.stop();
+    await expect(server.start()).rejects.toThrow(/currently stopping/);
+    await stopping;
+  }, 30000);
+
+  it("rejects a failed shutdown rather than reporting success", async () => {
+    // The caller owns what a failed shutdown means, so it has to reach them.
+    // This used to settle through .finally, which runs on rejection too, and a
+    // shutdown that failed exited 0 before anything could report it.
+    let failExitCode: number | undefined;
+
+    const failing = new LocalDevDBServer({
+      port: await findFreePort(),
+      user: "failing_user",
+      password: "failing_password",
+      database: "failing_database",
+      dataDir: join(tempDir.name, "failing-pgdata"),
+      pidFile: join(tempDir.name, ".failing_pg_pid"),
+      onExit: (code) => {
+        failExitCode = code;
+      },
+    });
+
+    await failing.start();
+
+    type Internals = { terminateProcess(): Promise<"gone" | "failed"> };
+    const internals = failing as unknown as Internals;
+    const originalTerminate = internals.terminateProcess.bind(failing);
+
+    // Only the kill outcome is faked; the surrounding logic is the real thing.
+    internals.terminateProcess = async () => "failed";
+
+    await expect(failing.shutdown("SIGINT")).rejects.toThrow(
+      /could not be stopped/,
+    );
+
+    // Nothing exited over it, in either direction.
+    expect(failExitCode).toBeUndefined();
+    expect(exitCalled).toBe(false);
+
+    internals.terminateProcess = originalTerminate;
+
+    await failing.stop();
+  }, 90000);
+  it("notices a child that dies while the PID record is being written", async () => {
+    // `close` fires once and is not replayed, so the handler has to be
+    // attached before the first await. Attached after writePidRecord, a child
+    // dying in that window left startupFailure empty and startup waited out
+    // all thirty seconds instead of failing fast.
+    type Internals = {
+      writePidRecord(pid: number): Promise<void>;
+    };
+
+    const internals = server as unknown as Internals;
+    const original = internals.writePidRecord.bind(server);
+
+    internals.writePidRecord = async (pid: number) => {
+      await original(pid);
+
+      process.kill(pid, "SIGKILL");
+
+      // Long enough for `close` to land inside this await, and far short of
+      // the thirty seconds the generic timeout would take.
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    };
+
+    await expect(server.start()).rejects.toThrow(/before it was ready/i);
+  }, 60000);
+
+  it("does not treat a slow close after a timed-out stop() as a crash", async () => {
+    // stop() gives the close handler two seconds and then finishes the
+    // lifecycle cleanup itself. It used to reject instead, and to clear
+    // shutdownInFlight, which was the only record that anybody had asked for
+    // the shutdown — so when close finally landed the handler read it as the
+    // server dying on its own and exited the host process, which is exactly
+    // what an explicit stop() must never do.
+    await server.start();
+
+    type Internals = {
+      pgProcess: { pid?: number } | null;
+      terminateProcess(): Promise<"gone" | "failed">;
+    };
+
+    const internals = server as unknown as Internals;
+    const pid = internals.pgProcess?.pid;
+
+    expect(pid).toBeDefined();
+
+    // Report the stop as successful without actually killing anything, so the
+    // lifecycle wait times out with the child still alive and `close` still
+    // to come.
+    const originalTerminate = internals.terminateProcess.bind(server);
+
+    internals.terminateProcess = async () => "gone";
+
+    // Resolves rather than rejecting: the escalation said the process was
+    // gone, so a `close` that has not arrived is a late event and not a failed
+    // shutdown. The PID record is released here rather than left for it.
+    await server.stop();
+
+    expect(existsSync(pidFile)).toBe(false);
+    expect(internals.pgProcess).toBeNull();
+
+    internals.terminateProcess = originalTerminate;
+
+    // Now let close arrive, well after the shutdown promise has settled.
+    // Tolerating ESRCH: the timeout path destroys the stdio pipes, so the
+    // postmaster may already have gone of its own accord. Either way the point
+    // is what the close handler does with the exit, not who caused it.
+    try {
+      process.kill(pid as number, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+
+    expect(exitCalled).toBe(false);
+  }, 60000);
+
+  it("reports what initdb said when it fails", async () => {
+    // runPgCommand captures initdb's stderr and nothing else reads it, so a
+    // generic "failed to initialize" used to be the whole story. On macOS an
+    // exhausted SysV shared-memory table surfaces exactly here, and without
+    // initdb's own words it looks like a broken change rather than a host
+    // that needs `bun run test:clean-ipc`.
+    type Internals = {
+      runPgCommand(
+        command: string,
+        args: string[],
+        options?: { user?: string; silent?: boolean },
+      ): Promise<{ stdout: string; stderr: string; code: number | null }>;
+    };
+
+    const internals = server as unknown as Internals;
+
+    internals.runPgCommand = async () => ({
+      stdout: "",
+      stderr:
+        "initdb: error: could not create shared memory segment: No space left on device\n",
+      code: 1,
+    });
+
+    await expect(server.start()).rejects.toThrow(/No space left on device/);
+  }, 60000);
+
+  it("reports what the postmaster said when it refuses to start", async () => {
+    // The counterpart for the server itself. PostgreSQL writes the one line
+    // that diagnoses a failed start to its own stderr, which used to go
+    // nowhere at all without a logger, so the rejection was a bare "exited
+    // with code 1 before it was ready" and the caller had to reproduce the
+    // failure by hand to learn anything.
+    //
+    // Reproduced with the everyday case rather than a contrived one: a data
+    // directory an older PostgreSQL initialized, which is what every user has
+    // the first time strataline bumps a PostgreSQL major.
+    await server.start();
+    await server.stop();
+
+    // Initialized by this version a moment ago. Say it was a previous one.
+    writeFileSync(join(tempDir.name, "pgdata", "PG_VERSION"), "17\n");
+
+    await expect(server.start()).rejects.toThrow(
+      /database files are incompatible with server/i,
+    );
+  }, 120000);
+
+  it("refuses startup when an existing PID record is malformed", async () => {
+    writeFileSync(pidFile, "partially written");
+
+    type Internals = {
+      cleanupExistingProcess(): Promise<void>;
+    };
+
+    const internals = server as unknown as Internals;
+
+    await expect(internals.cleanupExistingProcess()).rejects.toThrow(
+      /could not be read/i,
+    );
+    expect(readFileSync(pidFile, "utf8")).toBe("partially written");
+  });
+
+  it("does not pause when there is no previous process to clean up", async () => {
+    type Internals = {
+      cleanupExistingProcess(): Promise<void>;
+    };
+
+    const internals = server as unknown as Internals;
+    const scheduledDelays: number[] = [];
+    const originalSetTimeout = globalThis.setTimeout;
+
+    globalThis.setTimeout = ((
+      callback: (...args: unknown[]) => void,
+      delay?: number,
+      ...args: unknown[]
+    ) => {
+      scheduledDelays.push(delay ?? 0);
+
+      // Keep this focused test fast even when run against the regression. The
+      // assertion is about scheduling the fixed delay, not wall-clock speed.
+      return originalSetTimeout(callback, delay === 2000 ? 0 : delay, ...args);
+    }) as typeof globalThis.setTimeout;
+
+    try {
+      await internals.cleanupExistingProcess();
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+    }
+
+    // This path only checks two absent PID files. A fixed two-second delay is
+    // not synchronization because there is no process whose state can change.
+    expect(scheduledDelays).not.toContain(2000);
+  });
+
+  it("leaves signal listeners it did not register alone", async () => {
+    // Constructing a server used to call removeAllListeners("SIGINT") to
+    // "have full control", which silently unhooked the host process's own
+    // handler — and the previous LocalDevDBServer's.
+    const other = (): void => {};
+
+    process.on("SIGINT", other);
+
+    try {
+      new LocalDevDBServer({
+        port: await findFreePort(),
+        user: "handler_user",
+        password: "handler_password",
+        database: "handler_database",
+        dataDir: join(tempDir.name, "unused-pgdata"),
+        pidFile: join(tempDir.name, ".unused_pg_pid"),
+        onExit: () => {},
+      });
+
+      expect(process.listeners("SIGINT")).toContain(other);
+    } finally {
+      process.off("SIGINT", other);
+    }
+  });
+
+  it("does not exit the process when stopping a server that never started", async () => {
+    // stop() used to route an idle shutdown through cleanupAndExit(0), so a
+    // consumer calling it defensively — a test teardown, a finally block —
+    // killed its own process over a server that was never running. A signal
+    // still has to exit; an explicit stop() does not.
+    await server.stop();
+
+    expect(exitCalled).toBe(false);
+    expect(lastExitCode).toBeUndefined();
+  });
+
+  it("joins an explicit stop() when a signal arrives during it", async () => {
+    // A host that traps SIGINT while a stop() is already running. The second
+    // caller waits for the same shutdown rather than starting a second one.
+    const instance = new LocalDevDBServer({
+      port: await findFreePort(),
+      user: "late_signal_user",
+      password: "late_signal_password",
+      database: "late_signal_database",
+      dataDir: join(tempDir.name, "late-signal-pgdata"),
+      pidFile: join(tempDir.name, ".late_signal_pg_pid"),
+      onExit: () => {},
+    });
+
+    await instance.start();
+
+    const stopping = instance.stop();
+
+    await Promise.all([stopping, instance.shutdown("SIGINT")]);
+
+    expect(existsSync(join(tempDir.name, ".late_signal_pg_pid"))).toBe(false);
+    expect(exitCalled).toBe(false);
+  }, 60000);
+  it("registers no process listeners until start()", async () => {
+    // The handlers exist to keep a signal from stranding a running
+    // PostgreSQL, so they are scoped to the window where there is one.
+    // Registering on construction made a merely-constructed instance answer
+    // signals on behalf of a server it did not have, which is how an idle
+    // instance reached process.exit() while a sibling was still shutting its
+    // own server down — and the "exit" hook then SIGKILLed that server
+    // mid-shutdown.
+    const events = [
+      "SIGINT",
+      "SIGTERM",
+      "SIGHUP",
+      "uncaughtException",
+      "exit",
+    ] as const;
+    // Awaited before the counts are captured, so nothing registers a listener
+    // between the two readings.
+    const port = await findFreePort();
+    const before = new Map(
+      events.map((event) => [event, process.listenerCount(event)]),
+    );
+
+    const idle = new LocalDevDBServer({
+      port,
+      user: "bystander_user",
+      password: "bystander_password",
+      database: "bystander_database",
+      dataDir: join(tempDir.name, "bystander-pgdata"),
+      pidFile: join(tempDir.name, ".bystander_pg_pid"),
+      onExit: () => {},
+    });
+
+    for (const event of events) {
+      expect(process.listenerCount(event)).toBe(before.get(event) ?? 0);
+    }
+
+    // And a stop() on something that never started leaves it that way.
+    await idle.stop();
+
+    for (const event of events) {
+      expect(process.listenerCount(event)).toBe(before.get(event) ?? 0);
+    }
+  });
+
+  it("takes its process listeners off again once the server is stopped", async () => {
+    // The other half of scoping them to a running server. Without this a
+    // program that builds servers over its lifetime accumulates five
+    // listeners per cycle, trips Node's MaxListenersExceededWarning past ten,
+    // and has one signal run the shutdown of every instance ever built.
+    // Only the `exit` hook is this library's; it traps no signals at all.
+    const events = ["exit"] as const;
+    const untouched = [
+      "SIGINT",
+      "SIGTERM",
+      "SIGHUP",
+      "uncaughtException",
+    ] as const;
+    const before = new Map(
+      [...events, ...untouched].map((event) => [
+        event,
+        process.listenerCount(event),
+      ]),
+    );
+
+    await server.start();
+
+    for (const event of untouched) {
+      expect(process.listenerCount(event)).toBe(before.get(event) ?? 0);
+    }
+
+    for (const event of events) {
+      expect(process.listenerCount(event)).toBe((before.get(event) ?? 0) + 1);
+    }
+
+    await server.stop();
+
+    for (const event of events) {
+      expect(process.listenerCount(event)).toBe(before.get(event) ?? 0);
+    }
+
+    // A second cycle re-arms rather than leaving the new child unmanaged.
+    await server.start();
+
+    for (const event of events) {
+      expect(process.listenerCount(event)).toBe((before.get(event) ?? 0) + 1);
+    }
+
+    await server.stop();
+
+    for (const event of events) {
+      expect(process.listenerCount(event)).toBe(before.get(event) ?? 0);
+    }
+  }, 120000);
+
+  it("does not let a throwing logger keep the listeners on", async () => {
+    // The logger belongs to the caller, so calling it runs somebody else's
+    // code. start()'s catch logs before cleanupFailedStart, which is the only
+    // thing that takes this instance's process listeners back off on a
+    // refusal, so a throw from that one line leaked all five — the same leak
+    // as resolving the binaries outside the try. It also replaced the reason
+    // the start refused with the logger's own error.
+    const events = [
+      "SIGINT",
+      "SIGTERM",
+      "SIGHUP",
+      "uncaughtException",
+      "exit",
+    ] as const;
+    const before = new Map(
+      events.map((event) => [event, process.listenerCount(event)]),
+    );
+
+    const noisy = new LocalDevDBServer({
+      port: await findFreePort(),
+      user: "noisy_user",
+      password: "noisy_password",
+      database: "noisy_database",
+      dataDir: join(tempDir.name, "noisy-pgdata"),
+      pidFile: join(tempDir.name, ".noisy_pg_pid"),
+      onExit: () => {},
+      logger: (type) => {
+        if (type === "error") {
+          throw new Error("logger blew up");
+        }
+      },
+    });
+
+    // This logger fails at the level the escalation would report through, so
+    // the failure runs out of rungs and leaves the logger. Both out-of-band
+    // destinations are taken over so neither the host's own reporting nor a
+    // console line surfaces here: the reporter prefers dispatching where an
+    // EventTarget exists and this runtime has one.
+    const scope = globalThis as unknown as Record<string, unknown>;
+    const saved = ["reportError", "dispatchEvent"].map((name) => ({
+      name,
+      had: name in scope,
+      value: scope[name],
+    }));
+
+    delete scope.dispatchEvent;
+    scope.reportError = () => {};
+
+    try {
+      // Refuses in cleanupExistingProcess, which is what reaches the catch.
+      writeFileSync(join(tempDir.name, ".noisy_pg_pid"), "partially written");
+
+      // The reason the start refused, not the logger's error.
+      await expect(noisy.start()).rejects.toThrow(/could not be read/i);
+
+      for (const event of events) {
+        expect(process.listenerCount(event)).toBe(before.get(event) ?? 0);
+      }
+    } finally {
+      for (const entry of saved) {
+        if (entry.had) {
+          scope[entry.name] = entry.value;
+        } else {
+          delete scope[entry.name];
+        }
+      }
+    }
+  });
+
+  it("names the cause when PostgreSQL runs out of SysV IPC objects", async () => {
+    // PostgreSQL reports both exhaustions as "No space left on device", which
+    // reads as a full disk and sends the reader to check their disk. It also
+    // surfaces on an unrelated start, long after the run that leaked the
+    // objects, so the message is all anyone has to go on.
+    const failing = new LocalDevDBServer({
+      port: await findFreePort(),
+      user: "ipc_user",
+      password: "ipc_password",
+      database: "ipc_database",
+      dataDir: join(tempDir.name, "ipc-pgdata"),
+      pidFile: join(tempDir.name, ".ipc_pg_pid"),
+    });
+
+    type Internals = {
+      serverOutput: string[];
+      withServerOutput(message: string): string;
+    };
+    const internals = failing as unknown as Internals;
+
+    internals.serverOutput = [
+      "FATAL:  could not create semaphores: No space left on device",
+      "DETAIL:  Failed system call was semget(345485937, 17, 03600).",
+    ];
+
+    const message = internals.withServerOutput("PostgreSQL failed to start");
+
+    expect(message).toContain("could not create semaphores");
+    expect(message).toContain("kernel limit");
+    expect(message).toContain("ipcrm");
+
+    // Only for that failure. Every other startup error keeps its own wording
+    // rather than being told to go clearing IPC objects.
+    internals.serverOutput = ["FATAL:  database files are incompatible"];
+
+    expect(internals.withServerOutput("PostgreSQL failed to start")).not.toContain(
+      "ipcrm",
+    );
+  });
+
+  it("registers no signal handlers of its own", async () => {
+    // Trapping SIGINT or SIGTERM inside a library takes a decision that
+    // belongs to the program: the listener suppresses Node's default
+    // termination for the whole process, so a library that installs one
+    // silently changes how its host dies. RunStratalineCLI has always said
+    // the same about itself. Only the `exit` hook goes on, which decides
+    // nothing and only stops a postmaster outliving its parent.
+    const before = new Map(
+      (
+        ["SIGINT", "SIGTERM", "SIGHUP", "uncaughtException", "exit"] as const
+      ).map((event) => [event, process.listenerCount(event)]),
+    );
+
+    let exitedWith: number | undefined;
+
+    const owned = new LocalDevDBServer({
+      port: await findFreePort(),
+      user: "owned_user",
+      password: "owned_password",
+      database: "owned_database",
+      dataDir: join(tempDir.name, "owned-pgdata"),
+      pidFile: join(tempDir.name, ".owned_pg_pid"),
+      onExit: (code) => {
+        exitedWith = code;
+      },
+    });
+
+    await owned.start();
+
+    for (const event of [
+      "SIGINT",
+      "SIGTERM",
+      "SIGHUP",
+      "uncaughtException",
+    ] as const) {
+      expect(process.listenerCount(event)).toBe(before.get(event) ?? 0);
+    }
+
+    expect(process.listenerCount("exit")).toBe((before.get("exit") ?? 0) + 1);
+
+    // The seam a host drives from its own handler. It stops the server and
+    // resolves; the exit stays theirs.
+    await owned.shutdown("SIGTERM");
+
+    expect(exitedWith).toBeUndefined();
+    expect(existsSync(join(tempDir.name, ".owned_pg_pid"))).toBe(false);
+    expect(process.listenerCount("exit")).toBe(before.get("exit") ?? 0);
+  }, 60000);
+  it("does not signal a child that has already exited when the process exits", () => {
+    // pgProcess is only cleared by the close handler, and `close` can stay
+    // pending long after the child is gone when it left an inherited stdio
+    // handle open. By then the number is free, so the exit hook must go by
+    // what Node reports on the handle rather than by the PID still being set.
+    type Internals = {
+      pgProcess: unknown;
+      killProcess(pid: number, signal?: NodeJS.Signals): boolean;
+      armProcessHandlers(): void;
+    };
+
+    const before = new Set(process.listeners("exit"));
+
+    const instance = new LocalDevDBServer({
+      port: 65000,
+      user: "exit_user",
+      password: "exit_password",
+      database: "exit_database",
+      dataDir: join(tempDir.name, "exit-pgdata"),
+      pidFile: join(tempDir.name, ".exit_pg_pid"),
+      onExit: () => {},
+    });
+
+    const internals = instance as unknown as Internals;
+
+    // The hook goes on at start(), and this test drives it against a stand-in
+    // child rather than a real server, so arm it the way start() would.
+    internals.armProcessHandlers();
+
+    const added = process
+      .listeners("exit")
+      .filter((listener) => !before.has(listener));
+
+    expect(added).toHaveLength(1);
+    const signaled: number[] = [];
+
+    internals.killProcess = (pid) => {
+      signaled.push(pid);
+
+      return true;
+    };
+
+    try {
+      internals.pgProcess = { pid: 4242, exitCode: 0, signalCode: null };
+      added[0](0);
+
+      expect(signaled).toEqual([]);
+
+      internals.pgProcess = {
+        pid: 4242,
+        exitCode: null,
+        signalCode: "SIGKILL",
+      };
+      added[0](0);
+
+      expect(signaled).toEqual([]);
+
+      internals.pgProcess = { pid: 4242, exitCode: null, signalCode: null };
+      added[0](0);
+
+      expect(signaled).toEqual([4242]);
+    } finally {
+      internals.pgProcess = null;
+      process.off("exit", added[0]);
+    }
+  });
+
+  it("starts a server when the previous child has exited but its close is still pending", async () => {
+    // The same lag the exit hook guards against, reached from start() instead.
+    // pgProcess is cleared by the close handler, and `close` waits on the
+    // stdio pipes as well as the process: a postmaster killed without
+    // signaling its children leaves orphaned backends holding those pipes and
+    // the reference standing indefinitely. Answering "already running" from
+    // the reference alone would resolve start() for a database that is not
+    // there — and the caller is told by no other route either, since
+    // reportServerExit lives in the very handler that has not run.
+    type Internals = {
+      pgProcess: unknown;
+      pgProcessLifecycle: {
+        proc: unknown;
+        closed: Promise<void>;
+        finalize(): Promise<void>;
+      } | null;
+    };
+
+    const internals = server as unknown as Internals;
+    const stale = fakeChild(999002);
+
+    // Gone as far as Node is concerned, with a `close` that never arrives.
+    (stale.proc as { exitCode: number | null }).exitCode = 0;
+
+    let finalized = false;
+
+    internals.pgProcess = stale.proc;
+    internals.pgProcessLifecycle = {
+      proc: stale.proc,
+      closed: new Promise<void>(() => {}),
+      finalize: async () => {
+        finalized = true;
+      },
+    };
+
+    await server.start();
+
+    // The stale child's cleanup was run here rather than waited out, and a
+    // real server came up rather than a resolved promise with nothing behind
+    // it.
+    expect(finalized).toBe(true);
+
+    const status = await getLocalDevDBServerStatus({
+      pidFile,
+      dataDir: join(tempDir.name, "pgdata"),
+    });
+
+    expect(status.running).toBe(true);
+  }, 60000);
+
+  it("rejects when PostgreSQL exits at the very end of startup", async () => {
+    // Startup has done everything it was going to do, so nothing is left
+    // watching. The close handler records the failure rather than exiting —
+    // start() owns it while start() is still running — which only helps if
+    // start() asks once more before reporting success.
+    type Internals = {
+      setupUsersAndDatabases(): Promise<void>;
+      pgProcess: { pid?: number } | null;
+    };
+
+    const internals = server as unknown as Internals;
+    const original = internals.setupUsersAndDatabases.bind(server);
+
+    internals.setupUsersAndDatabases = async () => {
+      await original();
+
+      const pid = internals.pgProcess?.pid;
+
+      if (pid) {
+        process.kill(pid, "SIGQUIT");
+      }
+
+      // Wait for the close handler to run, which is what start() then has to
+      // notice. Polling the reference it clears rather than a fixed sleep.
+      for (let i = 0; i < 100 && internals.pgProcess !== null; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    };
+
+    await expect(server.start()).rejects.toThrow(/before it was ready/i);
+    expect(existsSync(pidFile)).toBe(false);
+  }, 60000);
+
+  it("resolves when there is nothing to stop", async () => {
+    // A host may forward a signal before start() ever spawned, or after a
+    // stop(). Neither is an error, and neither exits.
+    let exitCode: number | undefined;
+
+    const idle = new LocalDevDBServer({
+      port: await findFreePort(),
+      user: "idle_user",
+      password: "idle_password",
+      database: "idle_database",
+      dataDir: join(tempDir.name, "unused-pgdata"),
+      pidFile: join(tempDir.name, ".unused_pg_pid"),
+      onExit: (code) => {
+        exitCode = code;
+      },
+    });
+
+    await idle.shutdown("SIGTERM");
+    await idle.stop();
+
+    expect(exitCode).toBeUndefined();
+  });
+  it("fails fast when the server binary cannot be spawned", async () => {
+    // A spawn that fails emits "error" and never "close". With no listener
+    // that is an unhandled event, which throws out of the event loop instead
+    // of rejecting start(), so the documented start().catch(...) never sees
+    // it — and waiting the failure out took the full thirty seconds.
+    type Internals = {
+      startPostgresServer(binaries: {
+        postgres: string;
+        pg_ctl: string;
+        initdb: string;
+      }): Promise<void>;
+      waitForServerReady(maxAttempts?: number): Promise<boolean>;
+      startingUp: boolean;
+    };
+
+    const internals = server as unknown as Internals;
+    const missing = join(tempDir.name, "no-such-postgres");
+
+    // start() sets this for the window in which it owns the failure; the
+    // child's close handler defers to it rather than exiting the process.
+    internals.startingUp = true;
+
+    try {
+      await internals.startPostgresServer({
+        postgres: missing,
+        pg_ctl: missing,
+        initdb: missing,
+      });
+
+      // Let the failed spawn's "error" event land.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      const began = Date.now();
+
+      await expect(internals.waitForServerReady()).rejects.toThrow();
+
+      // The point of recording the failure: no waiting out 30 attempts for a
+      // server that was never going to appear.
+      expect(Date.now() - began).toBeLessThan(5000);
+      expect(exitCalled).toBe(false);
+    } finally {
+      internals.startingUp = false;
+    }
+  }, 45000);
+
+  describe("writing the PID record", () => {
+    // The record is written to a sibling and renamed into place. Writing the
+    // path directly would truncate it first, so a failure part-way through
+    // would leave a file that is neither a valid record nor known to be this
+    // invocation's — and every later start would refuse it as unreadable.
+    type PidWriter = {
+      writePidRecord(pid: number): Promise<void>;
+      releasePidRecord(): Promise<void>;
+      pidRecordIsOurs(path: string, ownRecord: string): Promise<boolean>;
+      readClaimedRecord(
+        path: string,
+      ): Promise<{ raw: string } | { error: unknown }>;
+      pidRecord: string | null;
+    };
+
+    const siblings = (): string[] =>
+      readdirSync(tempDir.name).filter((name) => name.endsWith(".tmp"));
+
+    const claims = (): string[] =>
+      readdirSync(tempDir.name).filter((name) => name.endsWith(".claim"));
+
+    /** A complete record for somebody else's server. */
+    const foreignRecord = (pid: number): string =>
+      JSON.stringify({
+        pid,
+        startedAt: Date.now(),
+        dataDir: tempDir.name,
+        port: serverPort,
+        bootTime: null,
+      });
+
+    it("leaves a complete record and no sibling behind", async () => {
+      const writer = server as unknown as PidWriter;
+
+      await writer.writePidRecord(process.pid);
+
+      const record = JSON.parse(readFileSync(pidFile, "utf8"));
+
+      expect(record.pid).toBe(process.pid);
+      expect(record.port).toBe(serverPort);
+      expect(typeof record.startedAt).toBe("number");
+      expect(writer.pidRecord).toBe(readFileSync(pidFile, "utf8"));
+      expect(siblings()).toEqual([]);
+    });
+
+    it("refuses to overwrite a record that arrived after startup accounted for the last one", async () => {
+      // The window a rename could not see. cleanupExistingProcess accounts for
+      // what is at this name and removes it or refuses, but the spawn and the
+      // readiness wait sit between that and the write, and a second cluster
+      // sharing this pidFile can write its own record in between. Renamed into
+      // place, that live record is replaced silently — around every refusal
+      // written to stop exactly this — and the other server goes on running
+      // with nothing recording it.
+      const writer = server as unknown as PidWriter;
+      const arrived = foreignRecord(9999);
+
+      writeFileSync(pidFile, arrived);
+
+      await expect(writer.writePidRecord(4242)).rejects.toThrow(
+        /taken this pidFile/,
+      );
+
+      // Left exactly as it was, and this invocation claims to own nothing, so
+      // a later release has no record here to delete either.
+      expect(readFileSync(pidFile, "utf8")).toBe(arrived);
+      expect(writer.pidRecord).toBeNull();
+      expect(siblings()).toEqual([]);
+    });
+
+    it("does not truncate an existing record when the write fails", async () => {
+      // The property the rename buys: a write that cannot complete never
+      // reaches the real path at all. A read-only directory blocks creating
+      // the sibling while leaving the record itself readable, so a direct
+      // write would have truncated it to nothing by now.
+      const holder = join(tempDir.name, "readonly");
+      const heldPidFile = join(holder, ".pg_pid");
+
+      mkdirSync(holder);
+      writeFileSync(
+        heldPidFile,
+        '{"pid":123,"startedAt":1,"dataDir":"/x","port":2}',
+      );
+      chmodSync(holder, 0o500);
+
+      // Windows does not enforce directory modes this way, and root ignores
+      // them everywhere. Confirm the block is real before asserting on it.
+      let enforced = false;
+
+      try {
+        writeFileSync(join(holder, "probe"), "x");
+      } catch {
+        enforced = true;
+      }
+
+      if (!enforced) {
+        chmodSync(holder, 0o700);
+
+        return;
+      }
+
+      const held = new LocalDevDBServer({
+        port: await findFreePort(),
+        user: "held_user",
+        password: "held_password",
+        database: "held_database",
+        dataDir: join(tempDir.name, "unused-pgdata"),
+        pidFile: heldPidFile,
+        onExit: () => {},
+      });
+
+      const writer = held as unknown as PidWriter;
+
+      await expect(writer.writePidRecord(process.pid)).rejects.toThrow();
+
+      // Untouched: still the record that was there before, not an empty file.
+      expect(JSON.parse(readFileSync(heldPidFile, "utf8")).pid).toBe(123);
+      expect(writer.pidRecord).toBeNull();
+
+      chmodSync(holder, 0o700);
+    });
+
+    it("clears the sibling when the rename fails", async () => {
+      // Nothing else knows the sibling's name, so a rename that fails has to
+      // clear it or it lingers forever.
+      const pidFileAsDirectory = join(tempDir.name, "pid-as-directory");
+
+      mkdirSync(pidFileAsDirectory);
+
+      const blocked = new LocalDevDBServer({
+        port: await findFreePort(),
+        user: "blocked_user",
+        password: "blocked_password",
+        database: "blocked_database",
+        dataDir: join(tempDir.name, "unused-pgdata"),
+        pidFile: pidFileAsDirectory,
+        onExit: () => {},
+      });
+
+      const writer = blocked as unknown as PidWriter;
+
+      await expect(writer.writePidRecord(process.pid)).rejects.toThrow();
+
+      expect(writer.pidRecord).toBeNull();
+      expect(siblings()).toEqual([]);
+    });
+
+    it("does not remove a record that replaced its own", async () => {
+      // A child's `close` can fire long after the process died, because an
+      // inherited stdio handle keeps it pending. By then another server may
+      // have written its own record over ours. Releasing on the strength of
+      // having once written one would delete that live server's record.
+      const writer = server as unknown as PidWriter;
+
+      await writer.writePidRecord(4242);
+
+      // Somebody else takes the file over while our release is still pending.
+      writeFileSync(pidFile, foreignRecord(9999));
+
+      await writer.releasePidRecord();
+
+      expect(JSON.parse(readFileSync(pidFile, "utf8")).pid).toBe(9999);
+      expect(writer.pidRecord).toBeNull();
+      expect(claims()).toEqual([]);
+    });
+
+    it("does not remove a replacement record that names the same PID", async () => {
+      // The number is not the token. Our child exits, the OS hands its PID to
+      // a replacement server, and that server writes its own record before our
+      // delayed `close` runs. Matching on the PID alone recognizes that live
+      // record as ours and deletes it, leaving a running server unrecorded.
+      const writer = server as unknown as PidWriter;
+
+      await writer.writePidRecord(4242);
+
+      const replacement = foreignRecord(4242);
+
+      writeFileSync(pidFile, replacement);
+
+      await writer.releasePidRecord();
+
+      expect(readFileSync(pidFile, "utf8")).toBe(replacement);
+      expect(claims()).toEqual([]);
+    });
+
+    it("does not delete a record that replaced its own inside the gap", async () => {
+      // Reading the shared path and then unlinking the shared path are two
+      // steps. Another server renaming its own record into place between them
+      // used to have the unlink delete that live record after all. The record
+      // is claimed with a rename first, so the delete decision is made on a
+      // path nothing else can reach.
+      const writer = server as unknown as PidWriter;
+
+      await writer.writePidRecord(4242);
+
+      // Stands in for that other server, landing in the window that used to
+      // be unguarded: after our own record has been recognized, before it is
+      // taken out of the way.
+      const realPidRecordIsOurs = writer.pidRecordIsOurs.bind(writer);
+      let replaced = false;
+
+      writer.pidRecordIsOurs = async (path: string, ownRecord: string) => {
+        const answer = await realPidRecordIsOurs(path, ownRecord);
+
+        if (!replaced) {
+          replaced = true;
+          writeFileSync(pidFile, foreignRecord(9999));
+        }
+
+        return answer;
+      };
+
+      await writer.releasePidRecord();
+
+      // Put back rather than deleted, and the claim tidied away.
+      expect(existsSync(pidFile)).toBe(true);
+      expect(JSON.parse(readFileSync(pidFile, "utf8")).pid).toBe(9999);
+      expect(claims()).toEqual([]);
+    });
+
+    it("leaves the newest record alone when one arrives during the claim", async () => {
+      // The restore must never overwrite: by the time it runs, a third record
+      // may hold the name, and it is newer than the one being put back.
+      const writer = server as unknown as PidWriter;
+
+      await writer.writePidRecord(4242);
+
+      const realPidRecordIsOurs = writer.pidRecordIsOurs.bind(writer);
+      const realReadClaimedRecord = writer.readClaimedRecord.bind(writer);
+
+      // Recognized as ours, and then another server replaces it, so the claim
+      // picks up theirs rather than ours.
+      writer.pidRecordIsOurs = async (path: string, ownRecord: string) => {
+        const answer = await realPidRecordIsOurs(path, ownRecord);
+
+        writeFileSync(pidFile, foreignRecord(9999));
+
+        return answer;
+      };
+
+      // Reading the claimed record is the one step between the rename that
+      // takes the name and the link that gives it back, so a third writer
+      // lands here or nowhere.
+      writer.readClaimedRecord = async (path: string) => {
+        const held = await realReadClaimedRecord(path);
+
+        writeFileSync(pidFile, foreignRecord(7777));
+
+        return held;
+      };
+
+      await writer.releasePidRecord();
+
+      expect(JSON.parse(readFileSync(pidFile, "utf8")).pid).toBe(7777);
+      expect(claims()).toEqual([]);
+    });
+
+    it("removes its own record, and only once", async () => {
+      const writer = server as unknown as PidWriter;
+
+      await writer.writePidRecord(4242);
+      await writer.releasePidRecord();
+
+      expect(existsSync(pidFile)).toBe(false);
+
+      // A second release must not reach the unlink at all: by then the file
+      // may belong to somebody else.
+      writeFileSync(pidFile, JSON.stringify({ pid: 9999 }));
+      await writer.releasePidRecord();
+
+      expect(existsSync(pidFile)).toBe(true);
+      expect(claims()).toEqual([]);
+    });
+  });
+
+  it("should not delete a PID file it did not write when startup refuses", async () => {
+    // Startup can refuse before spawning anything — here because a live
+    // process at the recorded PID cannot be identified. The failed-start
+    // cleanup must not then remove the PID file, since it describes somebody
+    // else's server and is the only record of it.
+    const otherPidFile = join(tempDir.name, ".other_pg_pid");
+    // A stand-in that looks like PostgreSQL but names no data directory, so it
+    // cannot be tied to this cluster or ruled out. Identification reads the
+    // executable name, so the copy must BE the executable — a shebang script
+    // would report its interpreter instead.
+    const standIn = join(
+      tempDir.name,
+      process.platform === "win32" ? "postgres.exe" : "postgres",
+    );
+    const keepAlive = join(tempDir.name, "keepalive.js");
+
+    copyFileSync(process.execPath, standIn);
+
+    if (process.platform !== "win32") {
+      chmodSync(standIn, 0o755);
+    }
+
+    writeFileSync(keepAlive, "setTimeout(() => {}, 1e6);\n");
+
+    const child = spawn(standIn, [keepAlive, "-p", "5433"], {
+      stdio: "ignore",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    writeFileSync(otherPidFile, String(child.pid));
+
+    // A file where the data directory should be, so initdb fails and startup
+    // rejects after the refusal point.
+    const brokenDataDir = join(tempDir.name, "not_a_directory");
+
+    writeFileSync(brokenDataDir, "not a data directory");
+
+    const blocked = new LocalDevDBServer({
+      port: await findFreePort(),
+      user: "blocked_user",
+      password: "blocked_password",
+      database: "blocked_database",
+      dataDir: brokenDataDir,
+      pidFile: otherPidFile,
+      onExit: () => {},
+    });
+
+    // The refusal happens before anything is spawned: a process is alive at
+    // the recorded PID and cannot be identified, so it is neither safe to
+    // signal nor safe to forget.
+    await expect(blocked.start()).rejects.toThrow(/could not be identified/i);
+
+    expect(existsSync(otherPidFile)).toBe(true);
+    // Startup must not have written its own record over the preserved one.
+    expect(readFileSync(otherPidFile, "utf8").trim()).toBe(String(child.pid));
+
+    child.kill("SIGKILL");
+  }, 60000);
+
+  it("refuses rather than orphan a live server for another cluster", async () => {
+    // One pidFile path shared across two data directories — what you get by
+    // leaving pidFile at its default and changing dataDir. The record names
+    // the OLD cluster, and a process is still alive at that PID. Carrying on
+    // would either delete that record or overwrite it with ours the moment we
+    // spawn, and either way nothing on disk would say what is holding that
+    // server's port. One file cannot describe two clusters, so startup has to
+    // refuse — and must leave the record it refused over intact.
+    const sharedPidFile = join(tempDir.name, ".shared_pg_pid");
+    const otherDataDir = join(tempDir.name, "pgdata-previous");
+
+    // Genuinely that cluster's server: a postgres naming its data directory.
+    // A bare process holding the number is not enough to refuse over, and
+    // should not be — after a reboot that is an ordinary thing for a
+    // low-numbered PID, with no server anywhere to protect.
+    const standIn = join(
+      tempDir.name,
+      process.platform === "win32" ? "postgres.exe" : "postgres",
+    );
+    const keepAlive = join(tempDir.name, "orphan-keepalive.js");
+
+    copyFileSync(process.execPath, standIn);
+
+    if (process.platform !== "win32") {
+      chmodSync(standIn, 0o755);
+    }
+
+    writeFileSync(keepAlive, "setTimeout(() => {}, 1e6);\n");
+
+    const child = spawn(standIn, [keepAlive, "-D", otherDataDir], {
+      stdio: "ignore",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 400));
+
+    const record = {
+      pid: child.pid,
+      startedAt: Date.now(),
+      dataDir: otherDataDir,
+      port: 5599,
+      // Written during this boot; a record predating it describes a server
+      // that is gone, and is deliberately not protected.
+      bootTime: getSystemBootTime(),
+    };
+
+    writeFileSync(sharedPidFile, JSON.stringify(record));
+
+    const moved = new LocalDevDBServer({
+      port: await findFreePort(),
+      user: "moved_user",
+      password: "moved_password",
+      database: "moved_database",
+      dataDir: join(tempDir.name, "pgdata-current"),
+      pidFile: sharedPidFile,
+      onExit: () => {},
+    });
+
+    try {
+      await expect(moved.start()).rejects.toThrow(
+        /another data directory|orphan/i,
+      );
+
+      // The other cluster's record must have survived byte for byte.
+      expect(readFileSync(sharedPidFile, "utf8")).toBe(JSON.stringify(record));
+    } finally {
+      child.kill("SIGKILL");
+    }
+  }, 60000);
+
+  it("checks the start-time fingerprint before each signal", async () => {
+    // Identity is rechecked before every signal, and a start time is what
+    // makes that possible. Re-deriving identity from the command line is
+    // ambiguous in both directions — undecidable both for a server that IS
+    // ours and for a replacement nothing can be read about — and those need
+    // opposite answers. A PID cannot be reused without the process behind it
+    // changing, so the start time captured when the escalation was authorized
+    // separates the two.
+    type Internals = {
+      confirmSignalTarget(
+        pid: number,
+        target: {
+          kind: "recorded";
+          startedAt: number | null;
+          fingerprint: number | null;
+        },
+      ): "ours" | "gone" | "pid-reused" | "unknown";
+    };
+
+    const internals = server as unknown as Internals;
+
+    // A stand-in named postgres that names no data directory, so it can be
+    // neither confirmed as this cluster nor ruled out by the command line.
+    const standIn = join(
+      tempDir.name,
+      process.platform === "win32" ? "postgres.exe" : "postgres",
+    );
+    const keepAlive = join(tempDir.name, "recheck-keepalive.js");
+
+    copyFileSync(process.execPath, standIn);
+
+    if (process.platform !== "win32") {
+      chmodSync(standIn, 0o755);
+    }
+
+    writeFileSync(keepAlive, "setTimeout(() => {}, 1e6);\n");
+
+    const undecidable = spawn(standIn, [keepAlive], { stdio: "ignore" });
+
+    await new Promise((resolve) => setTimeout(resolve, 400));
+
+    const pid = undecidable.pid as number;
+    const fingerprint = getProcessStartTime(pid);
+
+    if (fingerprint === null) {
+      undecidable.kill("SIGKILL");
+
+      return;
+    }
+
+    try {
+      // Unreadable command line, matching fingerprint: still ours. Without
+      // this the escalation would abandon a live server it was already
+      // authorized to stop.
+      expect(
+        internals.confirmSignalTarget(pid, {
+          kind: "recorded",
+          startedAt: null,
+          fingerprint,
+        }),
+      ).toBe("ours");
+
+      // A nearby timestamp is still a different process. Liveness only says
+      // the PID is occupied, and allowing clock tolerance here would signal a
+      // replacement that acquired the number soon after PostgreSQL exited.
+      expect(
+        internals.confirmSignalTarget(pid, {
+          kind: "recorded",
+          startedAt: null,
+          fingerprint: fingerprint - 500,
+        }),
+      ).toBe("pid-reused");
+
+      // The same PID, but the process behind it is not the one authorized —
+      // which is what PID reuse looks like from here.
+      expect(
+        internals.confirmSignalTarget(pid, {
+          kind: "recorded",
+          startedAt: null,
+          fingerprint: fingerprint - 600_000,
+        }),
+      ).toBe("pid-reused");
+
+      expect(
+        internals.confirmSignalTarget(999999, {
+          kind: "recorded",
+          startedAt: null,
+          fingerprint,
+        }),
+      ).toBe("gone");
+    } finally {
+      undecidable.kill("SIGKILL");
+    }
+  }, 30000);
+
+  it("takes the fingerprint from the verification, not a later read", async () => {
+    // The fingerprint has to be the value identity was established from. A
+    // read taken afterwards is a fresh observation of whatever holds the
+    // number then, and if it changed hands in between no timestamp test
+    // separates the replacement from the original — they can fall arbitrarily
+    // close together.
+    type Internals = {
+      captureSignalFingerprint(
+        pid: number,
+        observedStartTime: number | null,
+      ): { fingerprint: number | null } | null;
+    };
+
+    const internals = server as unknown as Internals;
+
+    // A live stand-in named postgres serving THIS data directory, so its
+    // command line alone identifies it — the one way a PID is verified
+    // without a clock being consulted at all.
+    const dataDir = join(tempDir.name, "pgdata");
+    const standIn = join(
+      tempDir.name,
+      process.platform === "win32" ? "postgres.exe" : "postgres",
+    );
+    const keepAlive = join(tempDir.name, "capture-keepalive.js");
+
+    copyFileSync(process.execPath, standIn);
+
+    if (process.platform !== "win32") {
+      chmodSync(standIn, 0o755);
+    }
+
+    writeFileSync(keepAlive, "setTimeout(() => {}, 1e6);\n");
+
+    const serving = spawn(standIn, [keepAlive, "-D", dataDir], {
+      stdio: "ignore",
+    });
+    // An ordinary process, standing in for one that took a recycled number.
+    const unrelated = spawn(
+      process.execPath,
+      ["-e", "setTimeout(() => {}, 1e6)"],
+      { stdio: "ignore" },
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 400));
+
+    const servingPid = serving.pid as number;
+
+    try {
+      // An observed value is carried straight through — it is not re-read, and
+      // it is not compared against the record. Comparing would only bound the
+      // gap between two timestamps, which is not identity.
+      expect(internals.captureSignalFingerprint(servingPid, 4242)).toEqual({
+        fingerprint: 4242,
+      });
+
+      // Nothing observed means the PID was verified without a clock, by its
+      // command line naming this data directory. The bracketed recheck proves
+      // that observation was coherent, but later checks must keep using the
+      // command line instead of promoting a coarse timestamp to identity.
+      expect(internals.captureSignalFingerprint(servingPid, null)).toEqual({
+        fingerprint: null,
+      });
+
+      // The same, but the number is held by something that is not serving this
+      // cluster: nothing ties it to the reported server, so nothing may be
+      // signaled.
+      expect(
+        internals.captureSignalFingerprint(unrelated.pid as number, null),
+      ).toBeNull();
+
+      // A process that has gone away during the check is a stop, not a number
+      // changing hands, and must not fail startup.
+      expect(internals.captureSignalFingerprint(999999, null)).toEqual({
+        fingerprint: null,
+      });
+    } finally {
+      serving.kill("SIGKILL");
+      unrelated.kill("SIGKILL");
+    }
+  }, 30000);
+
+  it("does not refuse over another cluster's record whose number was reused", async () => {
+    // The different-cluster refusal is a hard stop, so it needs evidence that
+    // the other cluster's server is actually there — not merely that its
+    // number is in use. After a reboot a low-numbered PID is very likely held
+    // by something unrelated, and a bare liveness check would refuse on every
+    // run with no server anywhere to protect.
+    type Internals = {
+      otherClusterStillLive(
+        pid: number,
+        startedAt: number | null,
+        otherDataDir: string | null,
+      ): boolean;
+    };
+
+    const internals = server as unknown as Internals;
+    const otherDataDir = join(tempDir.name, "pgdata-previous");
+
+    const standIn = join(
+      tempDir.name,
+      process.platform === "win32" ? "postgres.exe" : "postgres",
+    );
+    const keepAlive = join(tempDir.name, "other-keepalive.js");
+
+    copyFileSync(process.execPath, standIn);
+
+    if (process.platform !== "win32") {
+      chmodSync(standIn, 0o755);
+    }
+
+    writeFileSync(keepAlive, "setTimeout(() => {}, 1e6);\n");
+
+    // Genuinely that cluster's server.
+    const live = spawn(standIn, [keepAlive, "-D", otherDataDir], {
+      stdio: "ignore",
+    });
+    // Merely holding a number the record happens to name.
+    const unrelated = spawn(
+      process.execPath,
+      ["-e", "setTimeout(() => {}, 1e6)"],
+      { stdio: "ignore" },
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 400));
+
+    try {
+      expect(
+        internals.otherClusterStillLive(live.pid as number, null, otherDataDir),
+      ).toBe(true);
+
+      expect(
+        internals.otherClusterStillLive(
+          unrelated.pid as number,
+          null,
+          otherDataDir,
+        ),
+      ).toBe(false);
+
+      expect(internals.otherClusterStillLive(999999, null, otherDataDir)).toBe(
+        false,
+      );
+    } finally {
+      live.kill("SIGKILL");
+      unrelated.kill("SIGKILL");
+    }
+  }, 30000);
+
+  it("will not confirm a target on a timestamp when it has no fingerprint", async () => {
+    // With no fingerprint, the command line naming this data directory is what
+    // authorized the escalation, so it is what has to hold again. Offering a
+    // recorded start time as well would let the recheck succeed on the
+    // timestamp branch, which accepts a PostgreSQL naming no data directory at
+    // all — a replacement that inherited PGDATA.
+    type Internals = {
+      confirmSignalTarget(
+        pid: number,
+        target: {
+          kind: "recorded";
+          startedAt: number | null;
+          fingerprint: number | null;
+        },
+      ): "ours" | "gone" | "pid-reused" | "unknown";
+    };
+
+    const internals = server as unknown as Internals;
+    const standIn = join(
+      tempDir.name,
+      process.platform === "win32" ? "postgres.exe" : "postgres",
+    );
+    const keepAlive = join(tempDir.name, "timestamp-keepalive.js");
+
+    copyFileSync(process.execPath, standIn);
+
+    if (process.platform !== "win32") {
+      chmodSync(standIn, 0o755);
+    }
+
+    writeFileSync(keepAlive, "setTimeout(() => {}, 1e6);\n");
+
+    // A PostgreSQL that names NO data directory — the PGDATA-inheriting shape.
+    const inherited = spawn(standIn, [keepAlive], { stdio: "ignore" });
+
+    await new Promise((resolve) => setTimeout(resolve, 400));
+
+    const pid = inherited.pid as number;
+
+    try {
+      // Its real start time, offered as the record's, is exactly what the
+      // timestamp branch would accept. It must not be enough — and the answer
+      // is `unknown` rather than `reused`, because nothing here ruled the
+      // process out either, so it is no basis for calling the server stopped.
+      expect(
+        internals.confirmSignalTarget(pid, {
+          kind: "recorded",
+          startedAt: getProcessStartTime(pid),
+          fingerprint: null,
+        }),
+      ).toBe("unknown");
+    } finally {
+      inherited.kill("SIGKILL");
+    }
+  }, 30000);
+
+  it("aborts the escalation when nothing can confirm the target", async () => {
+    // No fingerprint means the platform cannot read a start time, so reuse
+    // cannot be detected at all. The authorization must then have come from
+    // the command line naming this data directory — so require exactly that
+    // again, and abort on anything less.
+    type Internals = {
+      confirmSignalTarget(
+        pid: number,
+        target: {
+          kind: "recorded";
+          startedAt: number | null;
+          fingerprint: number | null;
+        },
+      ): "ours" | "gone" | "pid-reused" | "unknown";
+    };
+
+    const internals = server as unknown as Internals;
+    const unrelated = spawn(
+      process.execPath,
+      ["-e", "setTimeout(() => {}, 1e6)"],
+      { stdio: "ignore" },
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 400));
+
+    try {
+      // Positively ruled out rather than merely unconfirmed: a live PID that
+      // is demonstrably some other program is how PID reuse looks from here.
+      expect(
+        internals.confirmSignalTarget(unrelated.pid as number, {
+          kind: "recorded",
+          startedAt: null,
+          fingerprint: null,
+        }),
+      ).toBe("pid-reused");
+    } finally {
+      unrelated.kill("SIGKILL");
+    }
+  }, 30000);
+
+  it("settles runPgCommand when the binary cannot be spawned", async () => {
+    // A spawn failure emits "error" and never emits "close". Without an error
+    // listener the promise never settles, so terminateProcess() hangs instead
+    // of falling back to signals — and on the startup path there is no
+    // backstop timer to rescue it.
+    type Internals = {
+      runPgCommand(
+        command: string,
+        args: string[],
+        options?: { silent?: boolean },
+      ): Promise<{ stdout: string; stderr: string; code: number | null }>;
+    };
+
+    const internals = server as unknown as Internals;
+
+    const result = await Promise.race([
+      internals.runPgCommand(join(tempDir.name, "definitely_not_here"), [], {
+        silent: true,
+      }),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("runPgCommand never settled")), 5000),
+      ),
+    ]);
+
+    expect((result as { code: number | null }).code).not.toBe(0);
+  }, 15000);
+
+  it("should keep the PID record when a failed start cannot be cleaned up", async () => {
+    // A process surviving even SIGKILL cannot be provoked with one we own, so
+    // only the kill outcome is faked; the surrounding logic is the real thing.
+    type Internals = {
+      cleanupFailedStart(): Promise<boolean>;
+      terminateProcess(pid: number, label: string): Promise<"gone" | "failed">;
+    };
+
+    await server.start();
+
+    expect(existsSync(pidFile)).toBe(true);
+
+    const internals = server as unknown as Internals;
+    const originalTerminate = internals.terminateProcess.bind(server);
+
+    internals.terminateProcess = async () => "failed";
+
+    const cleanedUp = await internals.cleanupFailedStart();
+
+    expect(cleanedUp).toBe(false);
+    // The server may still be holding the port, so its record must survive.
+    expect(existsSync(pidFile)).toBe(true);
+
+    internals.terminateProcess = originalTerminate;
+
+    // A later stop() must still complete the lifecycle. The close handler was
+    // detached during the failed cleanup, so if it was not reattached the
+    // process would be stopped while the PID file and the keep-alive interval
+    // were both left hanging — and stop() would time out waiting for a
+    // lifecycle that never finished.
+    await server.stop();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    expect(existsSync(pidFile)).toBe(false);
+    expect(exitCalled).toBe(false);
+  }, 60000);
+
+  it("does not report a running server after a spawn that never got a PID", async () => {
+    // A spawn that fails emits "error" and never "close", and the handle it
+    // leaves has no PID at all, so the escalation in cleanupFailedStart has
+    // nothing to signal and skips the block that drops the reference. Left on
+    // the instance, that handle is exactly what start() reads as "already
+    // running" — so a retry resolved with nothing behind it, and stop() found
+    // nothing to stop either.
+    type Internals = {
+      pgProcess: ReturnType<typeof spawn> | null;
+      cleanupFailedStart(): Promise<boolean>;
+    };
+
+    const internals = server as unknown as Internals;
+    const failed = spawn(join(tempDir.name, "no-such-postgres"), []);
+
+    await new Promise<void>((resolve) => failed.once("error", () => resolve()));
+
+    expect(failed.pid).toBeUndefined();
+
+    internals.pgProcess = failed;
+
+    expect(await internals.cleanupFailedStart()).toBe(true);
+    expect(internals.pgProcess).toBeNull();
+
+    // The consequence the stale reference was hiding: the retry has to start a
+    // server rather than report the failed spawn as one.
+    await server.start();
+
+    const status = await getLocalDevDBServerStatus({
+      pidFile,
+      dataDir: join(tempDir.name, "pgdata"),
+    });
+
+    expect(status.running).toBe(true);
+  }, 90000);
+
+  it("should not exit the host when a failed start's leftover server later dies", async () => {
+    // The other half of the case above. start() has already rejected and the
+    // caller has handled it, so when the server that outlived SIGKILL finally
+    // goes, that is not an unrequested crash — a shutdown was asked for here
+    // and merely could not be completed. Reading it as a crash routes through
+    // cleanupAndExit, which calls onExit and, by default, process.exit: the
+    // host process dies asynchronously over a failure it already dealt with.
+    type Internals = {
+      cleanupFailedStart(): Promise<boolean>;
+      terminateProcess(pid: number, label: string): Promise<"gone" | "failed">;
+      pgProcess: { pid?: number } | null;
+    };
+
+    await server.start();
+
+    const internals = server as unknown as Internals;
+    const pid = internals.pgProcess?.pid;
+
+    expect(pid).toBeDefined();
+
+    const originalTerminate = internals.terminateProcess.bind(server);
+
+    internals.terminateProcess = async () => "failed";
+
+    expect(await internals.cleanupFailedStart()).toBe(false);
+
+    internals.terminateProcess = originalTerminate;
+
+    // Nobody calls stop(). The server dies on its own, the way the stubborn
+    // one this path exists for eventually would.
+    process.kill(pid as number, "SIGKILL");
+
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+
+    expect(internals.pgProcess).toBeNull();
+    expect(existsSync(pidFile)).toBe(false);
+    expect(exitCalled).toBe(false);
+  }, 60000);
+
+  it("should refuse a restart while a failed start's leftover server is held", async () => {
+    // cleanupFailedStart deliberately puts the process reference back when the
+    // child outlives even SIGKILL, so a later stop() can try again. That same
+    // reference is what the "already running" guard reads, and it used to take
+    // it at face value: the caller handled start()'s rejection, called start()
+    // again, and got a RESOLVED promise reporting a server that had never come
+    // up. Refusing is the only honest answer while that child is still held.
+    type Internals = {
+      cleanupFailedStart(): Promise<boolean>;
+      terminateProcess(pid: number, label: string): Promise<"gone" | "failed">;
+      pgProcess: { pid?: number } | null;
+    };
+
+    await server.start();
+
+    const internals = server as unknown as Internals;
+    const pid = internals.pgProcess?.pid;
+
+    expect(pid).toBeDefined();
+
+    // A process that survives SIGKILL cannot be provoked with one we own, so
+    // only the kill outcome is faked; the surrounding logic is the real thing.
+    const originalTerminate = internals.terminateProcess.bind(server);
+
+    internals.terminateProcess = async () => "failed";
+
+    expect(await internals.cleanupFailedStart()).toBe(false);
+
+    internals.terminateProcess = originalTerminate;
+
+    await expect(server.start()).rejects.toThrow(/could not be stopped/i);
+
+    // And the refusal is specific to that held child rather than a permanent
+    // wedge: once it is genuinely stopped, the instance works again.
+    await server.stop();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    await server.start();
+
+    expect(internals.pgProcess).not.toBeNull();
+    expect(exitCalled).toBe(false);
+  }, 90000);
+
+  it("should not delete a PID record that was replaced mid-cleanup", async () => {
+    // cleanupExistingProcess decides from a status read taken before the
+    // escalation, and the escalation takes seconds. A postmaster that claimed
+    // this data directory inside that window is described by the very files
+    // the cleanup then deletes, and postmaster.pid is PostgreSQL's own
+    // interlock against two postmasters on one data directory, so deleting a
+    // live one removes the last thing standing between a second server and
+    // these files.
+    //
+    // A real second postmaster cannot be conjured at that instant, but what
+    // identifies one can be: taking the directory means writing its own
+    // record, so replacing the record is the thing the guard actually looks
+    // for.
+    type Internals = {
+      cleanupExistingProcess(): Promise<void>;
+      terminateProcess(pid: number, label: string): Promise<"gone" | "failed">;
+    };
+
+    const dataDir = join(tempDir.name, "pgdata");
+    const postmasterPidFile = join(dataDir, "postmaster.pid");
+
+    await server.start();
+
+    expect(existsSync(postmasterPidFile)).toBe(true);
+
+    const internals = server as unknown as Internals;
+    const originalTerminate = internals.terminateProcess.bind(server);
+
+    internals.terminateProcess = async () => {
+      // Somebody else's record, in the window between the decision and the
+      // deletion. Only the PID line changes, so the file stays a well-formed
+      // postmaster.pid and it is the record's identity being recognized rather
+      // than a parse failure.
+      const lines = readFileSync(postmasterPidFile, "utf8").split("\n");
+
+      lines[0] = String(Number(lines[0]) + 1);
+      writeFileSync(postmasterPidFile, lines.join("\n"));
+
+      return "gone";
+    };
+
+    await expect(internals.cleanupExistingProcess()).rejects.toThrow(
+      /was not there when the previous server/i,
+    );
+
+    // The point of the refusal: the record that replaced ours is still there.
+    expect(existsSync(postmasterPidFile)).toBe(true);
+
+    internals.terminateProcess = originalTerminate;
+
+    await server.stop();
+
+    expect(exitCalled).toBe(false);
+  }, 90000);
+
+  it("should still remove a stale record the escalation accounted for", async () => {
+    // The other half. An unchanged record describes the server just stopped,
+    // whatever has become of the number it names, so it is the cleanup's to
+    // remove. Recognizing the record rather than re-probing that number is
+    // what keeps this case from refusing: a PID recycled to something
+    // unidentifiable would make a provably stale file look undecidable.
+    type Internals = {
+      cleanupExistingProcess(): Promise<void>;
+      terminateProcess(pid: number, label: string): Promise<"gone" | "failed">;
+    };
+
+    const dataDir = join(tempDir.name, "pgdata");
+    const postmasterPidFile = join(dataDir, "postmaster.pid");
+
+    await server.start();
+
+    const internals = server as unknown as Internals;
+    const originalTerminate = internals.terminateProcess.bind(server);
+
+    // Stops nothing and changes nothing, so the records are exactly the ones
+    // the cleanup set out to account for.
+    internals.terminateProcess = async () => "gone";
+
+    await internals.cleanupExistingProcess();
+
+    expect(existsSync(postmasterPidFile)).toBe(false);
+    expect(existsSync(pidFile)).toBe(false);
+
+    internals.terminateProcess = originalTerminate;
+
+    await server.stop();
+
+    expect(exitCalled).toBe(false);
+  }, 90000);
+
+  it("should claim a PID record before deciding whether to delete it", async () => {
+    // Reading a path and then unlinking that path are two steps, and a record
+    // written between them is the one that gets deleted. The rename closes
+    // that: whatever comes back is held by this call alone, so the decision is
+    // made about the record in hand rather than about whatever the shared name
+    // points at by the time the unlink lands. A record that turns out not to
+    // be ours has to survive the round trip intact.
+    type Internals = {
+      removeRecordIfUnchanged(
+        path: string,
+        accounted: string,
+        identify: (raw: string) => string,
+      ): Promise<{ outcome: string }>;
+    };
+
+    const internals = server as unknown as Internals;
+    const record = join(tempDir.name, "claimed-record");
+
+    writeFileSync(record, "the record that is actually there");
+
+    // Somebody else's. It has to go back exactly as it was.
+    expect(
+      (
+        await internals.removeRecordIfUnchanged(
+          record,
+          "a different record",
+          (raw) => raw,
+        )
+      ).outcome,
+    ).toBe("restored");
+    expect(existsSync(record)).toBe(true);
+    expect(readFileSync(record, "utf8")).toBe(
+      "the record that is actually there",
+    );
+
+    // No claim file left beside it either way.
+    expect(
+      readdirSync(tempDir.name).filter((name) => name.endsWith(".claim")),
+    ).toEqual([]);
+
+    // Ours, so it goes.
+    expect(
+      (
+        await internals.removeRecordIfUnchanged(
+          record,
+          "the record that is actually there",
+          (raw) => raw,
+        )
+      ).outcome,
+    ).toBe("removed");
+    expect(existsSync(record)).toBe(false);
+
+    // A claim that cannot be READ is undecidable, not disproof. Reported as
+    // `restored`, the callers read it as another server having taken this data
+    // directory and refuse a start saying so — over bytes that never changed.
+    const unreadable = server as unknown as Internals & {
+      readClaimedRecord(
+        path: string,
+      ): Promise<{ raw: string } | { error: unknown }>;
+    };
+
+    writeFileSync(record, "the record that is actually there");
+
+    const originalRead = unreadable.readClaimedRecord.bind(server);
+    const readFailure = Object.assign(new Error("EIO"), { code: "EIO" });
+
+    unreadable.readClaimedRecord = async () => ({ error: readFailure });
+
+    const undecidable = (await unreadable.removeRecordIfUnchanged(
+      record,
+      "the record that is actually there",
+      (raw) => raw,
+    )) as { outcome: string; error?: unknown };
+
+    unreadable.readClaimedRecord = originalRead;
+
+    expect(undecidable.outcome).toBe("unclaimable");
+    expect(undecidable.error).toBe(readFailure);
+
+    // Back exactly as it was, with no claim left beside it.
+    expect(readFileSync(record, "utf8")).toBe(
+      "the record that is actually there",
+    );
+    expect(
+      readdirSync(tempDir.name).filter((name) => name.endsWith(".claim")),
+    ).toEqual([]);
+
+    // Ours again, so it goes.
+    expect(
+      (
+        await internals.removeRecordIfUnchanged(
+          record,
+          "the record that is actually there",
+          (raw) => raw,
+        )
+      ).outcome,
+    ).toBe("removed");
+
+    // Nothing there at all is not a failure, just nothing to do.
+    expect(
+      (
+        await internals.removeRecordIfUnchanged(
+          record,
+          "anything",
+          (raw) => raw,
+        )
+      ).outcome,
+    ).toBe("absent");
+
+    expect(
+      readdirSync(tempDir.name).filter((name) => name.endsWith(".claim")),
+    ).toEqual([]);
+  }, 30000);
+
+  it("should discard a claimed record a third one has already replaced", async () => {
+    // Putting a record back fails when a THIRD one took the name meanwhile,
+    // and that one is newer than the one in hand, so there is nowhere for this
+    // to go. Keeping it would leave a claim file nothing ever reads, one per
+    // attempt, under a name nothing looks for. Reported apart from a record
+    // that went back, since releasing this instance's own record has a line to
+    // log here and nothing to say there.
+    type Internals = {
+      removeRecordIfUnchanged(
+        path: string,
+        accounted: string,
+        identify: (raw: string) => string,
+      ): Promise<{ outcome: string }>;
+      readClaimedRecord(
+        path: string,
+      ): Promise<{ raw: string } | { error: unknown }>;
+    };
+
+    const internals = server as unknown as Internals;
+    const originalReadClaimedRecord = internals.readClaimedRecord.bind(server);
+    const record = join(tempDir.name, "displaced-record");
+
+    writeFileSync(record, "the record that was claimed");
+
+    // The read of the claimed file is the one step between the rename that
+    // takes the name and the link that gives it back, so a third writer lands
+    // here or nowhere.
+    internals.readClaimedRecord = async (path: string) => {
+      const held = await originalReadClaimedRecord(path);
+
+      if (path !== record) {
+        writeFileSync(record, "a third server's newer record");
+      }
+
+      return held;
+    };
+
+    try {
+      // Not the accounted bytes, so it takes the restore path — and the name
+      // is taken by then.
+      expect(
+        (
+          await internals.removeRecordIfUnchanged(
+            record,
+            "the record this start accounted for",
+            (raw) => raw,
+          )
+        ).outcome,
+      ).toBe("discarded");
+    } finally {
+      internals.readClaimedRecord = originalReadClaimedRecord;
+    }
+
+    // The newer record keeps the name, untouched.
+    expect(readFileSync(record, "utf8")).toBe("a third server's newer record");
+
+    // And the displaced one is gone rather than stranded beside it.
+    expect(
+      readdirSync(tempDir.name).filter((name) => name.endsWith(".claim")),
+    ).toEqual([]);
+  }, 30000);
+
+  it("should not delete another cluster's live record it never examined", async () => {
+    // probeStatusFromFiles answers from postmaster.pid and returns without
+    // reading strataline's own record at all, so a start whose own cluster
+    // verifies forms no view of that file whatsoever. The removal at the end
+    // used to delete it anyway on the strength of its bytes not having changed
+    // across the probe, which is not the same thing as having been looked at.
+    //
+    // Point two data directories at one pidFile and that is the record of
+    // somebody else's running server, erased on the way past by a start that
+    // never considered it. statusFromPidFile has refused exactly this since
+    // the different-cluster rule went in; it simply never ran here.
+    type Internals = {
+      cleanupExistingProcess(): Promise<void>;
+      terminateProcess(pid: number, label: string): Promise<"gone" | "failed">;
+    };
+
+    const dataDir = join(tempDir.name, "pgdata");
+    const postmasterPidFile = join(dataDir, "postmaster.pid");
+    const otherDataDir = join(tempDir.name, "pgdata-other");
+
+    // A stand-in rather than a real second cluster: what makes it that
+    // cluster's server is its command line naming that directory, which is
+    // the only thing verifyPid reads here.
+    const standIn = join(
+      tempDir.name,
+      process.platform === "win32" ? "postgres.exe" : "postgres",
+    );
+    const keepAlive = join(tempDir.name, "other-cluster-keepalive.js");
+
+    copyFileSync(process.execPath, standIn);
+
+    if (process.platform !== "win32") {
+      chmodSync(standIn, 0o755);
+    }
+
+    writeFileSync(keepAlive, "setTimeout(() => {}, 1e6);\n");
+
+    await server.start();
+
+    const other = spawn(standIn, [keepAlive, "-D", otherDataDir], {
+      stdio: "ignore",
+    });
+
+    // Long enough for the process to be there to observe.
+    await new Promise((resolve) => setTimeout(resolve, 400));
+
+    const foreignRecord = JSON.stringify({
+      pid: other.pid,
+      startedAt: Date.now(),
+      dataDir: otherDataDir,
+      port: serverPort + 1,
+      bootTime: getSystemBootTime(),
+      uid: process.geteuid?.() ?? null,
+    });
+
+    const internals = server as unknown as Internals;
+    const originalTerminate = internals.terminateProcess.bind(server);
+
+    // Stops nothing and changes nothing, so the records reaching the removal
+    // are exactly the ones the cleanup set out to account for.
+    internals.terminateProcess = async () => "gone";
+
+    try {
+      // The shared pidFile now holds that server's live record.
+      writeFileSync(pidFile, foreignRecord);
+
+      await expect(internals.cleanupExistingProcess()).rejects.toThrow(
+        /another data directory/,
+      );
+
+      // Left exactly as it was. Deleting it would leave that server running
+      // with nothing recording it.
+      expect(existsSync(pidFile)).toBe(true);
+      expect(readFileSync(pidFile, "utf8")).toBe(foreignRecord);
+
+      // And nothing half-done beside it: a record put back has to leave no
+      // claim behind.
+      expect(
+        readdirSync(tempDir.name).filter((name) => name.endsWith(".claim")),
+      ).toEqual([]);
+
+      // postmaster.pid still goes. It is this cluster's, this start examined
+      // it, and removing it before a later refusal loses nothing.
+      expect(existsSync(postmasterPidFile)).toBe(false);
+    } finally {
+      other.kill("SIGKILL");
+      internals.terminateProcess = originalTerminate;
+
+      // Tolerant, so that a regression is reported by the assertion above
+      // rather than by the teardown tripping over the very file it deleted.
+      if (existsSync(pidFile)) {
+        unlinkSync(pidFile);
+      }
+
+      await server.stop();
+    }
+
+    expect(exitCalled).toBe(false);
+  }, 90000);
+
+  it("should not delete a live foreign server's old-format record", async () => {
+    // A legacy record is the bare PID and nothing else, so unlike the
+    // structured form it names no data directory and cannot be told apart from
+    // this cluster's own by reading it. That must not make it the one record
+    // that reaches the removal unexamined. What the record cannot say, the
+    // live process can: strataline starts PostgreSQL with an absolute -D.
+    type Internals = {
+      cleanupExistingProcess(): Promise<void>;
+      terminateProcess(pid: number, label: string): Promise<"gone" | "failed">;
+    };
+
+    const otherDataDir = join(tempDir.name, "pgdata-legacy-other");
+    const standIn = join(
+      tempDir.name,
+      process.platform === "win32" ? "postgres.exe" : "postgres",
+    );
+    const keepAlive = join(tempDir.name, "legacy-keepalive.js");
+
+    copyFileSync(process.execPath, standIn);
+
+    if (process.platform !== "win32") {
+      chmodSync(standIn, 0o755);
+    }
+
+    writeFileSync(keepAlive, "setTimeout(() => {}, 1e6);\n");
+
+    await server.start();
+
+    const other = spawn(standIn, [keepAlive, "-D", otherDataDir], {
+      stdio: "ignore",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 400));
+
+    const internals = server as unknown as Internals;
+    const originalTerminate = internals.terminateProcess.bind(server);
+
+    internals.terminateProcess = async () => "gone";
+
+    try {
+      // Exactly what strataline 4.0.3 and earlier wrote.
+      writeFileSync(pidFile, String(other.pid));
+
+      await expect(internals.cleanupExistingProcess()).rejects.toThrow(
+        /another data directory/,
+      );
+
+      expect(readFileSync(pidFile, "utf8")).toBe(String(other.pid));
+    } finally {
+      other.kill("SIGKILL");
+      internals.terminateProcess = originalTerminate;
+
+      if (existsSync(pidFile)) {
+        unlinkSync(pidFile);
+      }
+
+      await server.stop();
+    }
+
+    expect(exitCalled).toBe(false);
+  }, 90000);
+
+  it("should keep the command snapshot that identified an old-format record", async () => {
+    // The verifier's command read is the evidence that this bare PID belongs
+    // to a live foreign server. A second read can fail transiently, and that
+    // failure must not erase the evidence and license deleting its record.
+    // This PID is deliberately absent, so the old second OS read returned
+    // null even though the injected verification snapshot was decisive.
+    type Internals = {
+      otherClusterStillLive(
+        pid: number,
+        startedAt: number | null,
+        dataDir: string | null,
+      ): boolean;
+      pidVerificationProbes: ProcessProbes;
+      refuseUnexaminedPidRecord(accounted: string): Promise<void>;
+    };
+
+    const internals = server as unknown as Internals;
+    const originalOtherClusterStillLive = internals.otherClusterStillLive;
+    const originalProbes = internals.pidVerificationProbes;
+    const absentPid = 2_147_483_647;
+    const otherDataDir = join(tempDir.name, "snapshot-other");
+    let commandReads = 0;
+
+    internals.pidVerificationProbes = {
+      isAlive: () => true,
+      command: () => {
+        commandReads++;
+
+        return `postgres -D ${otherDataDir}`;
+      },
+      startTime: () => null,
+      bootTime: () => null,
+      uid: () => null,
+    };
+    internals.otherClusterStillLive = () => true;
+
+    try {
+      await expect(
+        internals.refuseUnexaminedPidRecord(String(absentPid)),
+      ).rejects.toThrow(/another data directory/i);
+
+      expect(commandReads).toBe(1);
+    } finally {
+      internals.pidVerificationProbes = originalProbes;
+      internals.otherClusterStillLive = originalOtherClusterStillLive;
+    }
+  });
+
+  it("removes a foreign record whose owner proves its server is gone", async () => {
+    // The refusal is a hard stop that stands until somebody deletes the file
+    // by hand, so it takes evidence that the other server is actually there.
+    // A uid mismatch is evidence it is not: a process cannot change uid after
+    // exec, so whatever holds the number now was never that server, whichever
+    // directory the record named.
+    //
+    // The owner is all there is to go on here. A readable command line would
+    // settle it without the uid — and settle it the other way if it named that
+    // directory, since a live server for it is a live server whoever owns it —
+    // so the case where the uid decides anything is the one where nothing else
+    // could be read. Withheld, that leaves the PID undecidable and the start
+    // refuses, on every run, over a number it had proof was somebody else's.
+    type Internals = {
+      pidVerificationProbes: ProcessProbes;
+      refuseUnexaminedPidRecord(accounted: string): Promise<void>;
+    };
+
+    const internals = server as unknown as Internals;
+    const originalProbes = internals.pidVerificationProbes;
+    const otherDataDir = join(tempDir.name, "owned-by-somebody-else");
+
+    internals.pidVerificationProbes = {
+      isAlive: () => true,
+      command: () => null,
+      startTime: () => null,
+      bootTime: () => null,
+      // Running as a different user than the record says started it.
+      uid: () => 501,
+    };
+
+    const record = JSON.stringify({
+      pid: 4242,
+      startedAt: Date.now(),
+      dataDir: otherDataDir,
+      port: 5599,
+      bootTime: null,
+      uid: 502,
+    });
+
+    // Returning rather than throwing IS the outcome: refuseUnexaminedPidRecord
+    // either refuses or lets the removal that follows it go ahead, so a start
+    // that gets past here is one that will delete the record.
+    let refused: unknown = null;
+
+    try {
+      await internals.refuseUnexaminedPidRecord(record);
+    } catch (e) {
+      refused = e;
+    } finally {
+      internals.pidVerificationProbes = originalProbes;
+    }
+
+    expect(refused).toBeNull();
+  });
+
+  it("should refuse an old-format record with a relative data directory", async () => {
+    // Strataline 4.0.x passed dataDir through as configured, so an old server
+    // can legitimately have a relative -D. That path belongs to the target
+    // process's working directory rather than ours and is indeterminate in
+    // both directions. Treating it as safe to remove recreates the legacy
+    // hole on exactly the compatibility path this check exists to protect.
+    type Internals = {
+      cleanupExistingProcess(): Promise<void>;
+      terminateProcess(pid: number, label: string): Promise<"gone" | "failed">;
+    };
+
+    const standIn = join(
+      tempDir.name,
+      process.platform === "win32" ? "postgres.exe" : "postgres",
+    );
+    const keepAlive = join(tempDir.name, "legacy-relative-keepalive.js");
+
+    copyFileSync(process.execPath, standIn);
+
+    if (process.platform !== "win32") {
+      chmodSync(standIn, 0o755);
+    }
+
+    writeFileSync(keepAlive, "setTimeout(() => {}, 1e6);\n");
+
+    await server.start();
+
+    const other = spawn(standIn, [keepAlive, "-D", "relative-legacy-pgdata"], {
+      stdio: "ignore",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 400));
+
+    const internals = server as unknown as Internals;
+    const originalTerminate = internals.terminateProcess.bind(server);
+
+    internals.terminateProcess = async () => "gone";
+
+    try {
+      writeFileSync(pidFile, String(other.pid));
+
+      await expect(internals.cleanupExistingProcess()).rejects.toThrow(
+        /could not be tied|relative data directory/i,
+      );
+
+      expect(readFileSync(pidFile, "utf8")).toBe(String(other.pid));
+    } finally {
+      other.kill("SIGKILL");
+      internals.terminateProcess = originalTerminate;
+
+      if (existsSync(pidFile)) {
+        unlinkSync(pidFile);
+      }
+
+      await server.stop();
+    }
+
+    expect(exitCalled).toBe(false);
+  }, 90000);
+
+  it("should still remove an old-format record whose number is dead", async () => {
+    // The counterweight. After a reboot every legacy record names a number
+    // that is either gone or held by something unrelated, and refusing on
+    // either would refuse on every run with no server anywhere to protect.
+    type Internals = {
+      cleanupExistingProcess(): Promise<void>;
+      terminateProcess(pid: number, label: string): Promise<"gone" | "failed">;
+    };
+
+    await server.start();
+
+    const internals = server as unknown as Internals;
+    const originalTerminate = internals.terminateProcess.bind(server);
+
+    internals.terminateProcess = async () => "gone";
+
+    // Nothing is running at this number, so the record describes a server that
+    // is gone and there is nothing to protect.
+    writeFileSync(pidFile, "999999");
+
+    await internals.cleanupExistingProcess();
+
+    expect(existsSync(pidFile)).toBe(false);
+
+    internals.terminateProcess = originalTerminate;
+
+    await server.stop();
+
+    expect(exitCalled).toBe(false);
+  }, 90000);
+
+  it("should refuse an unreadable record whichever file settled the question", async () => {
+    // "refuses startup when an existing PID record is malformed" covers the
+    // path where strataline's own record is what gets probed. This is the same
+    // record on the path where postmaster.pid answered first, so the record is
+    // never read by the probe at all. Which file happened to settle what is
+    // running says nothing about whose record this one is, so the answer has
+    // to be the same on both.
+    type Internals = {
+      cleanupExistingProcess(): Promise<void>;
+      terminateProcess(pid: number, label: string): Promise<"gone" | "failed">;
+    };
+
+    const postmasterPidFile = join(tempDir.name, "pgdata", "postmaster.pid");
+
+    await server.start();
+
+    const internals = server as unknown as Internals;
+    const originalTerminate = internals.terminateProcess.bind(server);
+
+    internals.terminateProcess = async () => "gone";
+
+    try {
+      writeFileSync(pidFile, "partially written");
+
+      await expect(internals.cleanupExistingProcess()).rejects.toThrow(
+        /could not be read/i,
+      );
+
+      expect(readFileSync(pidFile, "utf8")).toBe("partially written");
+
+      // postmaster.pid is this cluster's own and was examined, so it still
+      // goes: the refusal is about the record nothing formed a view of.
+      expect(existsSync(postmasterPidFile)).toBe(false);
+    } finally {
+      internals.terminateProcess = originalTerminate;
+
+      if (existsSync(pidFile)) {
+        unlinkSync(pidFile);
+      }
+
+      await server.stop();
+    }
+
+    expect(exitCalled).toBe(false);
+  }, 90000);
+
+  it("should distinguish an inaccessible record from an absent one", async () => {
+    // A verified postmaster.pid makes the status probe return before it reads
+    // strataline's record. The accounting reads are therefore the only thing
+    // preventing an unreadable existing file from being mistaken for absence
+    // and overwritten by the next atomic PID-record write.
+    if (process.platform === "win32" || process.getuid?.() === 0) {
+      return;
+    }
+
+    await server.start();
+
+    chmodSync(pidFile, 0o000);
+
+    try {
+      await expect(
+        (
+          server as unknown as { cleanupExistingProcess(): Promise<void> }
+        ).cleanupExistingProcess(),
+      ).rejects.toThrow(/exists or is inaccessible/i);
+
+      expect(existsSync(pidFile)).toBe(true);
+    } finally {
+      chmodSync(pidFile, 0o600);
+      await server.stop();
+    }
+
+    expect(exitCalled).toBe(false);
+  }, 90000);
+
+  it("should still remove its own cluster's record on the same path", async () => {
+    // The other half of the rule above, and the ordinary case: a record naming
+    // THIS data directory is the one this start is there to clean up, and
+    // withholding it would leave a stale file behind after every run.
+    type Internals = {
+      cleanupExistingProcess(): Promise<void>;
+      terminateProcess(pid: number, label: string): Promise<"gone" | "failed">;
+    };
+
+    const postmasterPidFile = join(tempDir.name, "pgdata", "postmaster.pid");
+
+    await server.start();
+
+    const internals = server as unknown as Internals;
+    const originalTerminate = internals.terminateProcess.bind(server);
+
+    internals.terminateProcess = async () => "gone";
+
+    await internals.cleanupExistingProcess();
+
+    expect(existsSync(pidFile)).toBe(false);
+    expect(existsSync(postmasterPidFile)).toBe(false);
+
+    internals.terminateProcess = originalTerminate;
+
+    await server.stop();
+
+    expect(exitCalled).toBe(false);
+  }, 90000);
+
+  it("should refuse when a stale record cannot be claimed for removal", async () => {
+    // A rename that fails is two different answers, and only one of them is
+    // "the record is gone". Reporting the other as absent reads an unclaimable
+    // postmaster.pid as a data directory that is free, and the start then goes
+    // on to fail against PostgreSQL's own lock file instead — a message about
+    // the wrong thing, in place of a refusal that names the actual cause.
+    type Internals = {
+      removeRecordIfUnchanged(
+        path: string,
+        accounted: string,
+        identify: (raw: string) => string,
+      ): Promise<{ outcome: string }>;
+    };
+
+    // Permissions are what makes a rename fail here, and root does not have
+    // any. Windows does not enforce a read-only directory the same way.
+    if (process.platform === "win32" || process.getuid?.() === 0) {
+      return;
+    }
+
+    const internals = server as unknown as Internals;
+    const locked = join(tempDir.name, "locked");
+    const record = join(locked, "record");
+
+    mkdirSync(locked);
+    writeFileSync(record, "a stale record");
+
+    // No write permission on the directory, so the record cannot be renamed
+    // out of it — while remaining perfectly readable, which is what separates
+    // this from a record that is simply gone.
+    chmodSync(locked, 0o500);
+
+    try {
+      expect(
+        (
+          await internals.removeRecordIfUnchanged(
+            record,
+            "a stale record",
+            (raw) => raw,
+          )
+        ).outcome,
+      ).toBe("unclaimable");
+
+      // Untouched, and still there to be found by hand.
+      expect(existsSync(record)).toBe(true);
+      expect(readFileSync(record, "utf8")).toBe("a stale record");
+    } finally {
+      chmodSync(locked, 0o700);
+    }
+
+    // Genuinely absent stays absent: the distinction only exists because the
+    // two used to be reported as one.
+    unlinkSync(record);
+
+    expect(
+      (
+        await internals.removeRecordIfUnchanged(
+          record,
+          "anything",
+          (raw) => raw,
+        )
+      ).outcome,
+    ).toBe("absent");
+  }, 30000);
+
+  it("should still remove a record PostgreSQL rewrote while shutting down", async () => {
+    // PostgreSQL owns line 8 of postmaster.pid and flips it from "ready" to
+    // "stopping" the moment a shutdown begins. A postmaster wedged badly
+    // enough to need SIGKILL never reaches the point of removing the file, so
+    // what survives carries that changed line. Comparing every byte would read
+    // the server's own last act as somebody else having taken the data
+    // directory, and refuse the start on the one rung the escalation exists
+    // for. Only lines 1 to 7 identify a postmaster, and PostgreSQL writes
+    // those once at startup.
+    type Internals = {
+      cleanupExistingProcess(): Promise<void>;
+      terminateProcess(pid: number, label: string): Promise<"gone" | "failed">;
+    };
+
+    const dataDir = join(tempDir.name, "pgdata");
+    const postmasterPidFile = join(dataDir, "postmaster.pid");
+
+    await server.start();
+
+    const internals = server as unknown as Internals;
+    const originalTerminate = internals.terminateProcess.bind(server);
+
+    internals.terminateProcess = async () => {
+      // Exactly what a shutdown that then had to be killed leaves behind.
+      const lines = readFileSync(postmasterPidFile, "utf8").split("\n");
+
+      expect(lines[7]).toBe("ready   ");
+      lines[7] = "stopping";
+      writeFileSync(postmasterPidFile, lines.join("\n"));
+
+      return "gone";
+    };
+
+    await internals.cleanupExistingProcess();
+
+    expect(existsSync(postmasterPidFile)).toBe(false);
+
+    internals.terminateProcess = originalTerminate;
+
+    await server.stop();
+
+    expect(exitCalled).toBe(false);
+  }, 90000);
+
+  it("should stop cleanly even while a client is connected", async () => {
+    // The case that used to leave a stale data directory. SIGTERM is smart
+    // shutdown, which waits for clients to disconnect, so an open connection
+    // made it hang until the timeout forced a SIGKILL. A clean shutdown
+    // removes postmaster.pid; an abrupt kill leaves it behind.
+    const dataDir = join(tempDir.name, "pgdata");
+
+    await server.start();
+
+    const pool = new Pool({
+      host: "localhost",
+      port: serverPort,
+      user: "test_dev_user",
+      password: "test_dev_password",
+      database: "test_dev_database",
+    });
+    // A fast shutdown disconnects live clients with 57P01 (admin_shutdown),
+    // which arrives as an error event. That is the expected outcome here, so
+    // swallow it rather than letting it surface as an unhandled error.
+    pool.on("error", () => {});
+
+    const client = await pool.connect();
+
+    client.on("error", () => {});
+
+    await client.query("SELECT 1");
+
+    // Deliberately hold the connection open across the shutdown.
+    await server.stop();
+
+    expect(existsSync(join(dataDir, "postmaster.pid"))).toBe(false);
+
+    try {
+      client.release();
+      await pool.end();
+    } catch {
+      // The server is gone; tearing down the pool may well fail.
+    }
+  }, 60000);
+
+  it("should identify a real running server over a connection", async () => {
+    // Exercises the actual SQL and the pg round trip, which the unit tests
+    // deliberately stub out. Without this the query string itself is unverified.
+    const dataDir = join(tempDir.name, "pgdata");
+
+    await server.start();
+
+    const result = await identifyViaConnection({
+      port: serverPort,
+      user: "test_dev_user",
+      password: "test_dev_password",
+      database: "test_dev_database",
+    });
+
+    expect(result.responded).toBe(true);
+    expect(result.error).toBeNull();
+    expect(result.dataDir).toBe(dataDir);
+    expect(result.startedAt).toBeGreaterThan(0);
+
+    await server.stop();
+  }, 30000);
+
+  it("should report a connection refused when nothing is listening", async () => {
+    // The other half of the classification: a closed port must come back as
+    // not responding, so the tiebreaker leaves the cautious answer alone.
+    const closedPort = await findFreePort();
+    const result = await identifyViaConnection({
+      port: closedPort,
+      user: "test_dev_user",
+      password: "test_dev_password",
+      database: "test_dev_database",
+      timeoutMs: 2000,
+    });
+
+    expect(result.responded).toBe(false);
+    expect(result.dataDir).toBeNull();
+  }, 30000);
+
+  it("should not report a connect timeout as a response", async () => {
+    // pg's own connect timeout throws a bare Error with no `code`, so a check
+    // that only reads `code` calls it a response. The reason string built from
+    // this goes into a refusal, and telling somebody a server answered on a
+    // port sends them looking for one that is not there.
+    const silent = createServer(() => {
+      // Accept the socket and then say nothing, so the connection attempt can
+      // only end in pg's timeout.
+    });
+
+    const silentPort = await findFreePort();
+
+    await new Promise<void>((resolve) => silent.listen(silentPort, resolve));
+
+    try {
+      const result = await identifyViaConnection({
+        port: silentPort,
+        user: "test_dev_user",
+        password: "test_dev_password",
+        database: "test_dev_database",
+        timeoutMs: 500,
+      });
+
+      expect(result.responded).toBe(false);
+      expect(result.dataDir).toBeNull();
+      expect(result.startedAt).toBeNull();
+    } finally {
+      await new Promise<void>((resolve) => silent.close(() => resolve()));
+    }
+  }, 30000);
+
+  it("should report a real running server as running", async () => {
+    // End to end through the status function against genuine PostgreSQL,
+    // rather than the stand-in process the unit tests spawn.
+    const dataDir = join(tempDir.name, "pgdata");
+
+    await server.start();
+
+    const status = await getLocalDevDBServerStatus({ pidFile, dataDir });
+
+    expect(status.running).toBe(true);
+    expect(status.indeterminate).toBe(false);
+    expect(status.pid).toBeGreaterThan(0);
+
+    await server.stop();
+  }, 30000);
+
+  it("should report not running once the server has stopped", async () => {
+    const dataDir = join(tempDir.name, "pgdata");
+
+    await server.start();
+    await server.stop();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    const status = await getLocalDevDBServerStatus({ pidFile, dataDir });
+
+    expect(status.running).toBe(false);
+    // A clean stop removes the PID file, which consumers treat as
+    // authoritative, so this must not come back indeterminate.
+    expect(status.indeterminate).toBe(false);
+  }, 30000);
 
   it("should create the specified user, password, and database", async () => {
     // Start the server
@@ -135,7 +3230,7 @@ describe("LocalDevDBServer", () => {
 
   it("should handle custom port configuration", async () => {
     // Create a server with a dynamically assigned port
-    const customPort = await getPort();
+    const customPort = await findFreePort();
 
     const customServer = new LocalDevDBServer({
       port: customPort,
@@ -175,7 +3270,7 @@ describe("LocalDevDBServer", () => {
 
   it("should work without a logger", async () => {
     // Create a server without a logger
-    const silentPort = await getPort();
+    const silentPort = await findFreePort();
 
     const silentServer = new LocalDevDBServer({
       port: silentPort,
@@ -216,8 +3311,8 @@ describe("LocalDevDBServer", () => {
 
   it("should handle data directory persistence", async () => {
     const dataDir = join(tempDir.name, "persistent_pgdata");
-    const persistPort1 = await getPort();
-    const persistPort2 = await getPort();
+    const persistPort1 = await findFreePort();
+    const persistPort2 = await findFreePort();
 
     // Create first server instance
     const server1 = new LocalDevDBServer({
@@ -314,9 +3409,360 @@ describe("LocalDevDBServer", () => {
       }
     }
   }, 45000);
-});
 
-describe("createDevDBConsoleLogger", () => {
+  describe("accounting for the records a start decided about", () => {
+    // The records are read before the status probe and confirmed after it.
+    // Reading only afterwards let a record written while the probe was running
+    // — it can wait out a three-second connection timeout — become the one the
+    // start accounted for, without the decision having examined it at all. The
+    // removals at the end then deleted a live postmaster.pid as unchanged.
+    type Accounting = {
+      accountedRecord(
+        path: string,
+        before: string | null,
+        identify: (raw: string) => string,
+      ): Promise<string | null>;
+      cleanupExistingProcess(): Promise<void>;
+      readAccountedPidFileBytes(path: string): Promise<string | null>;
+      readPidFileBytes(path: string): Promise<string | null>;
+    };
+
+    const identity = (raw: string): string => raw;
+
+    it("accounts for a record that did not change", async () => {
+      const path = join(tempDir.name, "record");
+
+      writeFileSync(path, "same");
+
+      const internals = server as unknown as Accounting;
+
+      expect(await internals.accountedRecord(path, "same", identity)).toBe(
+        "same",
+      );
+    });
+
+    it("accounts for nothing when the record went away", async () => {
+      // What a clean shutdown looks like. There is nothing left to delete, and
+      // a record that reappears is refused by the removal loop instead.
+      const path = join(tempDir.name, "departed");
+
+      const internals = server as unknown as Accounting;
+
+      expect(
+        await internals.accountedRecord(path, "gone", identity),
+      ).toBeNull();
+    });
+
+    it("refuses a record that changed while the server was identified", async () => {
+      const path = join(tempDir.name, "replaced");
+
+      writeFileSync(path, "theirs");
+
+      const internals = server as unknown as Accounting;
+
+      await expect(
+        internals.accountedRecord(path, "ours", identity),
+      ).rejects.toThrow(/has taken this data directory since/i);
+    });
+
+    it("refuses a record that arrived while the server was identified", async () => {
+      const path = join(tempDir.name, "arrived");
+
+      writeFileSync(path, "theirs");
+
+      const internals = server as unknown as Accounting;
+
+      await expect(
+        internals.accountedRecord(path, null, identity),
+      ).rejects.toThrow(/has taken this data directory since/i);
+    });
+
+    it("leaves a postmaster.pid that appeared during the status probe", async () => {
+      // The whole race, end to end: nothing is on disk when cleanup starts,
+      // and another PostgreSQL claims the directory while the probe is out.
+      // The record it wrote must survive, because deleting it would orphan
+      // that server and let this start put a second postmaster on the same
+      // data directory.
+      const dataDir = join(tempDir.name, "pgdata");
+
+      mkdirSync(dataDir, { recursive: true });
+
+      const postmasterPidFile = join(dataDir, "postmaster.pid");
+      const theirRecord = [
+        "424242",
+        dataDir,
+        String(Math.floor(Date.now() / 1000)),
+        String(serverPort),
+        "/tmp",
+        "127.0.0.1",
+        "  5432001         12345678",
+        "ready   ",
+      ].join("\n");
+
+      const internals = server as unknown as Accounting;
+      const readBytes = internals.readAccountedPidFileBytes.bind(internals);
+      const reads = new Map<string, number>();
+
+      // Stands in for the claim landing mid-probe. cleanupExistingProcess
+      // reads the PID file then postmaster.pid, probes, then reads each again
+      // to account for it, so the PID file's SECOND read is the first thing
+      // that happens after the probe. Writing there means the pre-probe reads
+      // and the probe itself all saw an empty data directory, and the record
+      // is present by the time postmaster.pid is accounted for. If that read
+      // order changes, this injection point has to move with it.
+      internals.readAccountedPidFileBytes = async (path: string) => {
+        const seen = (reads.get(path) ?? 0) + 1;
+
+        reads.set(path, seen);
+
+        if (path === pidFile && seen === 2) {
+          writeFileSync(postmasterPidFile, theirRecord);
+        }
+
+        return readBytes(path);
+      };
+
+      try {
+        await expect(internals.cleanupExistingProcess()).rejects.toThrow(
+          /has taken this data directory since/i,
+        );
+      } finally {
+        internals.readAccountedPidFileBytes = readBytes;
+      }
+
+      expect(existsSync(postmasterPidFile)).toBe(true);
+      expect(readFileSync(postmasterPidFile, "utf8")).toBe(theirRecord);
+    }, 30000);
+  });
+
+  it("completes a shutdown whose close event never arrives", async () => {
+    // `close` waits on the stdio pipes as well as the process, and PostgreSQL
+    // backends inherit those pipes. A postmaster wedged badly enough to need
+    // SIGKILL dies without signaling its children, which go on holding the
+    // write ends, so the event can lag the exit indefinitely. That used to
+    // reject after two seconds, reporting a failure for a shutdown that had
+    // worked — exiting non-zero on a clean Ctrl+C — and leaving the PID record
+    // behind, since releasing it lives in the close handler.
+    type Lifecycle = {
+      pgProcess: unknown;
+      pgProcessLifecycle: {
+        proc: unknown;
+        closed: Promise<void>;
+        finalize: () => Promise<void>;
+      } | null;
+    };
+
+    // Already exited, which is what terminateProcess confirms for a child of
+    // ours, so the escalation settles at once and only the wait is left.
+    const proc = {
+      pid: 999999,
+      exitCode: 0,
+      signalCode: null,
+      stdout: null,
+      stderr: null,
+      stdin: null,
+      kill: () => true,
+    };
+
+    let finalized = 0;
+
+    const internals = server as unknown as Lifecycle;
+
+    internals.pgProcess = proc;
+    internals.pgProcessLifecycle = {
+      proc,
+      // Never resolves: the child is gone but Node has not reported it.
+      closed: new Promise<void>(() => {}),
+      finalize: async () => {
+        finalized++;
+        internals.pgProcess = null;
+      },
+    };
+
+    const began = Date.now();
+
+    await server.stop();
+
+    // Bounded by the two-second wait rather than hanging, and the cleanup ran
+    // here rather than being left to an event that is not coming.
+    expect(Date.now() - began).toBeLessThan(10000);
+    expect(finalized).toBe(1);
+    expect(internals.pgProcess).toBeNull();
+    expect(exitCalled).toBe(false);
+  }, 30000);
+
+  it("makes both finalizers wait for the one release", async () => {
+    // Two callers reach the lifecycle cleanup: the shutdown that gave up
+    // waiting for `close`, and `close` itself when it lands anyway. They can
+    // land together. A flag that only stops the work running twice let the
+    // second return while the first was still inside releasePidRecord, and
+    // what the second does next is decide whether to end the process. Under
+    // the default exit handler that is process.exit(), which would cut the
+    // release off between the rename that claims the record and the link that
+    // would put somebody else's back.
+    type Internals = {
+      attachExitHandler(proc: unknown): void;
+      pgProcess: unknown;
+      pgProcessLifecycle: { finalize(): Promise<void> } | null;
+      releasePidRecord(): Promise<void>;
+    };
+
+    const internals = server as unknown as Internals;
+    const proc = {
+      pid: 999998,
+      exitCode: null,
+      signalCode: null,
+      on: () => {},
+    };
+
+    internals.pgProcess = proc;
+    internals.attachExitHandler(proc);
+
+    const lifecycle = internals.pgProcessLifecycle;
+
+    if (lifecycle === null) {
+      throw new Error("attachExitHandler recorded no lifecycle to finalize");
+    }
+
+    let releaseFinished = false;
+
+    internals.releasePidRecord = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      releaseFinished = true;
+    };
+
+    // Started together, the way the timeout path and a `close` arriving at the
+    // same moment would.
+    const first = lifecycle.finalize();
+    const second = lifecycle.finalize();
+
+    await second;
+
+    // The second caller is only allowed to go on to its exit decision once the
+    // release it shares has actually finished.
+    expect(releaseFinished).toBe(true);
+
+    await first;
+
+    expect(internals.pgProcess).toBeNull();
+  });
+
+  it("does not fail a start with a superseded child's exit", async () => {
+    // A `close` that arrives after the restart that followed its own stop()
+    // used to be recorded as the new server failing to come up, because the
+    // handler read this instance's state without first asking whether the
+    // exit was still its to speak for. start() then rejected and
+    // cleanupFailedStart killed a postmaster that was perfectly healthy.
+    const internals = server as unknown as ChildLifecycleInternals;
+    const fresh = fakeChild(999002);
+    const superseded = await supersedeAChild(internals, fresh.proc);
+
+    internals.startingUp = true;
+
+    superseded.close(null);
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(internals.startupFailure).toBeNull();
+    expect(internals.pgProcess).toBe(fresh.proc);
+
+    // Nothing real to stop, and afterEach would otherwise wait out the close
+    // this stand-in is never going to emit.
+    internals.startingUp = false;
+    internals.pgProcess = null;
+    internals.pgProcessLifecycle = null;
+  });
+
+  it("does not exit the host over a superseded child's exit", async () => {
+    // Same event, landing a moment later. Past the startup window the handler
+    // used to read it as the current server having crashed, which is the one
+    // outcome that ends the host process — while the server it was reporting
+    // on was running normally.
+    const internals = server as unknown as ChildLifecycleInternals;
+    const fresh = fakeChild(999002);
+    const superseded = await supersedeAChild(internals, fresh.proc);
+
+    superseded.close(null);
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(exitCalled).toBe(false);
+    expect(internals.pgProcess).toBe(fresh.proc);
+
+    internals.pgProcess = null;
+    internals.pgProcessLifecycle = null;
+  });
+
+  it("keeps the listeners until the last server lets go", async () => {
+    // One set of listeners serves every server, so arming a second adds
+    // nothing and releasing one must not take them off under the other. They
+    // come off when the last server leaves, and not before — the lifecycle
+    // does that by itself, so what dispose() is for is releasing an instance
+    // ahead of it, one whose server could not be stopped.
+    type Internals = { armProcessHandlers(): void };
+
+    const events = ["exit"] as const;
+
+    const config = (name: string): LocalDevDBServerConfig => ({
+      port: 65000,
+      user: `${name}_user`,
+      password: `${name}_password`,
+      database: `${name}_database`,
+      dataDir: join(tempDir.name, `${name}-pgdata`),
+      pidFile: join(tempDir.name, `.${name}_pg_pid`),
+      onExit: () => {},
+    });
+
+    // Relative to whatever is armed already, never to zero. One set serves
+    // every server in the process, so a server another test left running is
+    // enough to have them on before this one starts — which is the very
+    // sharing under test here, not interference with it.
+    const before = new Map(
+      events.map((event) => [event, process.listenerCount(event)]),
+    );
+
+    const one = new LocalDevDBServer(config("dispose_one"));
+    const two = new LocalDevDBServer(config("dispose_two"));
+
+    // Armed the way start() arms them, without the cost of a real server.
+    (one as unknown as Internals).armProcessHandlers();
+
+    const armed = new Map(
+      events.map((event) => [event, process.listenerCount(event)]),
+    );
+
+    for (const event of events) {
+      expect(armed.get(event) ?? 0).toBeGreaterThanOrEqual(1);
+    }
+
+    // A second server does not bring a second set with it.
+    (two as unknown as Internals).armProcessHandlers();
+
+    for (const event of events) {
+      expect(process.listenerCount(event)).toBe(armed.get(event) ?? 0);
+    }
+
+    // Still needed by `two`, so releasing `one` leaves them alone.
+    one.dispose();
+
+    for (const event of events) {
+      expect(process.listenerCount(event)).toBe(armed.get(event) ?? 0);
+    }
+
+    two.dispose();
+
+    // Back to whatever this test found, which is none of its own.
+    for (const event of events) {
+      expect(process.listenerCount(event)).toBe(before.get(event) ?? 0);
+    }
+
+    // Idempotent, and an instance stays reusable afterwards.
+    two.dispose();
+
+    for (const event of events) {
+      expect(process.listenerCount(event)).toBe(before.get(event) ?? 0);
+    }
+  });
   it("should create a logger function", () => {
     const logger = createDevDBConsoleLogger();
     expect(typeof logger).toBe("function");

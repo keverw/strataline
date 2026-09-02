@@ -53,7 +53,7 @@ describe("MigrationManager", () => {
   // afterAll won't run, so the embedded Postgres would leak its SysV shared
   // memory. macOS has a tiny SHMMNI limit, so a few leaks break later runs.
   // Stop Postgres on SIGINT/SIGTERM so it releases shm before exiting. (Leftover
-  // segments from a hard kill can still be cleared with `bun run test:clean-shm`.)
+  // segments from a hard kill can still be cleared with `bun run test:clean-ipc`.)
   let onSignalCleanup: (() => void) | undefined;
 
   // Set up the embedded PostgreSQL server before all tests
@@ -938,6 +938,113 @@ describe("MigrationManager", () => {
     },
     TEST_TIMEOUT,
   );
+
+  // Both shapes a failing logger can take, because only one of them is a
+  // throw. Nothing in this file awaits a logger call, so an `async` logger —
+  // which the `Logger` interface admits, being declared `=> void` — rejects on
+  // a promise the call site discards. That is unhandled the moment it settles,
+  // and Node ends the process over it: a migration worker killed by a broken
+  // log line. A synchronous throw is the same hazard wherever the call sits in
+  // a `setInterval` body or a voided chain, and merely turns a healthy run
+  // into a failed one everywhere else.
+  for (const shape of ["throws", "rejects"] as const) {
+    test(
+      `should complete a run with a logger that ${shape} on every call`,
+      async () => {
+        // Listened for rather than left to fire: with no listener this does
+        // not fail the test, it takes the runner down.
+        const rejections: unknown[] = [];
+        const onUnhandled = (reason: unknown): void => {
+          rejections.push(reason);
+        };
+
+        process.on("unhandledRejection", onUnhandled);
+
+        // Every level is broken, so the middle rung has nowhere to report
+        // through either and the failure leaves the logger. Both out-of-band
+        // destinations are taken over: the reporter prefers dispatching where
+        // an EventTarget exists and this runtime has one, so removing that
+        // pins the report to the one observed here, and stubbing reportError
+        // keeps the host's own from surfacing it as a test error.
+        const scope = globalThis as unknown as Record<string, unknown>;
+        const saved = ["reportError", "dispatchEvent"].map((name) => ({
+          name,
+          had: name in scope,
+          value: scope[name],
+        }));
+        const reported: unknown[] = [];
+
+        delete scope.dispatchEvent;
+
+        scope.reportError = (e: unknown) => {
+          reported.push(e);
+        };
+
+        let calls = 0;
+        const fail = (): never => {
+          calls++;
+
+          if (shape === "throws") {
+            throw new Error("logger down");
+          }
+
+          // Typed as returning void, so an `async` implementation type-checks
+          // at every call site while failing where none of them can see it.
+          return Promise.reject(new Error("logger down")) as never;
+        };
+
+        const broken = { info: fail, warn: fail, error: fail };
+        const manager = new MigrationManager(pool, broken);
+
+        let ran = false;
+
+        manager.register([
+          {
+            id: `broken_logger_${shape}_001`,
+            description: "Runs under a logger that cannot be used",
+            migration: async (_pool, ctx) => {
+              ran = true;
+              ctx.complete();
+            },
+          },
+        ]);
+
+        try {
+          const result = await manager.runSchemaChanges("job");
+
+          // The logger is genuinely being exercised, so the assertions below
+          // are about a path that was taken rather than one that was skipped.
+          expect(calls).toBeGreaterThan(0);
+
+          // The run reaches its real verdict. A logger is not a dependency of
+          // the work, so failing to log must not fail the migration.
+          expect(ran).toBe(true);
+          expect(result.success).toBe(true);
+
+          await Bun.sleep(100);
+
+          // A wholly broken logger is not silenced: it is reported out of band
+          // so the operator has some way to learn their logging is gone.
+          expect(reported.length).toBeGreaterThan(0);
+
+          // And nothing escaped as the unhandled rejection that ends a
+          // process. This is the assertion that fails without the guard.
+          expect(rejections).toEqual([]);
+        } finally {
+          process.off("unhandledRejection", onUnhandled);
+
+          for (const entry of saved) {
+            if (entry.had) {
+              scope[entry.name] = entry.value;
+            } else {
+              delete scope[entry.name];
+            }
+          }
+        }
+      },
+      TEST_TIMEOUT,
+    );
+  }
 
   test(
     "should abort with an error when the migration lock is lost mid-run (safety)",

@@ -4,21 +4,18 @@ import {
   type MigrationResult,
 } from "./migration-system";
 import { Pool } from "pg";
-import { Logger, LogDataInput, BaseLogger, getErrorMessage } from "./logger";
+import {
+  makeSafeTaggedLogger,
+  taggedLoggerAsLogger,
+  type TaggedLoggerFunction,
+} from "./callback-safety";
 
 /**
  * Logger function type for Strataline CLI
  */
-export type CLILoggerFunction = (
-  type:
-    | "info"
-    | "error"
-    | "warn"
-    | "migrate-info"
-    | "migrate-error"
-    | "migrate-warn",
-  message: string,
-) => void;
+export type CLILoggerFunction = TaggedLoggerFunction<
+  "info" | "error" | "warn" | "migrate-info" | "migrate-error" | "migrate-warn"
+>;
 
 /**
  * Console-based logger implementation for Strataline CLI
@@ -58,52 +55,6 @@ export const createCLIConsoleLogger = (
     }
   };
 };
-
-/**
- * Adapter that converts between the Strataline Logger interface and our CLI logger
- * This separates CLI tool logs from migration system logs while preserving severity levels
- */
-class CLIStratalineLogger extends BaseLogger implements Logger {
-  private cliLogger: CLILoggerFunction;
-
-  constructor(logger: CLILoggerFunction) {
-    super();
-    this.cliLogger = logger;
-  }
-
-  info(data: LogDataInput): void {
-    const taskPrefix = data.task ? `[${data.task}]` : "";
-    const stagePrefix = data.stage ? `[${data.stage}]` : "";
-    const prefix = `${taskPrefix} ${stagePrefix}`.trim();
-    const message = prefix ? `${prefix} ${data.message}` : data.message;
-
-    // All info logs through this adapter are migration-related
-    this.cliLogger("migrate-info", message);
-  }
-
-  error(data: LogDataInput): void {
-    const taskPrefix = data.task ? `[${data.task}]` : "";
-    const stagePrefix = data.stage ? `[${data.stage}]` : "";
-    const prefix = `${taskPrefix} ${stagePrefix}`.trim();
-    const errorMsg = data.error
-      ? `${data.message}: ${getErrorMessage(data.error)}`
-      : data.message;
-    const message = prefix ? `${prefix} ${errorMsg}` : errorMsg;
-
-    // All errors through this adapter are migration-related
-    this.cliLogger("migrate-error", message);
-  }
-
-  warn(data: LogDataInput): void {
-    const taskPrefix = data.task ? `[${data.task}]` : "";
-    const stagePrefix = data.stage ? `[${data.stage}]` : "";
-    const prefix = `${taskPrefix} ${stagePrefix}`.trim();
-    const message = prefix ? `${prefix} ${data.message}` : data.message;
-
-    // All warnings through this adapter are migration-related
-    this.cliLogger("migrate-warn", message);
-  }
-}
 
 async function testConnection(
   pool: Pool,
@@ -176,7 +127,13 @@ async function runMigrations(
   logger("info", `Initializing database migration manager in ${mode} mode...`);
 
   // Create migration manager with our adapter for logging
-  const stratalineLogger = new CLIStratalineLogger(logger);
+  // Marked as the migration system's lines rather than the CLI's own, which
+  // is the whole reason the CLI's tag set has a `migrate-` half.
+  const stratalineLogger = taggedLoggerAsLogger(logger, {
+    info: "migrate-info",
+    warn: "migrate-warn",
+    error: "migrate-error",
+  });
   const manager = new MigrationManager(pool, stratalineLogger);
 
   // Register all migrations from the config
@@ -307,7 +264,13 @@ async function showMigrationStatus(
   logger: CLILoggerFunction,
 ): Promise<void> {
   // Create migration manager with our adapter for logging
-  const stratalineLogger = new CLIStratalineLogger(logger);
+  // Marked as the migration system's lines rather than the CLI's own, which
+  // is the whole reason the CLI's tag set has a `migrate-` half.
+  const stratalineLogger = taggedLoggerAsLogger(logger, {
+    info: "migrate-info",
+    warn: "migrate-warn",
+    error: "migrate-error",
+  });
   const manager = new MigrationManager(pool, stratalineLogger);
 
   // Register all migrations from the config
@@ -464,6 +427,11 @@ export async function RunStratalineCLI(config: {
   env?: Record<string, string | undefined>;
   signal?: AbortSignal;
 }): Promise<StratalineCLIResult> {
+  // Wrapped once on the way in, so no call site below has to remember to guard
+  // it: a logger that throws, or an `async` one that rejects, loses its line
+  // and degrades rather than ending the process. See makeSafeTaggedLogger.
+  const logger = makeSafeTaggedLogger(config.logger, "error");
+
   let poolInstance: Pool | undefined;
 
   // Validate configuration
@@ -494,12 +462,12 @@ export async function RunStratalineCLI(config: {
     if (missingEnvVars.length > 0) {
       const formattedVars = missingEnvVars.map((v) => prefix + v);
 
-      config.logger(
+      logger(
         "error",
         "Missing required environment variables: " + formattedVars.join(", "),
       );
 
-      config.logger(
+      logger(
         "error",
         "Please ensure all required database configuration is set in your .env file or environment variables.",
       );
@@ -608,7 +576,7 @@ export async function RunStratalineCLI(config: {
   // set up migration manager
   if (poolInstance) {
     poolInstance.on("error", (err) => {
-      config.logger(
+      logger(
         "error",
         `Unexpected error on idle client in PostgreSQL pool: ${err.message}`,
       );
@@ -623,7 +591,7 @@ export async function RunStratalineCLI(config: {
       // Test database connection before proceeding
       const connected = await testConnection(
         poolInstance,
-        config.logger,
+        logger,
         config.loadFrom,
         config.loadFrom === "env" ? config.envPrefix || "" : "",
         config.env,
@@ -631,7 +599,7 @@ export async function RunStratalineCLI(config: {
 
       if (!connected) {
         // Add a clear message about aborting the operation
-        config.logger(
+        logger(
           "error",
           "\nAborting operation due to database connection failure.\n",
         );
@@ -646,7 +614,7 @@ export async function RunStratalineCLI(config: {
             poolInstance,
             isDistributed ? "distributed" : "job",
             config.migrations,
-            config.logger,
+            logger,
             config.signal,
           );
           cliResult = {
@@ -658,16 +626,12 @@ export async function RunStratalineCLI(config: {
           break;
         }
         case "status":
-          await showMigrationStatus(
-            poolInstance,
-            config.migrations,
-            config.logger,
-          );
+          await showMigrationStatus(poolInstance, config.migrations, logger);
           cliResult = { command: "status", exitCode: 0 };
           break;
         case "help":
         default:
-          config.logger(
+          logger(
             "info",
             `
 Strataline Database Migration CLI
@@ -689,7 +653,7 @@ Options:
     } catch (error: unknown) {
       const errorMessage =
         error instanceof Error ? error.message : String(error);
-      config.logger("error", `Error: ${errorMessage}`);
+      logger("error", `Error: ${errorMessage}`);
       throw error; // Re-throw to allow caller to handle it
     } finally {
       await poolInstance.end();

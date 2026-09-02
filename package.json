@@ -38,11 +38,11 @@
     "db:migrate:distributed": "bun run scripts/db-migrate.ts run --distributed",
     "db:status": "bun run scripts/db-migrate.ts status",
     "test": "bun test --timeout 60000",
-    "test:clean-shm": "bun run scripts/clean-shm.ts",
+    "test:clean-ipc": "bun run scripts/clean-ipc.ts",
     "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,css,scss,md,html}\"",
-    "format:docs": "prettier --write README.md",
+    "format:docs": "prettier --write README.md changelog.md AGENTS.md CLAUDE.md",
     "lint": "eslint src",
-    "update-docs": "markdown-toc-gen update README.md && bun run scripts/update-readme-version.ts && bun run format:docs"
+    "update-docs": "markdown-toc-gen update README.md && markdown-toc-gen update changelog.md && bun run scripts/update-readme-version.ts && bun run format:docs"
   },
   "engines": {
     "node": ">=18"

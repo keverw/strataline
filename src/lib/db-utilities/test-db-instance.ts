@@ -1,14 +1,13 @@
 import { Pool } from "pg";
 import { MigrationManager, Migration } from "../migration-system";
 import {
-  Logger as StratalineLogger,
-  BaseLogger,
-  LogDataInput,
-  getErrorMessage,
-} from "../logger";
+  makeSafeTaggedLogger,
+  taggedLoggerAsLogger,
+  type TaggedLoggerFunction,
+} from "../callback-safety";
 import EmbeddedPostgres from "embedded-postgres";
 import * as tmp from "tmp";
-import getPort from "get-port";
+import { findFreePort } from "./free-port";
 import * as fs from "fs";
 
 // Default configuration for test database
@@ -19,17 +18,15 @@ const DEFAULT_DB_NAME = "test_database";
 /**
  * Logger function type for TestDatabaseInstance
  */
-export type TestDBLoggerFunction = (
-  type:
-    | "info"
-    | "error"
-    | "warn"
-    | "pg"
-    | "migrate-info"
-    | "migrate-error"
-    | "migrate-warn",
-  message: string,
-) => void;
+export type TestDBLoggerFunction = TaggedLoggerFunction<
+  | "info"
+  | "error"
+  | "warn"
+  | "pg"
+  | "migrate-info"
+  | "migrate-error"
+  | "migrate-warn"
+>;
 
 /**
  * Console-based logger implementation for TestDatabase
@@ -77,64 +74,6 @@ export const createTestDBConsoleLogger = (
     }
   };
 };
-
-/**
- * Adapter that converts between the Strataline Logger interface and our TestDB logger
- * This separates test DB logs from migration system logs while preserving severity levels
- */
-class TestDBStratalineLogger extends BaseLogger implements StratalineLogger {
-  private testDbLogger?: TestDBLoggerFunction;
-
-  constructor(logger?: TestDBLoggerFunction) {
-    super();
-    this.testDbLogger = logger;
-  }
-
-  info(data: LogDataInput): void {
-    if (!this.testDbLogger) {
-      return;
-    }
-
-    const taskPrefix = data.task ? `[${data.task}]` : "";
-    const stagePrefix = data.stage ? `[${data.stage}]` : "";
-    const prefix = `${taskPrefix} ${stagePrefix}`.trim();
-    const message = prefix ? `${prefix} ${data.message}` : data.message;
-
-    // All info logs through this adapter are migration-related
-    this.testDbLogger("migrate-info", message);
-  }
-
-  error(data: LogDataInput): void {
-    if (!this.testDbLogger) {
-      return;
-    }
-
-    const taskPrefix = data.task ? `[${data.task}]` : "";
-    const stagePrefix = data.stage ? `[${data.stage}]` : "";
-    const prefix = `${taskPrefix} ${stagePrefix}`.trim();
-    const errorMsg = data.error
-      ? `${data.message}: ${getErrorMessage(data.error)}`
-      : data.message;
-    const message = prefix ? `${prefix} ${errorMsg}` : errorMsg;
-
-    // All errors through this adapter are migration-related
-    this.testDbLogger("migrate-error", message);
-  }
-
-  warn(data: LogDataInput): void {
-    if (!this.testDbLogger) {
-      return;
-    }
-
-    const taskPrefix = data.task ? `[${data.task}]` : "";
-    const stagePrefix = data.stage ? `[${data.stage}]` : "";
-    const prefix = `${taskPrefix} ${stagePrefix}`.trim();
-    const message = prefix ? `${prefix} ${data.message}` : data.message;
-
-    // All warnings through this adapter are migration-related
-    this.testDbLogger("migrate-warn", message);
-  }
-}
 
 /**
  * Configuration options for {@link TestDatabaseInstance}. All fields are
@@ -187,7 +126,11 @@ export class TestDatabaseInstance {
    */
   constructor(options: TestDatabaseOptions = {}) {
     this.port = options.port || 0; // 0 means we'll find a port dynamically
-    this.logger = options.logger;
+    // Wrapped on the way in, so no call site below has to guard it and a
+    // logger that throws loses its line rather than the process. The other two
+    // entry points do the same; this one was simply missed.
+    this.logger =
+      options.logger && makeSafeTaggedLogger(options.logger, "error");
     this.user = options.user || DEFAULT_DB_USER;
     this.password = options.password || DEFAULT_DB_PASSWORD;
     this.databaseName = options.databaseName || DEFAULT_DB_NAME;
@@ -235,7 +178,7 @@ export class TestDatabaseInstance {
     try {
       // If no port was specified or port is 0, find an available port
       if (!this.port || this.port === 0) {
-        this.port = await getPort();
+        this.port = await findFreePort();
       }
 
       this.log(
@@ -414,7 +357,13 @@ export class TestDatabaseInstance {
     }
 
     // Create a strataline logger adapter using our logger (if any)
-    const stratalineLogger = new TestDBStratalineLogger(this.logger);
+    // Marked as the migration system's lines rather than the test database's
+    // own, which is what the `migrate-` half of the tag set is for.
+    const stratalineLogger = taggedLoggerAsLogger(this.logger, {
+      info: "migrate-info",
+      warn: "migrate-warn",
+      error: "migrate-error",
+    });
     const migrationManager = new MigrationManager(this.pool, stratalineLogger);
 
     this.log("migrate-info", "Applying migrations to test database...");
