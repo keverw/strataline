@@ -734,6 +734,74 @@ describe("LocalDevDBServer", () => {
     await expect(server.start()).rejects.toThrow(/No space left on device/);
   }, 60000);
 
+  it("strands nothing in the data directory when initdb is interrupted", async () => {
+    // initdb is the one unbounded step in a start, and the step a first run
+    // spends nearly all of its time in, so it is where a Ctrl+C lands. Run in
+    // place, an interrupted one left a directory holding part of a cluster and
+    // no postgresql.conf. That is neither a cluster nor absent: the config
+    // check sees no config and runs initdb again, and initdb refuses a
+    // directory that is not empty, so every later start failed the same way
+    // until somebody deleted the directory by hand.
+    type Internals = {
+      runPgCommand(
+        command: string,
+        args: string[],
+        options?: { user?: string; silent?: boolean; timeoutMs?: number },
+      ): Promise<{ stdout: string; stderr: string; code: number | null }>;
+    };
+
+    const internals = server as unknown as Internals;
+    const realRunPgCommand = internals.runPgCommand.bind(server);
+    const dataDir = join(tempDir.name, "pgdata");
+
+    // Part of the tree written and then killed, which is what a signal during
+    // initdb leaves behind. `code: null` is how runPgCommand reports a command
+    // that produced no exit code of its own.
+    internals.runPgCommand = async (command, args, options) => {
+      if (!command.includes("initdb")) {
+        return realRunPgCommand(command, args, options);
+      }
+
+      const target = args[args.indexOf("-D") + 1];
+
+      mkdirSync(join(target, "base"), { recursive: true });
+      writeFileSync(join(target, "PG_VERSION"), "18\n");
+
+      return { stdout: "", stderr: "", code: null };
+    };
+
+    await expect(server.start()).rejects.toThrow(/Failed to initialize/);
+
+    // The half-written tree went with the failure rather than into the data
+    // directory, so the next start has nothing to trip over.
+    expect(existsSync(dataDir)).toBe(false);
+
+    internals.runPgCommand = realRunPgCommand;
+
+    await server.start();
+
+    expect(existsSync(join(dataDir, "postgresql.conf"))).toBe(true);
+  }, 180000);
+
+  it("says what is in the way when the data directory holds something else", async () => {
+    // The remains of an interrupted first run under an older strataline, or a
+    // directory the caller pointed `dataDir` at by mistake. Nothing can tell
+    // those apart and only one is safe to remove, so this reports rather than
+    // deletes — and it must not surface as initdb's own "not empty", which
+    // says nothing about which directory or why strataline was looking at it.
+    const dataDir = join(tempDir.name, "pgdata");
+
+    mkdirSync(dataDir, { recursive: true });
+    writeFileSync(join(dataDir, "notes.txt"), "not a cluster\n");
+
+    await expect(server.start()).rejects.toThrow(
+      /is not an initialized PostgreSQL cluster/,
+    );
+
+    // Left exactly as it was found.
+    expect(existsSync(join(dataDir, "notes.txt"))).toBe(true);
+  }, 180000);
+
   it("reports what the postmaster said when it refuses to start", async () => {
     // The counterpart for the server itself. PostgreSQL writes the one line
     // that diagnoses a failed start to its own stderr, which used to go

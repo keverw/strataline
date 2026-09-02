@@ -8,9 +8,10 @@ import {
   link,
   unlink,
   mkdir,
+  rm,
 } from "fs/promises";
 import { constants } from "fs";
-import { isAbsolute, join, resolve } from "path";
+import { dirname, isAbsolute, join, resolve } from "path";
 import { userInfo } from "os";
 import { Client } from "pg";
 import {
@@ -1378,6 +1379,26 @@ export class LocalDevDBServer {
   }
 
   /**
+   * Removes a directory tree this instance created, ignoring a failure.
+   *
+   * Only ever called on the staging directory initdb was pointed at, whose
+   * name is unique to this call, so there is nothing here that could belong to
+   * anybody else. A failure to tidy it is logged rather than thrown: the
+   * caller is already reporting why the initialization failed, and losing that
+   * to a cleanup error would replace the diagnosis with the housekeeping.
+   */
+  private async removeDirectoryIfPresent(path: string): Promise<void> {
+    try {
+      await rm(path, { recursive: true, force: true });
+    } catch (e) {
+      this.log(
+        "warn",
+        `Could not remove the partially initialized data directory at ${path}: ${e}`,
+      );
+    }
+  }
+
+  /**
    * Removes the PID file, but only while it still holds this invocation's own
    * record.
    *
@@ -2176,8 +2197,26 @@ export class LocalDevDBServer {
         `Initializing new PostgreSQL data directory at ${this.pgDataDir}...`,
       );
 
-      // Create the data directory if it doesn't exist
-      await mkdir(this.pgDataDir, { recursive: true });
+      // initdb runs into a sibling and the result is renamed into place, so
+      // the data directory only ever exists initialized. It is the same
+      // publish-by-rename the PID record uses, for a sharper reason: initdb is
+      // the one unbounded step in a start, minutes against a cold filesystem,
+      // and it is the step a first run spends nearly all of its time in — so
+      // it is where an interruption lands. Interrupted in place it left a
+      // directory with no postgresql.conf in it, which is neither a cluster
+      // nor absent: the check above sees no config and runs initdb again, and
+      // initdb refuses a directory that is not empty. Every later start then
+      // failed the same way until somebody deleted the directory by hand.
+      //
+      // A sibling, so the rename cannot fail with EXDEV, and uniquely named,
+      // so two starts racing for one data directory do not also race here.
+      // What an interruption strands now is that sibling, which nothing looks
+      // for and which no start consults.
+      const stagedDataDir = `${this.pgDataDir}.${randomUUID()}.init`;
+
+      // The parent, rather than the data directory itself. initdb creates its
+      // own target and is where the directory now comes from.
+      await mkdir(dirname(this.pgDataDir), { recursive: true });
 
       // Pin initdb's locale rather than inherit the host shell's: a
       // Linux-style LC_ALL=C.UTF-8 makes initdb fail on macOS, whose libc has
@@ -2186,12 +2225,14 @@ export class LocalDevDBServer {
       // throwaway DB, so do not "fix" it to en_US.
       const initResult = await this.runPgCommand(pgBinaries.initdb, [
         "-D",
-        this.pgDataDir,
+        stagedDataDir,
         "--locale=C",
         "--encoding=UTF8",
       ]);
 
       if (initResult.code !== 0) {
+        await this.removeDirectoryIfPresent(stagedDataDir);
+
         // Carry initdb's own diagnosis. runPgCommand captures it and nothing
         // else reads it, so discarding it here left the one message that says
         // WHY unread: a locale libc rejects, a directory that is not empty, or
@@ -2208,6 +2249,32 @@ export class LocalDevDBServer {
               : ` (initdb exited with code ${initResult.code} without reporting a reason)`
           }` + ipcExhaustionHint(detail),
         );
+      }
+
+      try {
+        await rename(stagedDataDir, this.pgDataDir);
+      } catch (e) {
+        await this.removeDirectoryIfPresent(stagedDataDir);
+
+        // An empty directory at the destination is renamed over on POSIX, so
+        // what reaches here is one holding something. That is not this start's
+        // to delete: it may be a data directory left half initialized by an
+        // older strataline, and it may equally be a directory the caller
+        // pointed `dataDir` at by mistake, with files in it that are not
+        // PostgreSQL's at all. Nothing here can tell those apart, and only one
+        // of them is safe to remove, so say what is in the way instead.
+        const code = (e as NodeJS.ErrnoException)?.code;
+
+        if (code === "ENOTEMPTY" || code === "EEXIST" || code === "EXDEV") {
+          throw new Error(
+            `${this.pgDataDir} already holds files but is not an initialized PostgreSQL cluster, so a new one could not be moved into place. ` +
+              "It may be the remains of an interrupted first run, or a directory that is not meant to be a data directory at all. " +
+              "Check what is in it, then remove it and try again.",
+            { cause: e },
+          );
+        }
+
+        throw e;
       }
     } else {
       this.log(
