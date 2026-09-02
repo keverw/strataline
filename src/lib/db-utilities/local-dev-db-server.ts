@@ -348,15 +348,15 @@ export class LocalDevDBServer {
   // a stop that refused would leave a server running. See stop().
   private startInFlight: Promise<void> | null = null;
 
-  // The child a deliberate shutdown is aimed at, held until its close handler
+  // The child a deliberate shutdown is aimed at, held until its lifecycle handler
   // runs. shutdownInFlight cannot answer this: it is cleared the moment the
   // shutdown settles, so a stop() that gave up waiting for a slow `close`
   // would have that close arrive to an instance with no memory of it and be
   // mistaken for a crash — which exits the process.
   private stoppingProc: ReturnType<typeof spawn> | null = null;
 
-  // The running child's lifecycle cleanup: `closed` resolves once the close
-  // handler has finished it, and `finalize` performs it. Both are exposed
+  // The running child's lifecycle cleanup: `closed` resolves once the
+  // lifecycle handler has finished it, and `finalize` performs it. Both are exposed
   // because `close` is not guaranteed to arrive promptly — it waits on the
   // stdio pipes too — so a shutdown that has confirmed the process gone must
   // be able to run the cleanup itself rather than wait indefinitely for the
@@ -374,7 +374,7 @@ export class LocalDevDBServer {
   // server, so exactly it comes off again and nothing a host added.
   private static exitListener: (() => void) | null = null;
 
-  // Set while start() is running, so the child's close handler leaves the
+  // Set while start() is running, so the child's lifecycle handler leaves the
   // failure to start() instead of exiting the process out from under it.
   private startingUp: boolean = false;
 
@@ -398,7 +398,7 @@ export class LocalDevDBServer {
   //
   // Deliberately not pgProcess or pgProcessLifecycle, which a completed
   // lifecycle sets to null: those cannot tell "this child's cleanup has
-  // finished" apart from "a later child has taken over", and a close handler
+  // finished" apart from "a later child has taken over", and a lifecycle handler
   // has to know which of the two it is before touching anything shared.
   private attachedChild: ReturnType<typeof spawn> | null = null;
 
@@ -591,7 +591,7 @@ export class LocalDevDBServer {
       }
 
       // A gone PID does not mean `close` has fired — see the "exit" hook. Wait
-      // for the close handler to remove the PID file and clear the process
+      // for the lifecycle handler to remove the PID file and clear the process
       // reference, with a bound so stop() cannot hang on a leaked handle.
       let lifecycleTimeout: NodeJS.Timeout | undefined;
 
@@ -618,7 +618,7 @@ export class LocalDevDBServer {
         //
         // Left to reject, that turned a successful Ctrl+C into a non-zero exit
         // reporting a shutdown that had in fact worked — and, because the
-        // release lives in the close handler, into a stale PID record too. So
+        // release lives in the lifecycle handler, into a stale PID record too. So
         // do the lifecycle cleanup here instead. It is the same call the close
         // handler makes and runs at most once, so a `close` that does arrive
         // later still makes its own exit decision without repeating any of it.
@@ -645,7 +645,7 @@ export class LocalDevDBServer {
         proc.stdin?.destroy();
       }
     } finally {
-      // The close handler clears this too, but only when it exits — which an
+      // The lifecycle handler clears this too, but only when it exits — which an
       // explicit stop() does not do, and a failed shutdown never reaches.
       if (this.keepAliveInterval) {
         clearInterval(this.keepAliveInterval);
@@ -1390,7 +1390,7 @@ export class LocalDevDBServer {
    * this invocation's own bytes as the accounted record.
    *
    * Those bytes come from {@link pidRecord} rather than from the child handle,
-   * which a close handler may already have dropped.
+   * which a lifecycle handler may already have dropped.
    *
    * Nothing here throws. Failing to tidy a file must not be what stops the
    * process exiting — see finalize — so every outcome that is not a removal
@@ -1922,7 +1922,7 @@ export class LocalDevDBServer {
    * so it belongs in a log line or a branch that tolerates being wrong, not in
    * a check that a subsequent call is relied on to pass.
    *
-   * - `stopped` — nothing running. `start()` starts, `stop()` resolves with
+   * - `stopped` — nothing held. `start()` starts, `stop()` resolves with
    *   nothing to do.
    * - `starting` — `start()` and `stop()` both throw. Await the start.
    * - `running` — `stop()` stops it, `start()` logs and resolves.
@@ -1936,7 +1936,11 @@ export class LocalDevDBServer {
    * `running` is decided from what Node reports about the child rather than
    * from holding a reference to it, for the reason `start()` gives: a
    * postmaster that died without signaling its children leaves them holding
-   * the inherited stdio pipes, and the reference outlives the server.
+   * the inherited stdio pipes, and the reference outlives the server. There is
+   * no state for an exited child whose cleanup is outstanding, because that is
+   * no longer a place an instance rests: the lifecycle handler runs on the
+   * child's `exit`, so the PID record is released as soon as the process is
+   * gone rather than when the pipes close.
    */
   public getLifecycleState(): DevDBLifecycleState {
     // Ordered as the guards are, so the answer and the refusal cannot
@@ -2424,6 +2428,39 @@ export class LocalDevDBServer {
     await this.removeFileIfPresent(tempPidFile);
   }
 
+  /** How long an exiting child is given to flush what it last wrote. */
+  private static readonly OUTPUT_DRAIN_MS = 250;
+
+  /**
+   * Waits briefly for a child's stdio to close, so a diagnosis composed after
+   * this includes the last thing it wrote.
+   *
+   * Bounded, and the bound is the point: `close` is what guarantees the pipes
+   * are drained, and it is exactly the event that may never arrive, since
+   * PostgreSQL's backends inherit those pipes and can outlive the postmaster
+   * holding them open. So this waits for the guarantee where it is coming and
+   * gives up where it is not, rather than making a diagnosis depend on it.
+   */
+  private async drainServerOutput(
+    proc: ReturnType<typeof spawn>,
+  ): Promise<void> {
+    if (proc.stdout === null && proc.stderr === null) {
+      return;
+    }
+
+    await new Promise<void>((settle) => {
+      const timer = setTimeout(
+        settle,
+        LocalDevDBServer.OUTPUT_DRAIN_MS,
+      ).unref();
+
+      proc.once("close", () => {
+        clearTimeout(timer);
+        settle();
+      });
+    });
+  }
+
   /**
    * Attaches the handler that owns a running server's lifecycle: releasing the
    * PID file, dropping the process reference, and reporting the exit code.
@@ -2510,26 +2547,32 @@ export class LocalDevDBServer {
 
     this.pgProcessLifecycle = { proc, closed, finalize };
 
-    proc.on("close", async (code) => {
+    // `exit` rather than `close`, which is the whole of why a dead server no
+    // longer leaves anything outstanding.
+    //
+    // Node emits both: `exit` once the process is gone, `close` once the
+    // process is gone AND every stdio pipe has been closed. PostgreSQL's
+    // backends inherit those pipes, so a postmaster killed without signaling
+    // its children leaves orphaned backends holding them and `close` arrives
+    // late or never. Everything below is about the process rather than the
+    // pipes — releasing the PID record, dropping the reference, reporting the
+    // exit — so waiting for the pipes tied all of it to an event that may not
+    // come, and a crashed server could sit there with its record still on disk
+    // and its death unreported.
+    //
+    // `close` keeps only what is genuinely about the pipes: settling `closed`
+    // for anyone waiting on the full teardown. finalize() is memoized, so the
+    // pair cannot repeat any of the work between them.
+    proc.on("exit", async (code) => {
       // Answered before anything else, because everything else is about the
       // instance rather than about this child, and a superseded child has no
       // claim on any of it.
       //
-      // `close` waits on the stdio pipes as well as the process, so it can
-      // arrive after a stop() that gave up waiting for it and after the
-      // start() that followed. Both decisions below would then be made about
-      // the wrong child: the failure record would fail a start() whose server
-      // is perfectly healthy, and the exit decision would take the host
-      // process down while that server was running — the very outcome
-      // performGracefulShutdown drops the read ends to make less likely, which
-      // shortens this window rather than closing it.
-      //
-      // Returning here leaves nothing undone. Being superseded means a later
-      // start() spawned, which it does only with pgProcess null, and nothing
-      // but finalize() and cleanupFailedStart() makes it null. Both release
-      // this child's PID record before they return, and cleanupFailedStart
-      // takes this listener off as well, so anything still arriving here has
-      // been through finalize() and its cleanup is done.
+      // Far narrower than it was now that this is `exit`: a superseded child
+      // is one a later start() replaced, and start() only spawns with
+      // pgProcess null, which nothing but finalize() and cleanupFailedStart()
+      // makes it. Both release this child's PID record first, so anything
+      // arriving here has already been cleaned up.
       if (this.attachedChild !== proc) {
         this.log(
           "setup",
@@ -2551,10 +2594,23 @@ export class LocalDevDBServer {
       // the host process down instead of letting start() reject.
       const startOwnsThisExit = this.startingUp;
 
-      // Recorded before anything is awaited: start() checks this once more
-      // before reporting success, and a failure recorded after the unlink below
-      // would land too late, leaving start() to resolve with no server running.
+      // The one thing `exit` is worse at than `close`, and the only place it
+      // matters. A postmaster that refuses to start writes the reason and
+      // exits immediately, and that text can still be sitting in the pipe when
+      // `exit` fires, so composing the diagnosis now would report the failure
+      // without the sentence explaining it — a major-version mismatch reduced
+      // back to an exit code, which is what withServerOutput exists to
+      // prevent. So give the pipes a moment, bounded, and carry on with
+      // whatever arrived either way.
+      //
+      // Only on the startup path. Nothing else reads the captured output, and
+      // an ordinary stop should not pay for this.
       if (startOwnsThisExit) {
+        await this.drainServerOutput(proc);
+
+        // Still ahead of the cleanup below, and well ahead of start() asking:
+        // waitForServerReady polls this once a second, so the short wait above
+        // cannot let a start resolve with no server running.
         this.startupFailure ??= new Error(
           this.withServerOutput(
             `PostgreSQL exited with code ${code} before it was ready`,
@@ -2882,7 +2938,7 @@ export class LocalDevDBServer {
         this.pgProcessLifecycle?.proc === held ? this.pgProcessLifecycle : null;
 
       if (lifecycle) {
-        // The same call the close handler makes, and it runs at most once, so
+        // The same call the lifecycle handler makes, and it runs at most once, so
         // a `close` that does arrive later still repeats none of it.
         await lifecycle.finalize();
       } else {
@@ -2942,7 +2998,7 @@ export class LocalDevDBServer {
       // Set up users and databases
       await this.setupUsersAndDatabases();
 
-      // PostgreSQL can exit after the last setup step, and its close handler
+      // PostgreSQL can exit after the last setup step, and its lifecycle handler
       // records that rather than exiting while start() owns the failure — so
       // ask once more before reporting a success.
       if (this.startupFailure) {
@@ -2978,7 +3034,7 @@ export class LocalDevDBServer {
       throw error instanceof Error ? error : new Error(String(error));
     } finally {
       // Past this point a child exit is an ordinary shutdown again, and its
-      // close handler should exit the process as it always has.
+      // lifecycle handler should exit the process as it always has.
       this.startingUp = false;
     }
   }
@@ -2990,7 +3046,7 @@ export class LocalDevDBServer {
    * holding the port. Returns false if the process could not be stopped, in
    * which case the PID record and process reference are deliberately retained.
    *
-   * The close handler is detached first, so tearing the child down here is not
+   * The lifecycle handler is detached first, so tearing the child down here is not
    * reported as a server that died on its own: a failed start rejects to its
    * caller, and that rejection is the report.
    */
@@ -3000,9 +3056,9 @@ export class LocalDevDBServer {
     if (proc && proc.pid) {
       const pid = proc.pid;
 
-      // Detach the close handler so killing the process here is not reported
-      // through onExit as an unasked-for exit.
-      proc.removeAllListeners("close");
+      // Detach the lifecycle handler so killing the process here is not
+      // reported through onExit as an unasked-for exit.
+      proc.removeAllListeners("exit");
 
       // The reference deliberately stays on the instance across the
       // escalation below, and is dropped once the child is gone. Clearing it
@@ -3024,13 +3080,13 @@ export class LocalDevDBServer {
         )) === "failed"
       ) {
         // Outlived even SIGKILL. Keep the reference and the PID record so a
-        // later stop() can try again, and put an equivalent close handler back
+        // later stop() can try again, and put an equivalent lifecycle handler back
         // — without one that stop() would leave the PID file behind and never
         // clear the reference or the keep-alive interval.
         //
         // Aimed at, before the handler goes back on: a shutdown was asked for
         // here and merely could not be completed. start() is about to reject
-        // with that, so when the process does finally die the close handler
+        // with that, so when the process does finally die the lifecycle handler
         // must not read it as an unrequested crash and exit the host process
         // out from under a caller that has already handled the rejection.
         this.stoppingProc = proc;
@@ -3054,10 +3110,10 @@ export class LocalDevDBServer {
     // just as inert, since performGracefulShutdown returns early on a child
     // with no PID.
     //
-    // The close handler goes with it. A failed spawn emits "error" and never
-    // "close", so nothing would ever take that listener off by itself.
+    // The lifecycle handler goes with it. A failed spawn emits "error" and
+    // never "exit", so nothing would ever take that listener off by itself.
     if (this.pgProcess === proc) {
-      proc?.removeAllListeners("close");
+      proc?.removeAllListeners("exit");
       this.pgProcess = null;
     }
 
@@ -3069,12 +3125,12 @@ export class LocalDevDBServer {
 
     // Nothing of ours is running any more. Released here rather than beside
     // the kill above, so a spawn that failed before it ever had a PID — which
-    // skips that block entirely — is released too; its close handler, the
+    // skips that block entirely — is released too; its lifecycle handler, the
     // other place this happens, may never run.
     //
     // The handlers go with it, for the same reason and covering the same gap:
     // a start() that refused before spawning anything registered them on the
-    // way in and has no close handler coming to take them off again.
+    // way in and has no lifecycle handler coming to take them off again.
     this.releaseProcessHandlers();
 
     // Only the record this invocation created: startup can refuse before

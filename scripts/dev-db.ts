@@ -66,17 +66,26 @@ startup.then((error) => {
 /**
  * How long a signal waits for an in-flight `start()` before giving up.
  *
- * The wait needs a bound because trapping a signal suppresses Node's own
- * termination: without one, a `SIGTERM` during a first-run `initdb` — which is
- * unbounded, and the one step here that can be — leaves the supervisor's grace
- * period to expire and `SIGKILL` the script, which is the ungraceful ending the
- * wait was there to avoid, arrived at more slowly.
+ * Generous, and deliberately so. Giving up gains nothing on its own: both
+ * endings force-kill the postmaster through the library's `exit` hook, so a
+ * short bound does not avoid that outcome, it only reaches it sooner and
+ * throws away the starts that would have finished and shut down cleanly. The
+ * bound is here for a start that is stuck rather than slow, since trapping a
+ * signal suppresses Node's own termination and an unbounded wait would be a
+ * script that ignores SIGTERM forever.
  *
- * Short enough to leave a shutdown room inside `docker stop`'s ten seconds.
- * The give-up path is no worse than not waiting at all, so the only thing the
- * bound trades away is the startups that would have finished later than this.
+ * So it sits above what `start()` can legitimately take: a previous server's
+ * shutdown escalation runs to about 42 seconds, the readiness wait polls for
+ * about 30 more, and user and database setup follows. Five seconds — which
+ * this was — expired inside the readiness wait, which is the longest stretch
+ * of a cold run and exactly when a signal is most likely to land.
+ *
+ * Two things make the length safe to choose freely. A second signal gives up
+ * at once, which is the interactive escape hatch, and a supervisor with a
+ * shorter grace period simply kills the script itself, which is the same
+ * ending this would have produced by exiting early.
  */
-const START_WAIT_MS = 5000;
+const START_WAIT_MS = 120_000;
 
 let stopping: Promise<void> | null = null;
 
