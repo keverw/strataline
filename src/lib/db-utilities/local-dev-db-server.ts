@@ -585,6 +585,22 @@ export class LocalDevDBServer {
         throw new Error(`PostgreSQL (PID ${pid}) could not be stopped.`);
       }
 
+      // The read ends are ours, and the postmaster is gone by here, so nothing
+      // is going to close them for us. PostgreSQL's backends inherit those
+      // pipes and a postmaster killed without signaling its children leaves
+      // them holding the write ends, so the handles stay readable with nothing
+      // left to reap them — and a ref'd pipe keeps the event loop up, so a
+      // host that awaits stop() and returns would never exit. Same drop
+      // start() makes before reusing an instance, for the same reason.
+      //
+      // Ahead of everything below, so no later refusal can skip it. The
+      // lifecycle settles `closed` from the child's `exit` rather than its
+      // `close`, so waiting on that says nothing about the pipes and cannot be
+      // what decides this.
+      proc.stdout?.destroy();
+      proc.stderr?.destroy();
+      proc.stdin?.destroy();
+
       if (!lifecycle) {
         throw new Error(
           `PostgreSQL (PID ${pid}) stopped, but Strataline could not confirm that its PID-file cleanup finished. ` +
@@ -592,9 +608,10 @@ export class LocalDevDBServer {
         );
       }
 
-      // A gone PID does not mean `close` has fired — see the "exit" hook. Wait
-      // for the lifecycle handler to remove the PID file and clear the process
-      // reference, with a bound so stop() cannot hang on a leaked handle.
+      // A gone PID does not mean the lifecycle handler has run — `exit` is an
+      // event like any other. Wait for it to remove the PID file and clear the
+      // process reference, with a bound so stop() cannot hang on one that
+      // never arrives.
       let lifecycleTimeout: NodeJS.Timeout | undefined;
 
       const closedInTime = await Promise.race([
@@ -610,41 +627,23 @@ export class LocalDevDBServer {
 
       if (!closedInTime) {
         // Running out of time here is NOT a failed shutdown, and reporting one
-        // would be wrong in the case that produces it. `close` waits on the
-        // stdio pipes as well as the process, and PostgreSQL's backends
-        // inherit those pipes: a postmaster wedged badly enough to need
-        // SIGKILL dies without signaling its children, which go on holding the
-        // write ends with nothing left to reap them. The postmaster is
-        // confirmed gone by this point, so what is late is the event, not the
-        // stop.
+        // would be wrong in the case that produces it. The postmaster is
+        // confirmed gone by this point — waitForExit said so — so what is late
+        // is Node's `exit` event, not the stop.
         //
         // Left to reject, that turned a successful Ctrl+C into a non-zero exit
         // reporting a shutdown that had in fact worked — and, because the
         // release lives in the lifecycle handler, into a stale PID record too. So
-        // do the lifecycle cleanup here instead. It is the same call the close
-        // handler makes and runs at most once, so a `close` that does arrive
-        // later still makes its own exit decision without repeating any of it.
+        // do the lifecycle cleanup here instead. It is the same call the
+        // lifecycle handler makes and runs at most once, so an `exit` that
+        // does arrive later still makes its own decision without repeating it.
         this.log(
           "warn",
-          `PostgreSQL (PID ${pid}) has exited, but Node has not reported its stdio closed. ` +
-            "Completing shutdown without waiting: orphaned PostgreSQL child processes can hold those pipes open after the postmaster is gone.",
+          `PostgreSQL (PID ${pid}) is gone, but Node has not yet reported its exit. ` +
+            "Completing shutdown without waiting for that event.",
         );
 
         await lifecycle.finalize();
-
-        // The read ends are ours, and nothing is going to close them for us.
-        // Dropping them lets `close` fire and, more to the point, stops a
-        // leaked pipe from holding the event loop open so a CLI can exit.
-        //
-        // It also bounds how late that `close` can be, which matters more than
-        // it looks: a close arriving after a subsequent start() has attached
-        // its own handler reads as an unrequested crash, and that exits the
-        // host. Prompting the event here rather than leaving it open-ended is
-        // what keeps that window shorter than a restart. Do not drop these on
-        // the grounds that the cleanup above has already been done.
-        proc.stdout?.destroy();
-        proc.stderr?.destroy();
-        proc.stdin?.destroy();
       }
     } finally {
       // The lifecycle handler clears this too, but only when it exits — which an
@@ -2695,9 +2694,10 @@ export class LocalDevDBServer {
     // come, and a crashed server could sit there with its record still on disk
     // and its death unreported.
     //
-    // `close` keeps only what is genuinely about the pipes: settling `closed`
-    // for anyone waiting on the full teardown. finalize() is memoized, so the
-    // pair cannot repeat any of the work between them.
+    // `closed` settles from here too, so it reports the lifecycle having
+    // finished rather than the pipes having drained. A shutdown awaiting it
+    // therefore learns nothing about the pipes and drops the read ends itself
+    // either way — see performGracefulShutdown.
     proc.on("exit", async (code) => {
       // Answered before anything else, because everything else is about the
       // instance rather than about this child, and a superseded child has no
@@ -3257,6 +3257,18 @@ export class LocalDevDBServer {
     if (this.pgProcessLifecycle?.proc === proc) {
       this.pgProcessLifecycle = null;
     }
+
+    // The child is confirmed gone by this point, so the read ends are ours and
+    // nothing else is going to close them. Dropped for the reason
+    // performGracefulShutdown drops them: PostgreSQL's backends inherit those
+    // pipes and can outlive the postmaster holding them open, and a leaked
+    // pipe keeps the event loop up — so a caller that catches this start()'s
+    // rejection and returns would never exit. The unstoppable path above
+    // returns before this, deliberately: that child is still running and its
+    // output is still worth having.
+    proc?.stdout?.destroy();
+    proc?.stderr?.destroy();
+    proc?.stdin?.destroy();
 
     // Nothing of ours is running any more. Released here rather than beside
     // the kill above, so a spawn that failed before it ever had a PID — which
