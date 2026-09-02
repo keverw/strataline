@@ -4,6 +4,7 @@ import {
   access,
   writeFile,
   readFile,
+  open,
   rename,
   link,
   unlink,
@@ -1321,9 +1322,22 @@ export class LocalDevDBServer {
     // afterwards. Back with a link rather than by writing the bytes again: a
     // link is one step, so the record is never observed half written, and it
     // fails rather than overwrites, so a newer record that took the name
-    // meanwhile keeps it.
+    // meanwhile keeps it. Where the filesystem has no hard links, an exclusive
+    // create puts the same bytes back instead — see publishWithoutReplacing.
+    //
+    // Only where there are bytes to put back. `held` is null where the read
+    // failed and EMPTY where the claim had gone by the time it was read, which
+    // readClaimedRecord reports as the same absence a mismatch is, and neither
+    // is a record: rewriting one would publish a name holding nothing, which
+    // every reader treats as corrupt. The link is the only way back for those,
+    // and its failure is reported as one.
     try {
-      await link(claimed, path);
+      if (held) {
+        await this.publishWithoutReplacing(claimed, path, held);
+      } else {
+        await link(claimed, path);
+      }
+
       await this.removeFileIfPresent(claimed);
 
       // The record is at `path` again and nothing here could identify it,
@@ -1366,6 +1380,87 @@ export class LocalDevDBServer {
       }
 
       return { outcome: "stranded", heldAt: claimed, displaced: held };
+    }
+  }
+
+  /**
+   * Publishes a record at `path` without replacing whatever may already be
+   * there, by `link` where the filesystem has hard links and by an exclusive
+   * create where it does not.
+   *
+   * A hard link is the better of the two and stays the first choice: it is one
+   * step, so the record is never observed half written, and it fails rather
+   * than overwrites. But it is a capability rather than a given. exFAT and
+   * FAT32 have no hard links at all, and neither do many SMB/CIFS mounts,
+   * WSL's DrvFs, or some cloud-sync file providers, and every one of them
+   * fails the call outright — EPERM, ENOTSUP, ENOSYS. Treating that as fatal
+   * made every start on such a filesystem fail, permanently, with a bare errno
+   * that named nothing to do about it, and this module's own file writing was
+   * the only thing that needed the capability.
+   *
+   * The fallback keeps the property this is here for and gives up the other
+   * one. `wx` creates exclusively, so a name somebody else has taken still
+   * comes back EEXIST and is never overwritten; what it cannot promise is that
+   * a reader arriving mid-write sees the whole record. That reader sees an
+   * unparseable one, which every reader here refuses on rather than acts on,
+   * so the cost is a cautious refusal on a filesystem that could not have had
+   * the guarantee anyway.
+   *
+   * EEXIST is rethrown from whichever step produced it, so callers keep
+   * recognizing it as somebody having taken the name. ENOENT is rethrown
+   * without a fallback at all: the source having gone means there is no record
+   * in hand to publish, and writing `contents` anyway would put bytes under a
+   * name whose record this call no longer holds.
+   *
+   * `contents` must be the record itself. Publishing an empty string would
+   * create a name holding nothing, which every reader here treats as a corrupt
+   * record and refuses on, so a caller without real bytes must not use this.
+   */
+  private async publishWithoutReplacing(
+    source: string,
+    path: string,
+    contents: string,
+  ): Promise<void> {
+    try {
+      await link(source, path);
+
+      return;
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException)?.code;
+
+      if (code === "EEXIST" || code === "ENOENT") {
+        throw e;
+      }
+
+      // Opened rather than written in one call, so that creating the name and
+      // failing to fill it are distinguishable. `wx` fails with EEXIST where
+      // the name is taken, and a failure to open creates nothing, so there is
+      // nothing to undo and nothing of anybody else's to touch.
+      const handle = await open(path, "wx").catch((refused: unknown) => {
+        throw (refused as NodeJS.ErrnoException)?.code === "EEXIST"
+          ? refused
+          : e;
+      });
+
+      try {
+        try {
+          await handle.writeFile(contents);
+        } finally {
+          await handle.close();
+        }
+      } catch (failed) {
+        // The name exists and does not hold the whole record. Only this call
+        // could have created it, so removing it is safe, and leaving it would
+        // strand exactly the half-written file the link was avoiding.
+        await this.removeFileIfPresent(path);
+
+        // The write's own error rather than the link's. The link failing is
+        // what sent us here and describes the filesystem; this one describes
+        // what actually went wrong, and reporting a full disk or a read-only
+        // mount as "operation not permitted, link" points at the one thing
+        // that is not the problem.
+        throw failed;
+      }
     }
   }
 
@@ -2180,11 +2275,16 @@ export class LocalDevDBServer {
    * Creates a PostgreSQL client with connection options optimized for local development
    * @param user User to connect as
    * @param database Database to connect to
+   * @param timeoutMs Bound on connecting and on each query, for a caller that
+   *   has a deadline of its own. The forgiving defaults suit setup work, whose
+   *   caller is waiting on it and nothing else; a poll inside a bounded wait
+   *   needs its attempts to cost less than the wait — see waitForServerReady.
    * @returns Connected PostgreSQL client
    */
   private async createClient(
     user: string = "postgres",
     database: string = "postgres",
+    timeoutMs?: number,
   ): Promise<Client> {
     const password = user === "postgres" ? "postgres" : this.pgPass;
 
@@ -2195,8 +2295,8 @@ export class LocalDevDBServer {
       password: password,
       database: database,
       // Increase timeouts to be more forgiving during startup
-      connectionTimeoutMillis: 10000,
-      query_timeout: 15000,
+      connectionTimeoutMillis: timeoutMs ?? 10000,
+      query_timeout: timeoutMs ?? 15000,
       // Add keepalive settings to match server configuration
       keepAlive: true,
       keepAliveInitialDelayMillis: 10000,
@@ -2533,7 +2633,7 @@ export class LocalDevDBServer {
 
     try {
       await writeFile(tempPidFile, record);
-      await link(tempPidFile, this.pidFile);
+      await this.publishWithoutReplacing(tempPidFile, this.pidFile, record);
     } catch (e) {
       // Its name is unique to this write, so nothing else would reclaim it. A
       // crash can still strand one, harmlessly: readers only open the PID file.
@@ -2787,21 +2887,102 @@ export class LocalDevDBServer {
     });
   }
 
+  /** How long readiness polling may take in total, however it is spent. */
+  private static readonly READINESS_TIMEOUT_MS = 30_000;
+
+  /** What one readiness attempt may spend connecting and querying. */
+  private static readonly READINESS_ATTEMPT_TIMEOUT_MS = 2000;
+
+  /**
+   * How much of the budget an attempt needs before it is worth making.
+   *
+   * The deadline can fall anywhere, including a few milliseconds away, and an
+   * attempt given what is left of a budget nearly spent is not a shorter
+   * attempt but a pointless one: it can only time out, and it still counts
+   * itself in the "not ready after N attempts" the failure reports. So the
+   * loop stops when there is no time for a real try rather than making a
+   * token one.
+   *
+   * It also keeps the attempt timeout away from zero by construction, which
+   * matters more than it looks: node-postgres reads a connectionTimeoutMillis
+   * of 0 as NO timeout, so a clamp allowed to reach it would hand back the
+   * unbounded connect this whole bound exists to remove.
+   */
+  private static readonly READINESS_MIN_ATTEMPT_MS = 250;
+
+  /** The interval the poll settles at once the early attempts have missed. */
+  private static readonly READINESS_POLL_MS = 1000;
+
+  /**
+   * What the first few readiness polls wait, before settling at the interval
+   * above.
+   *
+   * A flat second was nearly the whole of an ordinary wait. A postmaster that
+   * is not up yet refuses the connection at once, so an attempt costs almost
+   * nothing and the loop spent its time asleep — and a server that became
+   * ready in the usual few hundred milliseconds went unnoticed until the
+   * second was out. Polling finely where the answer is most likely to change
+   * and coarsely where it is not notices a warm start about as soon as it
+   * happens, while a cold one polls no harder than it did before: these five
+   * add up to about a second and a half, so a run that gets past them is on
+   * the old interval having lost nothing.
+   */
+  private static readonly READINESS_BACKOFF_MS: readonly number[] = [
+    50, 100, 200, 400, 800,
+  ];
+
+  /** How long to wait after `attempts` failures, backing off to the interval. */
+  private static readinessDelay(attempts: number): number {
+    return (
+      LocalDevDBServer.READINESS_BACKOFF_MS[attempts - 1] ??
+      LocalDevDBServer.READINESS_POLL_MS
+    );
+  }
+
   /**
    * Waits for the PostgreSQL server to be ready to accept connections.
    *
+   * Bounded by a deadline rather than by an attempt count alone, because the
+   * count alone was not a bound. A server that is simply not up yet refuses
+   * the connection at once, so thirty attempts a second apart really did cost
+   * about thirty seconds — but something else holding the port, which is the
+   * collision free-port.ts exists to avoid, accepts the connection and then
+   * says nothing, and each attempt spent the client's full connect timeout
+   * instead. Thirty of those is five and a half minutes, reported as a failure
+   * "after 30 seconds" and well past the bound a host sizes its own shutdown
+   * wait from. So each attempt gets a short timeout of its own and the loop
+   * stops at the deadline whichever runs out first.
+   *
+   * The gap between attempts backs off rather than sitting at a flat second,
+   * which is where an ordinary start spent nearly all of its wait — see
+   * READINESS_BACKOFF_MS. Thirty attempts still come to about the same
+   * twenty-six seconds of sleeping, so which of the two bounds ends the loop
+   * depends on what the attempts themselves cost: the count where they are
+   * refused instantly, the deadline where they are not.
+   *
+   * "About" thirty seconds rather than exactly. One attempt's timeout covers
+   * connecting and then querying in turn, so the last one admitted can spend
+   * twice it, and the wait can run a couple of seconds over. The bound is here
+   * to keep a stuck start from becoming a five-minute one, not to be exact.
+   *
    * @param maxAttempts Maximum number of attempts to check if the server is ready (default: 30)
-   * Waits for the server to be ready to accept connections (up to 30 attempts, 1 second between attempts)
    * @returns True if the server is ready, false otherwise
    */
 
   private async waitForServerReady(maxAttempts = 30): Promise<boolean> {
     this.log("setup", "Waiting for PostgreSQL server to start...");
 
+    const startedAt = Date.now();
+    const deadline = startedAt + LocalDevDBServer.READINESS_TIMEOUT_MS;
+
     let serverReady = false;
     let attempts = 0;
 
-    while (!serverReady && attempts < maxAttempts) {
+    while (
+      !serverReady &&
+      attempts < maxAttempts &&
+      deadline - Date.now() >= LocalDevDBServer.READINESS_MIN_ATTEMPT_MS
+    ) {
       // Nothing is coming: the spawn failed, or the server exited before it
       // was ready. Waiting out the remaining attempts would turn a knowable
       // failure into a thirty-second one.
@@ -2812,7 +2993,18 @@ export class LocalDevDBServer {
       try {
         // Try to make a single connection test using our optimized client method
         const currentUser = this.currentUser;
-        const client = await this.createClient(currentUser, "postgres");
+        // Sized from what is left of the budget, so an attempt admitted near
+        // the end cannot run long past it. The loop guard above is what keeps
+        // this clear of zero, which pg would read as no bound at all — see
+        // READINESS_MIN_ATTEMPT_MS.
+        const client = await this.createClient(
+          currentUser,
+          "postgres",
+          Math.min(
+            LocalDevDBServer.READINESS_ATTEMPT_TIMEOUT_MS,
+            deadline - Date.now(),
+          ),
+        );
 
         // Ended in a finally, because a server that accepts the connection but
         // is not yet answering queries — or one that outlasts createClient's
@@ -2846,9 +3038,16 @@ export class LocalDevDBServer {
           );
         }
 
-        // Only wait if we're going to try again
-        if (attempts < maxAttempts) {
-          await new Promise((resolve) => setTimeout(resolve, 1000));
+        // Only wait if we're going to try again, and never past the deadline.
+        const remaining = deadline - Date.now();
+
+        if (attempts < maxAttempts && remaining > 0) {
+          await new Promise((resolve) =>
+            setTimeout(
+              resolve,
+              Math.min(LocalDevDBServer.readinessDelay(attempts), remaining),
+            ),
+          );
         }
       }
     }
@@ -2858,9 +3057,15 @@ export class LocalDevDBServer {
     }
 
     if (!serverReady) {
+      // What it actually waited, rather than what it was budgeted. The two
+      // agree on the ordinary path and the message is read on the other one.
+      const waited = Math.round((Date.now() - startedAt) / 1000);
+
       throw new Error(
         this.withServerOutput(
-          "PostgreSQL server failed to start after 30 seconds",
+          `PostgreSQL server was not ready after ${attempts} connection attempt${
+            attempts === 1 ? "" : "s"
+          } over ${waited} seconds`,
         ),
       );
     }
