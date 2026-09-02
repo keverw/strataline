@@ -1470,11 +1470,13 @@ startup.then((error) => {
   }
 });
 
-// Above what start() can legitimately take: a previous server's shutdown
+// Clears the bounded phases with room over: a previous server's shutdown
 // escalation runs to about 42 seconds, the readiness wait polls for about 30
-// more, and user and database setup follows. The bound is for a start that is
-// stuck rather than one that is slow, since trapping a signal suppresses
-// Node's own termination and an unbounded wait would ignore SIGTERM forever.
+// more, and user and database setup follows. Not a ceiling on a start, since
+// initdb has no bound of its own, but well clear of what a working machine
+// does. The bound is for a start that is stuck rather than one that is slow,
+// since trapping a signal suppresses Node's own termination and an unbounded
+// wait would ignore SIGTERM forever.
 const START_WAIT_MS = 90_000;
 
 let stopping: Promise<void> | null = null;
@@ -1713,12 +1715,14 @@ startup.then((error) => {
 });
 
 // Bounded, because trapping a signal suppresses Node's own termination and an
-// unbounded wait would be a script that ignores SIGTERM forever. Well above
-// what start() can legitimately take, though: a previous server's shutdown
-// escalation runs to about 42 seconds, the readiness wait polls for about 30
-// more, and user and database setup follows. This is for a start that is stuck
-// rather than one that is slow, and giving up early only reaches the same
-// force-kill sooner while throwing away the starts that would have finished.
+// unbounded wait would be a script that ignores SIGTERM forever. It clears the
+// bounded phases with room over: a previous server's shutdown escalation runs
+// to about 42 seconds, the readiness wait polls for about 30 more, and user and
+// database setup follows. Not a ceiling on a start, since initdb has no bound
+// of its own, but well clear of what a working machine does. This is for a
+// start that is stuck rather than one that is slow, and giving up early only
+// reaches the same force-kill sooner while throwing away the starts that would
+// have finished.
 const START_WAIT_MS = 90_000;
 
 let stopping: Promise<void> | null = null;

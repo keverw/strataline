@@ -2080,10 +2080,13 @@ export class LocalDevDBServer {
 
       let settled = false;
 
-      // Opt-in, and off for everything that legitimately takes its time —
-      // initdb against a cold filesystem is minutes, not seconds. It is for
-      // the callers that run inside a bounded operation and would otherwise
-      // hand an unbounded wait to a caller that was promised a bound.
+      // Opt-in, and off for the callers with no bound worth guessing at.
+      // initdb is the one that matters: it takes about half a second on a
+      // warm local disk, but what it actually costs is a function of the
+      // filesystem underneath it, and a timeout here would not shorten a slow
+      // one, it would kill it part way. It is for the callers that run inside
+      // a bounded operation and would otherwise hand an unbounded wait to a
+      // caller that was promised a bound.
       let timer: NodeJS.Timeout | undefined;
 
       const finish = (result: {
@@ -2200,13 +2203,17 @@ export class LocalDevDBServer {
       // initdb runs into a sibling and the result is renamed into place, so
       // the data directory only ever exists initialized. It is the same
       // publish-by-rename the PID record uses, for a sharper reason: initdb is
-      // the one unbounded step in a start, minutes against a cold filesystem,
-      // and it is the step a first run spends nearly all of its time in — so
-      // it is where an interruption lands. Interrupted in place it left a
-      // directory with no postgresql.conf in it, which is neither a cluster
-      // nor absent: the check above sees no config and runs initdb again, and
-      // initdb refuses a directory that is not empty. Every later start then
-      // failed the same way until somebody deleted the directory by hand.
+      // the one step in a start with no bound on it, and on a first run it is
+      // the step there is nothing else to wait for — so it is where an
+      // interruption lands. It is quick on a warm local disk, about half a
+      // second, which is not a guarantee about anybody else's filesystem and
+      // is no help at all to whoever hits Ctrl+C during it.
+      //
+      // Interrupted in place it left a directory with no postgresql.conf in
+      // it, which is neither a cluster nor absent: the check above sees no
+      // config and runs initdb again, and initdb refuses a directory that is
+      // not empty. Every later start then failed the same way until somebody
+      // deleted the directory by hand.
       //
       // A sibling, so the rename cannot fail with EXDEV, and uniquely named,
       // so two starts racing for one data directory do not also race here.

@@ -74,11 +74,18 @@ startup.then((error) => {
  * signal suppresses Node's own termination and an unbounded wait would be a
  * script that ignores SIGTERM forever.
  *
- * So it sits above what `start()` can legitimately take: a previous server's
+ * So it clears the bounded phases with room over: a previous server's
  * shutdown escalation runs to about 42 seconds, the readiness wait polls for
  * about 30 more, and user and database setup follows. Five seconds — which
  * this was — expired inside the readiness wait, which is the longest stretch
  * of a cold run and exactly when a signal is most likely to land.
+ *
+ * Not a ceiling on a start, though, and it cannot be one. initdb has no bound
+ * of its own, and a readiness poll against a port something else is holding
+ * open spends its own connect timeout on every attempt rather than failing
+ * fast. Both are far outside what a working machine does — initdb measures in
+ * under a second, and a healthy start in a few — so this is chosen to sit
+ * clear of the normal path rather than to prove anything about the worst one.
  *
  * Two things make the length safe to choose freely. A second signal gives up
  * at once, which is the interactive escape hatch, and a supervisor with a
