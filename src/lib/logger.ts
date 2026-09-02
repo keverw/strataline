@@ -196,14 +196,29 @@ export class MutableLogger extends BaseLogger {
   }
 
   /**
-   * Log a warning message if verbose is enabled
+   * Log a warning message if verbose is enabled, or inform where the logger
+   * beneath cannot warn.
+   *
+   * Same fallback PrefixedLogger makes, and for the same reason: `Logger`
+   * declares `warn`, but a JavaScript caller can hand over an object without
+   * it, and wrapping such a logger here produces one that HAS `warn` — so a
+   * call site with nothing to feature-detect calls it and reaches the one that
+   * is not there. A wrapper is never worse than what it wraps.
    */
   warn(data: LogDataInput): void {
     if (this.verbose) {
       const logData: LogData = { ...data, level: "warn" };
       const prefix = buildLogPrefix(logData);
+      const prefixed = { ...data, message: `${prefix}${logData.message}` };
+
       // Assuming baseLogger handles the actual console logging or equivalent
-      this.baseLogger.warn({ ...data, message: `${prefix}${logData.message}` });
+      if (typeof this.baseLogger.warn === "function") {
+        this.baseLogger.warn(prefixed);
+
+        return;
+      }
+
+      this.baseLogger.info(prefixed);
     }
   }
 }

@@ -168,6 +168,22 @@ describe("Logger Utilities", () => {
       expect(warnSpy).not.toHaveBeenCalled();
     });
 
+    it("should fall back to info when the base logger has no warn", () => {
+      // `Logger` declares warn, but a JavaScript caller can supply an object
+      // without it, and wrapping one here produced a logger that HAS warn and
+      // reached the one that did not.
+      const warnless = { info: logSpy, error: errorSpy } as unknown as Logger;
+      const mutableLogger = new MutableLogger(warnless, true);
+      const logInput: LogDataInput = { task: "MWarn", message: "Warn on" };
+
+      mutableLogger.warn(logInput);
+
+      expect(logSpy).toHaveBeenCalledWith({
+        ...logInput,
+        message: "[MWarn] Warn on",
+      });
+    });
+
     it("should log errors when verbose is true", () => {
       const mutableLogger = new MutableLogger(baseLoggerMock, true);
       const errorObj = new Error("Mutable error");
