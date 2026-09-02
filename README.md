@@ -1442,24 +1442,87 @@ const server = new LocalDevDBServer({
   onExit: (code) => process.exit(code),
 });
 
+// Held, not just awaited. A signal can arrive during startup, and shutdown()
+// rejects while a start is in flight, so the handler has to wait for the start
+// to settle rather than call shutdown() into a refusal. Exiting there instead
+// would leave the postmaster to the synchronous `exit` hook, which only
+// SIGKILLs it: no shutdown checkpoint, a stranded postmaster.pid, and leaked
+// SysV IPC objects.
+let settled = false;
+
+const startup = server.start().then(
+  (): unknown => {
+    settled = true;
+
+    return null;
+  },
+  (error: unknown) => {
+    settled = true;
+
+    return error;
+  },
+);
+
+startup.then((error) => {
+  if (error !== null) {
+    console.error(`Fatal error: ${error}`);
+    process.exit(1);
+  }
+});
+
+// Above what start() can legitimately take: a previous server's shutdown
+// escalation runs to about 42 seconds, the readiness wait polls for about 30
+// more, and user and database setup follows. The bound is for a start that is
+// stuck rather than one that is slow, since trapping a signal suppresses
+// Node's own termination and an unbounded wait would ignore SIGTERM forever.
+const START_WAIT_MS = 90_000;
+
 let stopping: Promise<void> | null = null;
+
+function abandonStartup(reason: string): void {
+  console.error(`${reason} Exiting without a clean shutdown.`);
+  process.exit(1);
+}
 
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
   process.on(signal, () => {
-    stopping ??= server
-      .shutdown(signal)
-      .then(() => process.exit(0))
+    // A second signal while the first is still WAITING gives up on the wait.
+    // Once the shutdown is running it is left alone: cutting an escalation off
+    // part-way can leave a data directory needing recovery.
+    if (stopping) {
+      if (!settled) {
+        abandonStartup("Signaled again while still waiting for startup.");
+      }
+
+      return;
+    }
+
+    const startWait = setTimeout(
+      () => abandonStartup("Timed out waiting for startup to finish."),
+      START_WAIT_MS,
+    );
+
+    startWait.unref();
+
+    stopping = startup
+      .then((error) => {
+        clearTimeout(startWait);
+
+        // A failed start has already torn its own child down, and the handler
+        // above is about to exit. Nothing here to stop.
+        if (error !== null) {
+          return;
+        }
+
+        return server.shutdown(signal).then(() => process.exit(0));
+      })
       .catch((error: unknown) => {
+        clearTimeout(startWait);
         console.error(`Shutdown failed: ${error}`);
         process.exit(1);
       });
   });
 }
-
-server.start().catch((error) => {
-  console.error(`Fatal error: ${error}`);
-  process.exit(1);
-});
 ```
 
 Add the script to your `package.json`:
@@ -1617,7 +1680,7 @@ What a joined caller gives up is knowing whose request stopped the server. The e
 
 This is the instance's own view and nothing more. A server left behind by a previous run reads as `stopped`, because this object has never held it. That question is [`getLocalDevDBServerStatus()`](#probing-for-a-running-server), which reads the PID records rather than memory. It is also a snapshot that does not survive an `await`, so use it for a log line or a branch that tolerates being wrong, not as a check that some later call is relied on to pass.
 
-`stop()` waits for the child's `close` event rather than only for the PID to disappear, so the PID file has been released by the time it resolves. That wait is bounded. `close` reports the stdio pipes closed as well as the process exited, and PostgreSQL's backends inherit those pipes: a postmaster wedged badly enough to need `SIGKILL` dies without signaling its children, which go on holding them with nothing left to reap them. Once the process itself is confirmed gone, strataline finishes the cleanup itself rather than wait on an event that may never arrive, so a shutdown that worked is never reported as one that failed.
+`stop()` waits for the child's `exit` event rather than only for the PID to disappear, so the PID file has been released by the time it resolves. It deliberately does not wait for `close`, which reports the stdio pipes closed as well as the process exited: PostgreSQL's backends inherit those pipes, and a postmaster wedged badly enough to need `SIGKILL` dies without signaling its children, which go on holding them with nothing left to reap them. So `close` can arrive late or never, and nothing `stop()` promises is about the pipes. The wait on `exit` is bounded too, and once the process itself is confirmed gone strataline finishes the cleanup itself rather than wait on an event, so a shutdown that worked is never reported as one that failed. What that leaves is that a resolved `stop()` does not mean the child's output has finished arriving. Only a `start()` whose server died waits for that, briefly and with a bound, so its error can carry what PostgreSQL said.
 
 **This library traps no signals.** Wiring `SIGINT`/`SIGTERM`/`SIGHUP` is the program's job, the same as it already is for [`RunStratalineCLI`](#cli-integration). A signal listener suppresses Node's default termination for the whole process, so a library that installs one silently changes how its host dies, and where two of them disagree the loudest wins. Call `shutdown(signal)` from your own handler: it stops the server and resolves, so the exit stays yours.
 
@@ -1649,10 +1712,14 @@ startup.then((error) => {
   }
 });
 
-// Bounded, because trapping a signal suppresses Node's own termination: an
-// unbounded wait through a first-run initdb lets a supervisor's grace period
-// expire and SIGKILL the script instead.
-const START_WAIT_MS = 5000;
+// Bounded, because trapping a signal suppresses Node's own termination and an
+// unbounded wait would be a script that ignores SIGTERM forever. Well above
+// what start() can legitimately take, though: a previous server's shutdown
+// escalation runs to about 42 seconds, the readiness wait polls for about 30
+// more, and user and database setup follows. This is for a start that is stuck
+// rather than one that is slow, and giving up early only reaches the same
+// force-kill sooner while throwing away the starts that would have finished.
+const START_WAIT_MS = 90_000;
 
 let stopping: Promise<void> | null = null;
 

@@ -85,7 +85,7 @@ startup.then((error) => {
  * shorter grace period simply kills the script itself, which is the same
  * ending this would have produced by exiting early.
  */
-const START_WAIT_MS = 120_000;
+const START_WAIT_MS = 90_000;
 
 let stopping: Promise<void> | null = null;
 
