@@ -108,7 +108,47 @@ function ownerOrSkip(pass: string): string | null {
   return user;
 }
 
-function cleanSharedMemory(): void {
+/**
+ * What the shared memory pass reads, and the removal itself.
+ *
+ * Injectable for a different reason than {@link SemaphoreProbes}, and it is
+ * worth being clear which. The semaphore pass needs it for ORDER: its two
+ * readings have to be taken in one sequence and nothing about a real `ipcs`
+ * can show that they were. This pass has no such ordering to protect, since
+ * every segment carries its own creator PID and is decided from the snapshot
+ * that PID was read out of.
+ *
+ * What it has instead is a PARSE. The owner and the creator PID are taken out
+ * of `ipcs -mp` by column index, and `ipcrm` runs on what comes back, so a
+ * column layout that shifted would not fail loudly, it would delete somebody
+ * else's segments. A destructive decision resting on `parts[6]` is exactly the
+ * thing to hold a fixture against.
+ */
+export interface SharedMemoryProbes {
+  /** Raw `ipcs -mp` output. */
+  listSegments(): string;
+  /** Whether the process that created a segment is still running. */
+  creatorIsAlive(pid: number): boolean;
+  /** Removes one segment by id. */
+  removeSegment(id: string): void;
+}
+
+const systemSharedMemoryProbes: SharedMemoryProbes = {
+  // macOS columns: T ID KEY MODE OWNER GROUP CPID LPID
+  listSegments: () => execSync("ipcs -mp", { encoding: "utf8" }),
+  creatorIsAlive: isAlive,
+  removeSegment: (id) => {
+    execSync(`ipcrm -m ${id}`);
+  },
+};
+
+/**
+ * @internal Exported for the parse tests. The entry point at the bottom calls
+ * this with the real probes.
+ */
+export function cleanSharedMemory(
+  probes: SharedMemoryProbes = systemSharedMemoryProbes,
+): void {
   const user = ownerOrSkip("shared memory");
 
   if (user === null) {
@@ -118,8 +158,7 @@ function cleanSharedMemory(): void {
   let output: string;
 
   try {
-    // macOS columns: T ID KEY MODE OWNER GROUP CPID LPID
-    output = execSync("ipcs -mp", { encoding: "utf8" });
+    output = probes.listSegments();
   } catch (err) {
     console.error("clean-ipc: failed to list shared memory segments:", err);
     process.exitCode = 1;
@@ -146,13 +185,13 @@ function cleanSharedMemory(): void {
       continue;
     }
 
-    if (isAlive(cpid)) {
+    if (probes.creatorIsAlive(cpid)) {
       kept++; // creator still running — leave it alone
       continue;
     }
 
     try {
-      execSync(`ipcrm -m ${id}`);
+      probes.removeSegment(id);
       removed++;
     } catch {
       failed++;
@@ -174,10 +213,10 @@ function cleanSharedMemory(): void {
  * wrong — the window is a few milliseconds wide and closing it is a matter of
  * which call comes first, not of what either one returns.
  *
- * The shared memory pass needs no equivalent. Each segment carries its
- * creator's PID, so that pass decides about every segment individually from
- * the same snapshot it read the PID out of, and no separate reading has to
- * line up with it.
+ * The shared memory pass has no ordering to protect, since each segment
+ * carries its creator's PID and is decided from the same snapshot that PID was
+ * read out of. It has {@link SharedMemoryProbes} anyway, for the parse rather
+ * than the sequence.
  */
 export interface SemaphoreProbes {
   /** Raw `ipcs -sa` output. */

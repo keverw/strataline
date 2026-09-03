@@ -1,6 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import { readOsUsername } from "../src/lib/os-user";
-import { cleanSemaphores, type SemaphoreProbes } from "./clean-ipc";
+import {
+  cleanSemaphores,
+  cleanSharedMemory,
+  type SemaphoreProbes,
+  type SharedMemoryProbes,
+} from "./clean-ipc";
 
 /**
  * The semaphore pass, tested for the ORDER it takes its two readings in.
@@ -156,5 +161,171 @@ describe.skipIf(OS_USER === null)("cleanSemaphores", () => {
     });
 
     expect(removed).toEqual([LEAKED]);
+  });
+});
+
+/**
+ * The shared memory pass, tested for its PARSE rather than for an order.
+ *
+ * It has no ordering to protect, but it does decide what to `ipcrm` from
+ * `parts[4]` and `parts[6]` of an `ipcs -mp` row. A column layout that shifted
+ * would not fail loudly, it would delete segments belonging to somebody else,
+ * so the fixture below is the real header and row shape this machine prints.
+ */
+
+/** One `ipcs -mp` row. macOS columns: T ID KEY MODE OWNER GROUP CPID LPID */
+function segmentRow(id: string, owner: string, cpid: string): string {
+  return `m ${id} 0x00000000 --rw------- ${owner} staff ${cpid} 4242`;
+}
+
+function segmentTable(rows: string[]): string {
+  return [
+    "IPC status from <running system> as of Thu Sep  3 17:52:15 MDT 2026",
+    "T     ID     KEY        MODE       OWNER    GROUP  CPID  LPID",
+    "Shared Memory:",
+    ...rows,
+    "",
+  ].join("\n");
+}
+
+const DEAD_CREATOR = 999001;
+const LIVE_CREATOR = 999002;
+
+function sharedMemoryProbes(
+  table: string,
+  removed: string[],
+  onRemove?: (id: string) => void,
+): SharedMemoryProbes {
+  return {
+    listSegments: () => table,
+    // Keyed on the PID the parse pulled out, so a row read from the wrong
+    // column reaches this with the wrong number and the assertions diverge.
+    creatorIsAlive: (pid) => pid === LIVE_CREATOR,
+    removeSegment: (id) => {
+      onRemove?.(id);
+      removed.push(id);
+    },
+  };
+}
+
+describe.skipIf(OS_USER === null)("cleanSharedMemory", () => {
+  it("removes a segment whose creator has exited", () => {
+    const removed: string[] = [];
+
+    cleanSharedMemory(
+      sharedMemoryProbes(
+        segmentTable([segmentRow("65536", OWNER, String(DEAD_CREATOR))]),
+        removed,
+      ),
+    );
+
+    expect(removed).toEqual(["65536"]);
+  });
+
+  it("keeps a segment whose creator is still running", () => {
+    const removed: string[] = [];
+
+    cleanSharedMemory(
+      sharedMemoryProbes(
+        segmentTable([segmentRow("65537", OWNER, String(LIVE_CREATOR))]),
+        removed,
+      ),
+    );
+
+    expect(removed).toEqual([]);
+  });
+
+  it("leaves another user's segments alone even when their creator is gone", () => {
+    const removed: string[] = [];
+
+    // The owner column is the only thing standing between this and somebody
+    // else's memory, so a shifted parse shows up here first.
+    cleanSharedMemory(
+      sharedMemoryProbes(
+        segmentTable([
+          segmentRow("65538", "someone-else", String(DEAD_CREATOR)),
+          segmentRow("65539", OWNER, String(DEAD_CREATOR)),
+        ]),
+        removed,
+      ),
+    );
+
+    expect(removed).toEqual(["65539"]);
+  });
+
+  it("ignores the header lines and anything that is not a segment row", () => {
+    const removed: string[] = [];
+
+    // The table carries three lines of preamble and the semaphore section can
+    // follow in the same output. Only rows whose first column is `m` are ours.
+    cleanSharedMemory(
+      sharedMemoryProbes(
+        segmentTable([
+          `s 111111 0x0b1193e2 --ra-ra-ra- ${OWNER} staff ${OWNER} staff 17 15:38:16 15:01:45`,
+        ]),
+        removed,
+      ),
+    );
+
+    expect(removed).toEqual([]);
+  });
+
+  it("skips a row whose creator PID is not a number", () => {
+    const removed: string[] = [];
+
+    // A truncated or reformatted row must not be read as PID zero and have its
+    // liveness guessed at.
+    cleanSharedMemory(
+      sharedMemoryProbes(
+        segmentTable([segmentRow("65540", OWNER, "-")]),
+        removed,
+      ),
+    );
+
+    expect(removed).toEqual([]);
+  });
+
+  it("carries on when one removal fails", () => {
+    const removed: string[] = [];
+
+    cleanSharedMemory(
+      sharedMemoryProbes(
+        segmentTable([
+          segmentRow("65541", OWNER, String(DEAD_CREATOR)),
+          segmentRow("65542", OWNER, String(DEAD_CREATOR)),
+        ]),
+        removed,
+        (id) => {
+          if (id === "65541") {
+            throw new Error("ipcrm: permission denied");
+          }
+        },
+      ),
+    );
+
+    // The first throws and is counted as failed rather than ending the pass,
+    // so a segment this user cannot remove does not strand the ones it can.
+    expect(removed).toEqual(["65542"]);
+  });
+
+  it("reports a listing it could not read rather than removing nothing quietly", () => {
+    const removed: string[] = [];
+    // Restored, because leaving it set would fail the whole run.
+    const previousExitCode = process.exitCode;
+
+    try {
+      cleanSharedMemory({
+        listSegments: () => {
+          throw new Error("ipcs: command not found");
+        },
+        creatorIsAlive: () => false,
+        removeSegment: (id) => removed.push(id),
+      });
+
+      expect(removed).toEqual([]);
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.exitCode = previousExitCode;
+    }
   });
 });
