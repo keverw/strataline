@@ -4060,3 +4060,55 @@ describe("postgresOutputLevel", () => {
     expect(postgresOutputLevel("")).toBe("info");
   });
 });
+
+describe("getCurrentUser, through a started server", () => {
+  it("connects as the account initdb named, not as USER or USERNAME", async () => {
+    // initdb runs with no -U, so the cluster's bootstrap superuser is named
+    // after the account the process actually runs as. Reading the name from
+    // the environment instead lets the two disagree, and every start then
+    // fails with `role "..." does not exist` against a database it had just
+    // created. Windows CI found it, where a process launched under other
+    // credentials inherits the parent's USERNAME.
+    const originalUser = process.env.USER;
+    const originalUsername = process.env.USERNAME;
+
+    process.env.USER = "definitely-not-a-real-account";
+    process.env.USERNAME = "definitely-not-a-real-account";
+
+    // Its own directory, since this sits outside the suite's shared fixture.
+    const scratch = tmp.dirSync({ unsafeCleanup: true, prefix: "pg-osuser-" });
+    const misleading = new LocalDevDBServer({
+      port: await findFreePort(),
+      user: "test_dev_user",
+      password: "test_dev_password",
+      database: "test_dev_database",
+      dataDir: join(scratch.name, "pgdata"),
+      pidFile: join(scratch.name, "dev-db.pid"),
+    });
+
+    try {
+      // Starts at all, which is the whole assertion: the environment is lying
+      // about who this is and the server has to ignore it.
+      await misleading.start();
+
+      expect(misleading.getLifecycleState()).toBe("running");
+    } finally {
+      await misleading.stop().catch(() => {});
+      scratch.removeCallback();
+
+      // Restored rather than deleted, since an absent variable is not the same
+      // as one that was never set for the rest of the suite.
+      if (originalUser === undefined) {
+        delete process.env.USER;
+      } else {
+        process.env.USER = originalUser;
+      }
+
+      if (originalUsername === undefined) {
+        delete process.env.USERNAME;
+      } else {
+        process.env.USERNAME = originalUsername;
+      }
+    }
+  }, 60000);
+});

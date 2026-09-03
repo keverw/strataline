@@ -380,14 +380,46 @@ async function fileExists(path: string): Promise<boolean> {
 }
 
 /**
+ * The username the operating system reports for this process, or null where it
+ * cannot say.
+ *
+ * `userInfo()` throws rather than returning nothing when there is no passwd
+ * entry for the effective uid, which is ordinary inside a container run with
+ * `--user 1000:1000` against an image that does not know that uid.
+ */
+function readOsUsername(): string | null {
+  try {
+    return userInfo().username || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Get current OS user in a cross-platform way
  */
 function getCurrentUser(): string {
-  // on Unix: USER, on Windows: USERNAME, else os.userInfo()
+  // The OS first, and the environment only as a fallback. Which way round
+  // this goes is not a matter of taste: initdb runs here with no `-U`, so the
+  // cluster's bootstrap superuser is named after the user the process is
+  // ACTUALLY running as, and this name is what connects to it. The two have to
+  // agree, and only one of these sources is a fact about the process.
+  //
+  // USER and USERNAME are inherited, so they describe whoever set them. Any
+  // way of running as another user without rewriting them leaves them naming
+  // the wrong one -- `su` without `-`, a container that pins them, and on
+  // Windows a process launched under other credentials, which is how this was
+  // found: the cluster's superuser was the real account and the connection
+  // asked for the parent's, so every start failed with
+  // `FATAL: role "..." does not exist` against a database it had just created.
+  //
+  // Kept as fallbacks rather than dropped, for a platform where userInfo()
+  // cannot answer -- it throws where the user has no passwd entry, which a
+  // container running as an unmapped uid does.
   const candidates = [
+    readOsUsername(),
     process.env.USER,
     process.env.USERNAME,
-    userInfo().username,
     "postgres", // final fallback
   ];
 
