@@ -69,7 +69,12 @@ jobs:
 
       # Bun's own default timeout is per test. The suite already passes
       # --timeout, and the job timeout above is what covers a wedged run.
-      - name: Test
+      # Named by platform, both of them, because a skipped step is still listed
+      # in every job. Called "Test" and "Test (as a non-administrator)" they
+      # read as one run and one variant, and whichever is greyed out looks
+      # arbitrary. Saying which platform each is for makes the skip explain
+      # itself from the step list alone.
+      - name: Test (Linux and macOS)
         if: runner.os != 'Windows'
         run: bun test
 
@@ -88,7 +93,7 @@ jobs:
       # can launch under other credentials and still be waited on for an exit
       # code, at the cost of not being able to share this console, hence the
       # redirected output read back afterwards.
-      - name: Test (as a non-administrator)
+      - name: Test (Windows, as a non-administrator)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -121,16 +126,87 @@ jobs:
           $bun = (Get-Command bun).Source
           $credential = New-Object System.Management.Automation.PSCredential($name, $password)
 
+          # Created before the readers below open them, and emptied so a
+          # rerun on the same runner cannot show the previous attempt's output.
+          $outFile = Join-Path $env:GITHUB_WORKSPACE 'bun-test-out.txt'
+          $errFile = Join-Path $env:GITHUB_WORKSPACE 'bun-test-err.txt'
+          Set-Content -Path $outFile -Value '' -NoNewline
+          Set-Content -Path $errFile -Value '' -NoNewline
+          icacls $outFile /grant "${name}:F" /Q | Out-Null
+          icacls $errFile /grant "${name}:F" /Q | Out-Null
+
+          # No -Wait, so the two files can be followed while the run is still
+          # going. Waiting on the process and printing afterwards means four
+          # minutes of a job that appears to be doing nothing, with no way to
+          # tell a suite that is working through its tests from one that has
+          # wedged on the first.
           $process = Start-Process -FilePath $bun -ArgumentList 'test' `
             -Credential $credential `
             -WorkingDirectory $env:GITHUB_WORKSPACE `
-            -RedirectStandardOutput bun-test-out.txt `
-            -RedirectStandardError bun-test-err.txt `
-            -Wait -PassThru
+            -RedirectStandardOutput $outFile `
+            -RedirectStandardError $errFile `
+            -PassThru
 
-          # Read back what could not be streamed. Both, and stdout first, since
-          # bun writes its results there and its diagnostics to stderr.
-          Get-Content bun-test-out.txt -ErrorAction SilentlyContinue
-          Get-Content bun-test-err.txt -ErrorAction SilentlyContinue
+          # ReadWrite sharing, because the child still holds these open for
+          # writing. Anything less fails to open them at all.
+          function Open-Follow($path) {
+            [System.IO.StreamReader]::new(
+              [System.IO.File]::Open(
+                $path,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::ReadWrite))
+          }
+
+          # Flat, deliberately: `@(a), @(b)` builds an array OF arrays, and the
+          # loop below would then call ReadLine on an array rather than a
+          # reader.
+          $readers = @((Open-Follow $outFile), (Open-Follow $errFile))
+
+          function Write-Pending($readers) {
+            foreach ($reader in $readers) {
+              while ($null -ne ($line = $reader.ReadLine())) {
+                Write-Host $line
+              }
+            }
+          }
+
+          # Shorter than the job's own timeout, and the difference is the
+          # point. A job killed at its timeout takes the step with it and
+          # reports nothing, so a run that hangs teaches nothing at all. Ending
+          # it here means the output above has already been streamed, the tree
+          # is killed rather than left holding a postmaster, and the failure
+          # says it was a hang rather than looking like an ordinary one.
+          $deadline = (Get-Date).AddMinutes(14)
+          $timedOut = $false
+
+          while (-not $process.HasExited) {
+            Write-Pending $readers
+
+            if ((Get-Date) -gt $deadline) {
+              $timedOut = $true
+              Write-Host "::error::bun test did not finish within 14 minutes. Killing it; the output above is where it stopped."
+              # The whole tree: a stuck test usually means a postmaster is
+              # still up, and killing only bun would leave it running.
+              $process.Kill($true)
+              break
+            }
+
+            Start-Sleep -Milliseconds 250
+          }
+
+          $process.WaitForExit()
+
+          # Once more after it exits, for whatever was written between the last
+          # poll and the process going away.
+          Write-Pending $readers
+
+          foreach ($reader in $readers) {
+            $reader.Dispose()
+          }
+
+          if ($timedOut) {
+            exit 1
+          }
 
           exit $process.ExitCode
