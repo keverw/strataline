@@ -1,0 +1,73 @@
+name: Test
+
+# `push` and `pull_request` read this file from the commit being tested, so a
+# workflow added on a feature branch runs there without being merged first.
+# `workflow_dispatch` is different: its button only appears once the file is on
+# the default branch. It is listed here so it works after the merge, and is not
+# what this relies on to run in the meantime.
+#
+# `push` is deliberately unfiltered for now, so this runs on the branch it was
+# added on rather than waiting for a merge. The cost is that a pull request
+# from a branch in this repository matches both triggers and runs twice. Once
+# this is on the default branch, narrow it to avoid that:
+#
+#   push:
+#     branches: [main]
+#
+# which leaves pull requests covered by the `pull_request` trigger alone.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same branch cancels the run it supersedes. The suite starts
+# a real PostgreSQL per test file, so overlapping runs are not free.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      # Every platform reports, rather than the first failure canceling the
+      # rest. The point of the matrix is knowing which ones are broken.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    # Windows has never run this suite. Until it has passed once, it reports
+    # its result without failing the run, so a real regression on the other two
+    # is not buried under a platform that was never known to work. Remove this
+    # line once Windows is green.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+
+    # The suite talks to a real PostgreSQL and starts and stops it repeatedly,
+    # so it is slower than a unit-test run and the default six hours is no
+    # bound at all for a job that has hung.
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # The lockfile is the point: a resolution that drifts per platform would
+      # make a failure here a question about the install rather than the code.
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Type check
+        run: bun run type-check
+
+      - name: Lint
+        run: bun run lint
+
+      # Bun's own default timeout is per test. The suite already passes
+      # --timeout, and the job timeout above is what covers a wedged run.
+      - name: Test
+        run: bun test
