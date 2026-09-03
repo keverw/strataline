@@ -1,7 +1,8 @@
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { describe, it, test, expect, beforeEach, afterEach } from "bun:test";
 import {
   TestDatabaseInstance,
   createTestDBConsoleLogger,
+  isBindFailure,
 } from "./test-db-instance";
 import { Migration } from "../migration-system";
 
@@ -355,6 +356,56 @@ describe("createTestDBConsoleLogger", () => {
       expect(logCalls).toContain("[MIGRATION] Test migration message");
     } finally {
       console.log = originalLog;
+    }
+  });
+});
+
+describe("isBindFailure", () => {
+  /**
+   * What PostgreSQL 18.4 actually writes when both address families for the
+   * port are taken, in the chunks it writes them in. The bind line is not the
+   * last one, which is the whole reason this is matched against the attempt's
+   * accumulated output rather than the most recent chunk.
+   */
+  const REAL_CHUNKS = [
+    'LOG:  could not bind IPv6 address "::1": Address already in use\n' +
+      "HINT:  Is another postmaster already running on port 24999?\n" +
+      'WARNING:  could not create listen socket for "localhost"\n',
+    "FATAL:  could not create any TCP/IP sockets\n",
+    "LOG:  database system is shut down\n",
+  ];
+
+  test("recognizes a taken port from the whole attempt's output", () => {
+    expect(isBindFailure(REAL_CHUNKS.join(""))).toBe(true);
+  });
+
+  test("does not recognize it from the last chunk alone", () => {
+    // The regression this encodes against: keeping only the most recent chunk
+    // left the matcher looking at the shutdown notice, so the retry was
+    // unreachable and PORT_RETRIES was dead code.
+    expect(isBindFailure(REAL_CHUNKS[REAL_CHUNKS.length - 1])).toBe(false);
+  });
+
+  test("recognizes the socket-creation lines on their own", () => {
+    // A host with IPv6 disabled never emits the bind line.
+    expect(isBindFailure("FATAL:  could not create any TCP/IP sockets")).toBe(
+      true,
+    );
+    expect(
+      isBindFailure('WARNING:  could not create listen socket for "localhost"'),
+    ).toBe(true);
+  });
+
+  test("does not fire for a start that failed for another reason", () => {
+    // Retrying these would be three more initdbs and the same failure.
+    for (const output of [
+      "",
+      "FATAL:  database files are incompatible with server\n",
+      "FATAL:  could not create shared memory segment: No space left on device\n",
+      "LOG:  database system is shut down\n",
+      "FATAL:  data directory has wrong ownership\n",
+    ]) {
+      expect(isBindFailure(output)).toBe(false);
     }
   });
 });

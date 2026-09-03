@@ -2887,3 +2887,301 @@ describe("a process cannot start after its own record", () => {
     expect(result.verifiedBy).not.toBeNull();
   });
 });
+
+/**
+ * A probe that fails the way a real one does, rather than the way an absent
+ * reading does.
+ *
+ * The distinction these tests exist for: `null` is what both look like at
+ * every later decision, so the only thing that tells "this platform has no
+ * uid" apart from "`ps` is not installed" is what the probe recorded on its
+ * way out. Every one of these runs on any platform, since the failure is
+ * injected rather than provoked.
+ */
+function failingProbes(
+  overrides: Partial<ProcessProbes>,
+  error: unknown,
+): ProcessProbes {
+  const thrower = () => {
+    throw error;
+  };
+
+  return {
+    isAlive: () => true,
+    command: thrower,
+    startTime: thrower,
+    bootTime: () => null,
+    uid: () => null,
+    ...overrides,
+  };
+}
+
+describe("probe failure reporting", () => {
+  test("says why a command-line read failed rather than only that it did", () => {
+    // A missing `ps` and an unsupported platform produce the same null and the
+    // same `indeterminate`. Only this tells them apart.
+    const missingPs = Object.assign(new Error("spawnSync ps ENOENT"), {
+      code: "ENOENT",
+    });
+
+    const result = verifyPid(4321, {
+      startedAt: null,
+      bootTime: null,
+      dataDir: "/tmp/cluster",
+      probes: failingProbes(
+        {
+          command: () => {
+            throw missingPs;
+          },
+        },
+        missingPs,
+      ),
+    });
+
+    expect(result.kind).toBe("indeterminate");
+    expect(result.probeFailures.length).toBeGreaterThan(0);
+    expect(result.probeFailures.join(" ")).toContain("ENOENT");
+  });
+
+  test("reports a probe killed at its timeout as a signal, not a code", () => {
+    // What execFileSync leaves behind when it kills a child at `timeout`. A
+    // wedged machine and a missing binary want different fixes.
+    const timedOut = Object.assign(new Error("spawnSync ps ETIMEDOUT"), {
+      signal: "SIGTERM",
+    });
+
+    const result = verifyPid(4321, {
+      startedAt: null,
+      bootTime: null,
+      dataDir: "/tmp/cluster",
+      probes: failingProbes({}, timedOut),
+    });
+
+    expect(result.probeFailures.join(" ")).toContain("SIGTERM");
+  });
+
+  test("is empty when every probe answered", () => {
+    const result = verifyPid(4321, {
+      startedAt: null,
+      bootTime: null,
+      dataDir: "/tmp/cluster",
+      probes: {
+        isAlive: () => true,
+        command: () => "/usr/bin/postgres -D /tmp/cluster",
+        startTime: () => 1_700_000_000_000,
+        bootTime: () => 1_600_000_000_000,
+        uid: () => 501,
+      },
+    });
+
+    expect(result.verifiedBy).toBe("command");
+    expect(result.probeFailures).toEqual([]);
+  });
+
+  test("a platform with no probe at all is not a failure", () => {
+    // getProcessUid returns null on Windows by design. An absent reading is
+    // not a probe that tried and could not, and must not be reported as one.
+    const result = verifyPid(4321, {
+      startedAt: null,
+      bootTime: null,
+      dataDir: "/tmp/cluster",
+      probes: {
+        isAlive: () => true,
+        command: () => null,
+        startTime: () => null,
+        bootTime: () => null,
+        uid: () => null,
+      },
+    });
+
+    expect(result.kind).toBe("indeterminate");
+    expect(result.probeFailures).toEqual([]);
+  });
+
+  test("does not attribute a caller's earlier failures to a nested check", () => {
+    // verifyPid runs inside its own pass, and a second call must report only
+    // what its own probes could not do.
+    const boom = Object.assign(new Error("nope"), { code: "EACCES" });
+    const options = {
+      startedAt: null,
+      bootTime: null,
+      dataDir: "/tmp/cluster",
+    };
+
+    const first = verifyPid(4321, {
+      ...options,
+      probes: failingProbes({}, boom),
+    });
+    const second = verifyPid(4321, {
+      ...options,
+      probes: {
+        isAlive: () => true,
+        command: () => null,
+        startTime: () => null,
+        bootTime: () => null,
+        uid: () => null,
+      },
+    });
+
+    expect(first.probeFailures.length).toBeGreaterThan(0);
+    expect(second.probeFailures).toEqual([]);
+  });
+
+  test("carries the failures into the status a caller refuses on", async () => {
+    const blocked = Object.assign(new Error("access is denied"), {
+      code: "EACCES",
+    });
+
+    writeFileSync(
+      pidFile,
+      JSON.stringify({
+        pid: 4321,
+        startedAt: Date.now(),
+        dataDir,
+        port: 5599,
+        bootTime: null,
+        uid: null,
+      }),
+    );
+
+    const status = await getLocalDevDBServerStatus({
+      pidFile,
+      dataDir,
+      probes: failingProbes({}, blocked),
+    });
+
+    expect(status.indeterminate).toBe(true);
+    expect(status.probeFailures.join(" ")).toContain("EACCES");
+    // Appended to the reason too, so a caller that only logs that still sees it.
+    expect(status.reason).toContain("some checks could not run");
+    expect(status.reason).toContain("EACCES");
+  });
+});
+
+describe("probe failure reporting, regressions", () => {
+  test("reports a boot-time probe failure rather than deduplicating it away", async () => {
+    // The boot read happens before the verification, outside its collector.
+    // With one shared array and a global dedup, the identical failure raised
+    // inside the verification was suppressed and then sliced away, so the one
+    // reading that pushes the answer to `indeterminate` was reported nowhere.
+    const gone = Object.assign(new Error("no sysctl"), { code: "ENOENT" });
+    const failing = () => {
+      throw gone;
+    };
+
+    // postmaster.pid must be present: that is what makes the boot read happen
+    // BEFORE the verification and outside its collector, which is the whole
+    // shape of the bug. Without it the only boot read is inside verifyPid,
+    // where it was always reported correctly.
+    writeFileSync(
+      join(dataDir, "postmaster.pid"),
+      `4321\n${dataDir}\n${Math.floor(Date.now() / 1000)}\n5599\n`,
+    );
+
+    writeFileSync(
+      pidFile,
+      JSON.stringify({
+        pid: 4321,
+        startedAt: Date.now(),
+        dataDir,
+        port: 5599,
+        bootTime: Date.now(),
+        uid: null,
+      }),
+    );
+
+    const status = await getLocalDevDBServerStatus({
+      pidFile,
+      dataDir,
+      probes: {
+        isAlive: () => true,
+        command: failing,
+        startTime: failing,
+        bootTime: failing,
+        uid: () => null,
+      },
+    });
+
+    expect(status.probeFailures.join(" ")).toContain("system boot time");
+    expect(status.reason).toContain("system boot time");
+  });
+
+  test("a bootTime probe that throws does not reject the status check", async () => {
+    // guardProbes exists so an injected probe cannot end a status check by
+    // throwing. Two boot reads sat outside it.
+    const boom = Object.assign(new Error("denied"), { code: "EACCES" });
+
+    writeFileSync(
+      pidFile,
+      JSON.stringify({
+        pid: 4321,
+        startedAt: Date.now(),
+        dataDir: "/somewhere/else",
+        port: 5599,
+        bootTime: Date.now(),
+        uid: null,
+      }),
+    );
+
+    const status = await getLocalDevDBServerStatus({
+      pidFile,
+      dataDir,
+      probes: {
+        isAlive: () => true,
+        command: () => null,
+        startTime: () => null,
+        bootTime: () => {
+          throw boom;
+        },
+        uid: () => null,
+      },
+    });
+
+    expect(status.running).toBe(false);
+    expect(status.probeFailures.join(" ")).toContain("EACCES");
+  });
+
+  test("the field and the reason never disagree", async () => {
+    // The field is documented as what is already appended to the reason. Two
+    // branches set one without the other, so a caller branching on the field
+    // and a person reading the message saw different machines.
+    const boom = Object.assign(new Error("denied"), { code: "EACCES" });
+    const failing = () => {
+      throw boom;
+    };
+
+    for (const recordDataDir of [dataDir, "/somewhere/else"]) {
+      writeFileSync(
+        pidFile,
+        JSON.stringify({
+          pid: 4321,
+          startedAt: Date.now(),
+          dataDir: recordDataDir,
+          port: 5599,
+          bootTime: 1,
+          uid: null,
+        }),
+      );
+
+      const status = await getLocalDevDBServerStatus({
+        pidFile,
+        dataDir,
+        probes: {
+          isAlive: () => true,
+          command: failing,
+          startTime: failing,
+          bootTime: failing,
+          uid: failing,
+        },
+      });
+
+      for (const failure of status.probeFailures) {
+        expect(status.reason).toContain(failure);
+      }
+
+      expect(status.reason.includes("some checks could not run")).toBe(
+        status.probeFailures.length > 0,
+      );
+    }
+  });
+});

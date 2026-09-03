@@ -187,6 +187,16 @@ export interface DevDBServerStatus {
    */
   observedStartTime: number | null;
   /**
+   * Probes that tried to answer and could not, phrased for a person.
+   *
+   * Empty on the ordinary path. A non-empty list means this answer rests on
+   * less evidence than it normally would, and says which evidence is missing
+   * and why. It is already appended to {@link reason}, so a caller that only
+   * shows the reason loses nothing; this is here for a caller that wants to
+   * branch on it or log it as a field.
+   */
+  probeFailures: string[];
+  /**
    * Human-readable explanation, phrased for a person and suitable for putting
    * straight into a log line or a refusal message.
    */
@@ -325,7 +335,9 @@ function powershellQuery(script: string): string | null {
     ).trim();
 
     return out || null;
-  } catch {
+  } catch (e) {
+    noteProbeFailure("PowerShell process query", e);
+
     return null;
   }
 }
@@ -335,6 +347,109 @@ export interface WindowsProcessInfo {
   bootTime: number | null;
   startTime: number | null;
   command: string | null;
+}
+
+/**
+ * Why a probe could not answer, kept so a refusal can say more than that it
+ * could not decide.
+ *
+ * A null reading takes every decision resting on it to `indeterminate`, which
+ * is start() refusing over what may be a perfectly healthy server. The reason
+ * it read null is the difference between "this platform cannot tell" and "`ps`
+ * is not installed" or "PowerShell is blocked by execution policy" — one is
+ * the design and the other is a five-minute fix, and the errno that tells them
+ * apart used to be discarded at the catch.
+ *
+ * Bounded, because a probe called outside any verification pass appends here
+ * with nothing to clear it, and this must not become a leak that grows for the
+ * life of a long-running process.
+ */
+const MAX_RECORDED_PROBE_FAILURES = 20;
+
+let probeFailures: string[] = [];
+
+/**
+ * Runs something with a collector of its own, and reports what it could not
+ * probe.
+ *
+ * A swap rather than an index into a shared array, which is what this
+ * replaced and which was wrong in two ways at once. Dedup is global, so a
+ * failure already recorded by an EARLIER probe — the boot-time read that
+ * statusFromPidFile makes before it verifies anything — suppressed the
+ * identical push from inside the verification, and the slice then reported
+ * nothing: the one reading that pushed the answer to `indeterminate` was the
+ * one dropped. And the cap shifts from the front, which renumbers an index
+ * taken before it.
+ *
+ * A fresh array has neither problem. Nested collectors do not see each
+ * other's failures, which is the property the mark was reaching for, and
+ * dedup is now per collector, which is what "the same probe failed four
+ * times in one command read" actually means.
+ */
+function collectProbeFailures<T>(fn: () => T): {
+  value: T;
+  failures: string[];
+} {
+  const outer = probeFailures;
+
+  probeFailures = [];
+
+  try {
+    return { value: fn(), failures: probeFailures };
+  } finally {
+    probeFailures = outer;
+  }
+}
+
+/** Formats the part of an error worth carrying: what it was, not the stack. */
+function describeProbeError(error: unknown): string {
+  // `signal` is not on ErrnoException: it is what execFileSync adds when it
+  // kills a child at its timeout, so it is spelled out here rather than
+  // assumed away.
+  const errno = error as
+    | (NodeJS.ErrnoException & { signal?: NodeJS.Signals })
+    | null;
+
+  // A spawn killed at its timeout reports the signal rather than a code, and
+  // that distinction is the whole diagnosis: a probe that timed out says the
+  // machine is wedged, while ENOENT says the binary is missing.
+  if (errno?.code) {
+    return errno.code;
+  }
+
+  if (errno?.signal) {
+    return `killed by ${errno.signal}`;
+  }
+
+  return getProbeErrorMessage(error);
+}
+
+function getProbeErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return String(error);
+}
+
+/**
+ * Records why one probe could not answer.
+ *
+ * Deduplicated, because a single command read calls `ps` four times and a
+ * missing binary would otherwise be reported four times over.
+ */
+function noteProbeFailure(probe: string, error: unknown): void {
+  const note = `${probe}: ${describeProbeError(error)}`;
+
+  if (probeFailures.includes(note)) {
+    return;
+  }
+
+  probeFailures.push(note);
+
+  if (probeFailures.length > MAX_RECORDED_PROBE_FAILURES) {
+    probeFailures.shift();
+  }
 }
 
 const windowsInfoCache = new Map<number, WindowsProcessInfo>();
@@ -494,7 +609,9 @@ function detectBootTime(): DetectedBootTime {
       // already run, this is satisfied from cache without spawning at all.
       return probed(getWindowsProcessInfo(process.pid).bootTime);
     }
-  } catch {
+  } catch (e) {
+    noteProbeFailure("system boot time", e);
+
     return { value: null, cacheable: false };
   }
 
@@ -529,7 +646,9 @@ function psField(pid: number, field: string): string | null {
     }).trim();
 
     return out || null;
-  } catch {
+  } catch (e) {
+    noteProbeFailure(`ps -o ${field}`, e);
+
     return null;
   }
 }
@@ -592,7 +711,9 @@ export function getProcessStartTime(pid: number): number | null {
     if (process.platform === "win32") {
       return getWindowsProcessInfo(pid).startTime;
     }
-  } catch {
+  } catch (e) {
+    noteProbeFailure("process start time", e);
+
     return null;
   }
 
@@ -628,7 +749,9 @@ export function getProcessUid(pid: number): number | null {
 
       return Number.isInteger(parsed) ? parsed : null;
     }
-  } catch {
+  } catch (e) {
+    noteProbeFailure("process owner", e);
+
     return null;
   }
 
@@ -700,7 +823,9 @@ export function getProcessCommand(pid: number): string | null {
     if (process.platform === "win32") {
       return getWindowsProcessInfo(pid).command;
     }
-  } catch {
+  } catch (e) {
+    noteProbeFailure("process command line", e);
+
     return null;
   }
 
@@ -920,6 +1045,49 @@ export interface ProcessProbes {
   uid(pid: number): number | null;
 }
 
+/**
+ * Wraps a probe set so a throw from one becomes an absent reading it recorded.
+ *
+ * {@link systemProbes} never throws, since each of its members catches on the
+ * way out. An injected one is somebody else's code: `probes` is on
+ * {@link DevDBStatusOptions}, so a caller can supply its own, and a throw from
+ * one used to escape verifyPid entirely and take LocalDevDBServer.start() with
+ * it. That is the wrong failure for a probe, whose whole contract is that it
+ * may not be able to answer.
+ *
+ * So a throw is treated as the null it should have returned, and recorded like
+ * any other probe failure — which is also what makes the failure reporting
+ * testable without a machine that is actually missing `ps`.
+ *
+ * `isAlive` is the one that cannot degrade to its falsy value. `false` there
+ * means the process is definitively gone, which licenses deleting its record,
+ * so a probe that could not tell must answer `true` and let the checks below
+ * reach `indeterminate` instead. Absence of evidence is not evidence of
+ * absence, and nowhere here more sharply than at that call.
+ */
+function guardProbes(probes: ProcessProbes): ProcessProbes {
+  const guard = <T>(name: string, read: () => T, fallback: T): T => {
+    try {
+      return read();
+    } catch (e) {
+      noteProbeFailure(name, e);
+
+      return fallback;
+    }
+  };
+
+  return {
+    isAlive: (pid) =>
+      guard("process liveness", () => probes.isAlive(pid), true),
+    command: (pid) =>
+      guard("process command line", () => probes.command(pid), null),
+    startTime: (pid) =>
+      guard("process start time", () => probes.startTime(pid), null),
+    bootTime: () => guard("system boot time", () => probes.bootTime(), null),
+    uid: (pid) => guard("process owner", () => probes.uid(pid), null),
+  };
+}
+
 /** The real probes, reading from the host operating system. */
 export const systemProbes: ProcessProbes = {
   isAlive: isProcessAlive,
@@ -950,6 +1118,19 @@ export interface VerifyPidResult {
   reason: string;
   /** OS start time used by this verification, or null when it used no clock. */
   startTime: number | null;
+  /**
+   * Why a probe could not answer, for the probes that failed during this
+   * verification. Empty on the ordinary path, where every probe answered or
+   * the platform simply has none.
+   *
+   * A reading that is absent because the platform cannot supply it is not a
+   * failure and does not appear here. What appears is a probe that tried and
+   * could not: `ps` missing from PATH, PowerShell refused by execution policy,
+   * a spawn killed at its timeout. Those all read as the same null everywhere
+   * else, and the same `indeterminate`, so this is the only thing that tells
+   * a person which of them they are looking at.
+   */
+  probeFailures: string[];
 }
 
 export interface VerifyPidOptions {
@@ -971,16 +1152,52 @@ export function verifyPid(
 ): VerifyPidResult {
   // One pass, so the Windows probes may share a PowerShell round trip while
   // this decision is being made — and so nothing they learned survives it.
-  return withProbePass(() => verifyPidInPass(pid, options));
+  return withProbePass(() => {
+    // Collected rather than sliced out of a shared array, so this reports what
+    // THIS verification could not probe and nothing else. See
+    // collectProbeFailures.
+    const { value, failures } = collectProbeFailures(() =>
+      verifyPidInPass(pid, options),
+    );
+
+    // Attached in one place rather than at each of the ten returns above, so a
+    // branch added later cannot forget to carry it.
+    return { ...value, probeFailures: failures };
+  });
+}
+
+/**
+ * One list of what could not be probed, from every probe that fed a decision.
+ *
+ * Deduplicated, because the same probe failing is the same fact however many
+ * readings needed it, and a status that names `ps` three times reads as three
+ * problems.
+ */
+function mergeProbeFailures(...lists: string[][]): string[] {
+  return [...new Set(lists.flat())];
+}
+
+/**
+ * The verification's probe failures phrased for a person, or "" when none.
+ *
+ * Appended to a reason rather than replacing it: what was concluded still
+ * comes first, and this says why the evidence for it was thin.
+ */
+function describeProbeFailures(failures: string[]): string {
+  if (failures.length === 0) {
+    return "";
+  }
+
+  return ` (some checks could not run: ${failures.join("; ")})`;
 }
 
 function verifyPidInPass(
   pid: number,
   options: VerifyPidOptions,
-): VerifyPidResult {
+): Omit<VerifyPidResult, "probeFailures"> {
   const { startedAt: recordedStartedAt, bootTime: recordedBootTime } = options;
   const dataDir = options.dataDir ?? "";
-  const probes = options.probes ?? systemProbes;
+  const probes = guardProbes(options.probes ?? systemProbes);
 
   if (!probes.isAlive(pid)) {
     return {
@@ -1438,11 +1655,16 @@ function canBindToServer(
   pid: number,
   startedAt: number | null,
   dataDir: string,
-  probes: ProcessProbes = systemProbes,
+  rawProbes: ProcessProbes = systemProbes,
 ): number | null {
   if (startedAt === null) {
     return null;
   }
+
+  // Guarded like every other probe read, so an injected probe that throws is
+  // an answer this could not get rather than an exception out of a status
+  // check. See guardProbes.
+  const probes = guardProbes(rawProbes);
 
   const before = probes.startTime(pid);
   const command = probes.command(pid);
@@ -1789,7 +2011,7 @@ function liveServerVerdict(
   dataDir: string,
   probes?: ProcessProbes,
   uid?: number | null,
-): LiveServerVerdict {
+): { verdict: LiveServerVerdict; probeFailures: string[] } {
   const check = verifyPid(pid, {
     startedAt: null,
     bootTime: null,
@@ -1798,13 +2020,23 @@ function liveServerVerdict(
     probes,
   });
 
+  // Carried out with the verdict rather than discarded. This is the probe that
+  // decides whether a clock reading may license destruction, so an
+  // `indeterminate` here is exactly where a person wants to know that `ps`
+  // could not run rather than that the platform had nothing to say.
+  const probeFailures = check.probeFailures;
+
   if (check.verifiedBy !== null) {
-    return "serving";
+    return { verdict: "serving", probeFailures };
   }
 
-  return check.kind === "process-gone" || check.kind === "recycled"
-    ? "ruled-out"
-    : "indeterminate";
+  return {
+    verdict:
+      check.kind === "process-gone" || check.kind === "recycled"
+        ? "ruled-out"
+        : "indeterminate",
+    probeFailures,
+  };
 }
 
 /**
@@ -1882,7 +2114,15 @@ async function probeStatusFromFiles(
   if (postmaster) {
     // postmaster.pid has no boot id, but its start time cannot predate the
     // current boot if the process is genuinely still alive.
-    const bootTime = (probes ?? systemProbes).bootTime();
+    //
+    // Guarded and collected like every probe read inside verifyPid. Raw, this
+    // was the one call an injected probe could throw out of and end the whole
+    // status check with, which is the failure guardProbes exists to rule out,
+    // and its failure was recorded where nothing would ever report it.
+    const { value: bootTime, failures: bootProbeFailures } =
+      collectProbeFailures(() =>
+        guardProbes(probes ?? systemProbes).bootTime(),
+      );
 
     // Asked once, here, and reused below. One view of the machine, and the
     // answer is needed before the boot check as well as after it.
@@ -1892,6 +2132,36 @@ async function probeStatusFromFiles(
       dataDir,
       probes,
     });
+
+    // Split out of the condition below so the check that corroborates it can
+    // be named and its own probe failures reported, and so naming it still
+    // costs no probe on the ordinary path: it runs only where this is true.
+    const predatesThisBoot =
+      bootTime !== null &&
+      postmaster.startedAt > 0 &&
+      postmaster.startedAt < bootTime - 5000;
+
+    const postmasterLiveCheck = predatesThisBoot
+      ? liveServerVerdict(postmaster.pid, dataDir, probes)
+      : null;
+
+    /**
+     * Everything this path could not probe, from every probe that fed it.
+     *
+     * One function rather than a list per return, because the field and the
+     * sentence appended to `reason` have to be the same thing. They were not:
+     * one branch set the field empty while the reason named the failures, and
+     * others did the reverse, so a caller branching on the field and a person
+     * reading the message saw different machines.
+     */
+    const postmasterProbeFailures = (
+      live: { probeFailures: string[] } | null = null,
+    ): string[] =>
+      mergeProbeFailures(
+        bootProbeFailures,
+        verification.probeFailures,
+        live?.probeFailures ?? [],
+      );
 
     // A start time predating this boot otherwise proves the record survived a
     // restart. Decisive rather than merely unusable as evidence: leaving it to
@@ -1918,14 +2188,7 @@ async function probeStatusFromFiles(
     // command line naming another cluster as the only company this reading may
     // license destruction in. An unidentifiable live PID is not disproof of
     // anything and keeps the cautious answer.
-    if (
-      bootTime !== null &&
-      postmaster.startedAt > 0 &&
-      postmaster.startedAt < bootTime - 5000 &&
-      // Last, so the extra probe is spent only once the reading it has to
-      // corroborate actually says something.
-      liveServerVerdict(postmaster.pid, dataDir, probes) === "ruled-out"
-    ) {
+    if (postmasterLiveCheck?.verdict === "ruled-out") {
       return preferInformativeFallback(
         {
           running: false,
@@ -1935,10 +2198,13 @@ async function probeStatusFromFiles(
           port: postmaster.port || null,
           source: "postmaster",
           observedStartTime: null,
+          probeFailures: postmasterProbeFailures(postmasterLiveCheck),
           stale: true,
           staleKind: "recycled",
           indeterminate: false,
-          reason: `stale postmaster.pid: it records a server started before the current boot, so PID ${postmaster.pid} now belongs to a different process`,
+          reason:
+            `stale postmaster.pid: it records a server started before the current boot, so PID ${postmaster.pid} now belongs to a different process` +
+            describeProbeFailures(postmasterProbeFailures(postmasterLiveCheck)),
         },
         pidFile,
         dataDir,
@@ -1960,10 +2226,13 @@ async function probeStatusFromFiles(
           port: postmaster.port || null,
           source: "postmaster",
           observedStartTime: null,
+          probeFailures: postmasterProbeFailures(),
           stale: true,
           staleKind: "different-cluster",
           indeterminate: false,
-          reason: `postmaster.pid names a different data directory (${postmaster.dataDir}), so it describes another cluster rather than this one`,
+          reason:
+            `postmaster.pid names a different data directory (${postmaster.dataDir}), so it describes another cluster rather than this one` +
+            describeProbeFailures(postmasterProbeFailures()),
         },
         pidFile,
         dataDir,
@@ -1982,10 +2251,13 @@ async function probeStatusFromFiles(
         port: postmaster.port || null,
         source: "postmaster",
         observedStartTime: startTime,
+        probeFailures: postmasterProbeFailures(),
         stale: false,
         staleKind: null,
         indeterminate: false,
-        reason: `PostgreSQL is running for this data directory (PID ${postmaster.pid})`,
+        reason:
+          `PostgreSQL is running for this data directory (PID ${postmaster.pid})` +
+          describeProbeFailures(postmasterProbeFailures()),
       };
     }
 
@@ -2021,12 +2293,15 @@ async function probeStatusFromFiles(
         port: postmaster.port || null,
         source: "postmaster",
         observedStartTime: null,
+        probeFailures: postmasterProbeFailures(),
         stale: true,
         staleKind: clockAlone ? "indeterminate" : kind,
         indeterminate: clockAlone || kind === "indeterminate",
-        reason: clockAlone
-          ? `postmaster.pid could not be resolved: ${reason}, but only the clock says so, and a clock adjusted since that record was written produces the same disagreement for a server that is still running`
-          : `stale postmaster.pid: ${reason}`,
+        reason:
+          (clockAlone
+            ? `postmaster.pid could not be resolved: ${reason}, but only the clock says so, and a clock adjusted since that record was written produces the same disagreement for a server that is still running`
+            : `stale postmaster.pid: ${reason}`) +
+          describeProbeFailures(postmasterProbeFailures()),
       },
       pidFile,
       dataDir,
@@ -2067,6 +2342,7 @@ async function statusFromPidFile(
       port: null,
       source: "none",
       observedStartTime: null,
+      probeFailures: [],
       stale: false,
       staleKind: null,
       indeterminate: false,
@@ -2075,7 +2351,26 @@ async function statusFromPidFile(
   }
 
   if (record.dataDir && !sameDataDir(record.dataDir, dataDir)) {
-    const currentBootTime = (probes ?? systemProbes).bootTime();
+    // Guarded and collected, as on the postmaster path. See there.
+    const { value: currentBootTime, failures: bootProbeFailures } =
+      collectProbeFailures(() =>
+        guardProbes(probes ?? systemProbes).bootTime(),
+      );
+
+    // Behind the boot reading rather than beside it, so the extra probe is
+    // spent only once the reading it has to corroborate actually says
+    // something. It is a full verifyPid, which on macOS is six `ps` spawns,
+    // and the ordinary different-cluster path must not pay for it. Named
+    // rather than inlined into the condition only so the branch can carry out
+    // what could not be probed alongside the verdict.
+    const bootDisagrees =
+      record.bootTime !== null &&
+      currentBootTime !== null &&
+      Math.abs(record.bootTime - currentBootTime) > 5000;
+
+    const recycledCheck = bootDisagrees
+      ? liveServerVerdict(record.pid, record.dataDir, probes, record.uid)
+      : null;
 
     // Which cluster it named stops mattering once the record is known to
     // predate this boot: the process it describes cannot still be alive, so
@@ -2099,16 +2394,12 @@ async function statusFromPidFile(
     // command line is an absent reading, and the record it would authorize
     // deleting may be the only thing recording a server that is running.
     if (
-      record.bootTime !== null &&
-      currentBootTime !== null &&
-      Math.abs(record.bootTime - currentBootTime) > 5000 &&
       // The record's own owner goes with it, as on the same-cluster path
       // below. A uid cannot change after exec, so a live process running as
       // another one is not the server this record describes, whichever
       // directory that server was for — and withholding that here refuses
       // forever over a number this could have proved was gone.
-      liveServerVerdict(record.pid, record.dataDir, probes, record.uid) ===
-        "ruled-out"
+      recycledCheck?.verdict === "ruled-out"
     ) {
       return {
         running: false,
@@ -2118,10 +2409,18 @@ async function statusFromPidFile(
         port: record.port || null,
         source: "pid-file",
         observedStartTime: null,
+        probeFailures: mergeProbeFailures(
+          bootProbeFailures,
+          recycledCheck.probeFailures,
+        ),
         stale: true,
         staleKind: "recycled",
         indeterminate: false,
-        reason: `the PID file names a different data directory (${record.dataDir}) and was written during a previous boot, so the server it described is gone and PID ${record.pid} now belongs to something else`,
+        reason:
+          `the PID file names a different data directory (${record.dataDir}) and was written during a previous boot, so the server it described is gone and PID ${record.pid} now belongs to something else` +
+          describeProbeFailures(
+            mergeProbeFailures(bootProbeFailures, recycledCheck.probeFailures),
+          ),
       };
     }
 
@@ -2133,22 +2432,36 @@ async function statusFromPidFile(
       port: record.port || null,
       source: "pid-file",
       observedStartTime: null,
+      probeFailures: mergeProbeFailures(
+        bootProbeFailures,
+        recycledCheck?.probeFailures ?? [],
+      ),
       stale: true,
       staleKind: "different-cluster",
       indeterminate: false,
-      reason: `the PID file names a different data directory (${record.dataDir}), so it describes another cluster rather than this one`,
+      reason:
+        `the PID file names a different data directory (${record.dataDir}), so it describes another cluster rather than this one` +
+        describeProbeFailures(
+          mergeProbeFailures(
+            bootProbeFailures,
+            recycledCheck?.probeFailures ?? [],
+          ),
+        ),
     };
   }
 
-  const { verifiedBy, kind, reason, startTime } = verifyPid(record.pid, {
-    startedAt: record.startedAt || null,
-    bootTime: record.bootTime,
-    // Only strataline's own record carries one. postmaster.pid does not, so
-    // that path leaves the check switched off rather than guessing an owner.
-    uid: record.uid,
-    dataDir,
-    probes,
-  });
+  const { verifiedBy, kind, reason, startTime, probeFailures } = verifyPid(
+    record.pid,
+    {
+      startedAt: record.startedAt || null,
+      bootTime: record.bootTime,
+      // Only strataline's own record carries one. postmaster.pid does not, so
+      // that path leaves the check switched off rather than guessing an owner.
+      uid: record.uid,
+      dataDir,
+      probes,
+    },
+  );
 
   // Two of the ways to reach `recycled` here read a clock: the record's boot
   // time against a current one, and its start time against the live process's.
@@ -2167,9 +2480,29 @@ async function statusFromPidFile(
   // being declared safe to delete.
   //
   // Behind `kind === "recycled"`, so the ordinary paths spend no probe on it.
+  // Named on the way past, so its failures reach the status. It is the check
+  // that decides whether a clock reading may license destruction, which is
+  // exactly where "`ps` could not run" is worth saying out loud.
+  let clockAloneCheck: { probeFailures: string[] } | null = null;
+
   const clockAlone =
     kind === "recycled" &&
-    liveServerVerdict(record.pid, dataDir, probes, record.uid) !== "ruled-out";
+    (clockAloneCheck = liveServerVerdict(
+      record.pid,
+      dataDir,
+      probes,
+      record.uid,
+    )).verdict !== "ruled-out";
+
+  /**
+   * Everything this path could not probe. See postmasterProbeFailures.
+   *
+   * No boot reading here: the one above belongs to the different-cluster
+   * branch, which returns before this, and the same-cluster path hands the
+   * record's own boot time to verifyPid rather than reading a second one.
+   */
+  const pidFileProbeFailures = (): string[] =>
+    mergeProbeFailures(probeFailures, clockAloneCheck?.probeFailures ?? []);
 
   return {
     running: verifiedBy !== null,
@@ -2182,17 +2515,18 @@ async function statusFromPidFile(
     // undecidable result would hand a caller a fingerprint for a process this
     // never claimed to have identified.
     observedStartTime: verifiedBy === null ? null : startTime,
+    probeFailures: pidFileProbeFailures(),
     stale: verifiedBy === null,
     staleKind: clockAlone ? "indeterminate" : kind,
     indeterminate: clockAlone || kind === "indeterminate",
     reason:
-      verifiedBy !== null
+      (verifiedBy !== null
         ? `the PID file describes a live server (PID ${record.pid})`
         : clockAlone
           ? `the PID file could not be resolved: ${reason}, but only the clock says so, and a clock adjusted since that record was written produces the same disagreement for a server that is still running`
           : `stale ${
               record.format === "legacy" ? "old-format PID file" : "PID file"
-            }: ${reason}`,
+            }: ${reason}`) + describeProbeFailures(pidFileProbeFailures()),
   };
 }
 
@@ -2210,6 +2544,7 @@ function unreadablePidStatus(
     port: null,
     source,
     observedStartTime: null,
+    probeFailures: [],
     stale: true,
     staleKind: "indeterminate",
     indeterminate: true,

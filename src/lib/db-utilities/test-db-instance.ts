@@ -42,6 +42,38 @@ const TEST_DB_LOG_TAGS = {
 
 type TestDBLogTag = keyof typeof TEST_DB_LOG_TAGS;
 
+/**
+ * True when a start failed because PostgreSQL could not take the port.
+ *
+ * Read out of the server's own output, because there is nothing else to read:
+ * `EmbeddedPostgres.start()` rejects with a bare `reject()` on the child's
+ * `close`, so every way a start can fail arrives as the same `undefined`.
+ *
+ * Matched across the WHOLE attempt rather than the last thing written, which
+ * is the mistake this encodes against. PostgreSQL reports a taken port over
+ * several lines and the bind line is never the last of them:
+ *
+ *   LOG:  could not bind IPv6 address "::1": Address already in use
+ *   WARNING:  could not create listen socket for "localhost"
+ *   FATAL:  could not create any TCP/IP sockets
+ *   LOG:  database system is shut down
+ *
+ * Testing only the final chunk tests the shutdown notice, which matches
+ * nothing, so the retry never ran at all.
+ *
+ * The socket-creation lines are matched as well as the bind line because a
+ * host with IPv6 disabled, or one where only one address family is taken,
+ * reaches the same failure by a different sentence.
+ *
+ * @internal Exported so the match can be checked against real PostgreSQL
+ * output without provoking a port collision.
+ */
+export function isBindFailure(output: string): boolean {
+  return /could not bind|address already in use|could not create any TCP\/IP sockets|could not create listen socket/i.test(
+    output,
+  );
+}
+
 /** Somewhere for lines to go when no logger was supplied. */
 const noOpLogger: Logger = {
   info: () => {},
@@ -145,6 +177,13 @@ export class TestDatabaseInstance {
   private migrationsApplied: boolean = false;
   private tempDir?: string;
   private port: number;
+  /**
+   * Whether {@link findFreePort} chose the port, rather than the caller.
+   *
+   * The retry below is allowed only on a port this picked. See
+   * {@link startWithPortRetry}.
+   */
+  private readonly portChosenAutomatically: boolean;
   private logger?: Logger;
   private user: string;
   private password: string;
@@ -158,6 +197,9 @@ export class TestDatabaseInstance {
    */
   constructor(options: TestDatabaseOptions = {}) {
     this.port = options.port || 0; // 0 means we'll find a port dynamically
+    // Settled once, from the caller's own option, and never recomputed. See
+    // the note in start().
+    this.portChosenAutomatically = !this.port;
     // Wrapped on the way in, so no call site below has to guard it and a
     // logger that throws loses its line rather than the process. The other two
     // entry points do the same; this one was simply missed.
@@ -191,6 +233,133 @@ export class TestDatabaseInstance {
     return this.isRunning && !!this.pool;
   }
 
+  /** How many ports a start may lose to the bind race before giving up. */
+  private static readonly PORT_RETRIES = 3;
+
+  /**
+   * Everything PostgreSQL wrote during the current start attempt.
+   *
+   * `EmbeddedPostgres.start()` rejects with no value at all, so the reason a
+   * start failed exists nowhere except the output it logged on the way down,
+   * and that output arrives in several chunks. Reset per attempt, so a retry
+   * is judged on its own failure rather than the previous one's.
+   */
+  private attemptOutput = "";
+
+  /** Builds the embedded server for one port, against this run's directory. */
+  private buildEmbeddedPostgres(port: number): EmbeddedPostgres {
+    return new EmbeddedPostgres({
+      port,
+      user: this.user,
+      password: this.password,
+      persistent: false, // Don't persist data between test runs
+      databaseDir: this.tempDir,
+      // Pin initdb's locale instead of letting it inherit the host/CI
+      // shell's, for two reasons: (1) a Linux-style locale like
+      // LC_ALL=C.UTF-8 makes initdb fail on macOS ("invalid locale settings")
+      // because macOS libc has no C.UTF-8; (2) an inherited locale makes the
+      // DB's collation vary per machine. "C" + UTF8 is valid on every OS and
+      // gives the same byte-order collation everywhere — ideal for a
+      // throwaway DB (just not locale-aware sorting, so don't "fix" this to
+      // en_US).
+      initdbFlags: ["--locale=C", "--encoding=UTF8"],
+      onLog: (message: string) => {
+        // Appended, not replaced. PostgreSQL writes a failed bind across
+        // several chunks and the bind line is never the last of them: the real
+        // sequence is `could not bind IPv6 address ... Address already in
+        // use`, then `could not create any TCP/IP sockets`, then `database
+        // system is shut down`. Keeping only the last chunk therefore tested
+        // the shutdown notice, matched nothing, and made the retry below
+        // unreachable.
+        this.attemptOutput += message;
+        this.log("pg", message);
+      },
+    });
+  }
+
+  /**
+   * True when a failed start was PostgreSQL refusing to bind the port.
+   *
+   * Read out of the server's own output rather than from the rejection,
+   * because there is nothing in the rejection to read: embedded-postgres
+   * rejects with a bare `reject()` on the child's `close`, so every way a
+   * start can fail arrives as the same `undefined`. Matching the message is
+   * the only thing that separates a port that was taken from a cluster that
+   * will not start at all, and retrying the second would be three initdbs and
+   * the same failure.
+   */
+  private failedToBind(): boolean {
+    return isBindFailure(this.attemptOutput);
+  }
+
+  /**
+   * Starts the server, taking another port if this one was claimed in the gap.
+   *
+   * The race this closes: {@link findFreePort} confirms a port is free and
+   * then closes the socket it proved it with, and initdb runs between that and
+   * the postmaster binding it. Anything may take the number in between, and
+   * on a busy machine the likeliest thief is the kernel handing it out as the
+   * local port for an outgoing connection. Choosing from outside the ephemeral
+   * range makes that rare rather than impossible, and a program that binds the
+   * port deliberately is not covered by the range choice at all.
+   *
+   * Cheap, which is what makes it worth doing rather than merely correct.
+   * initdb writes no port into the cluster, so a retry keeps the data
+   * directory it already built and only spawns a new postmaster against it.
+   *
+   * Only for a port this picked. An explicit `port` is the caller naming a
+   * number for a reason, and quietly starting somewhere else would hand back a
+   * database at an address they are not going to connect to.
+   */
+  private async startWithPortRetry(): Promise<void> {
+    for (
+      let attempt = 0;
+      attempt <= TestDatabaseInstance.PORT_RETRIES;
+      attempt++
+    ) {
+      this.attemptOutput = "";
+
+      // Rebuilt on every retry, so it is read here rather than captured once.
+      const db = this.db;
+
+      if (!db) {
+        throw new Error(
+          "PostgreSQL server was not constructed before start was attempted",
+        );
+      }
+
+      try {
+        await db.start();
+
+        return;
+      } catch (error) {
+        const canRetry =
+          this.portChosenAutomatically &&
+          attempt < TestDatabaseInstance.PORT_RETRIES &&
+          this.failedToBind();
+
+        if (!canRetry) {
+          throw error;
+        }
+
+        const taken = this.port;
+
+        this.port = await findFreePort();
+        this.db = this.buildEmbeddedPostgres(this.port);
+
+        // Worth saying out loud rather than retrying quietly. It is the one
+        // symptom of a machine whose ephemeral range covers the ports this
+        // picks from, and a run that says it three times is saying something
+        // the range choice cannot fix.
+        this.log(
+          "warn",
+          `Port ${taken} was taken between being chosen and PostgreSQL binding it. ` +
+            `Retrying on port ${this.port} against the same data directory.`,
+        );
+      }
+    }
+  }
+
   /**
    * Start the embedded PostgreSQL server and apply migration
    */
@@ -201,14 +370,31 @@ export class TestDatabaseInstance {
 
     // Use a separate try-catch for initial setup errors vs cleanup errors
     try {
-      // If no port was specified or port is 0, find an available port
-      if (!this.port || this.port === 0) {
+      // If no port was specified or port is 0, find an available port.
+      // An explicit `port` is taken as given and never searched for: the
+      // caller has a reason for that number, and picking a different one
+      // would silently ignore it.
+      // Decided in the constructor from what the CALLER supplied, not here
+      // from the current port. A second start() on the same instance still
+      // holds the port the first one chose, since cleanup() does not reset it,
+      // so deciding here would call that a supplied port: no fresh search, no
+      // retry on the very path the retry exists for, and a log line crediting
+      // the caller for a number they never gave.
+      if (this.portChosenAutomatically) {
         this.port = await findFreePort();
       }
 
+      // Which port, and whether this picked it. An automatic port is the one
+      // worth naming: it is not in the caller's configuration anywhere, so a
+      // log line is the only place it appears, and it is what a "could not
+      // bind" further down would be about. See ./free-port for how it is
+      // chosen and what that does and does not guarantee.
       this.log(
         "info",
-        `Starting embedded PostgreSQL for tests on port ${this.port}`,
+        `Starting embedded PostgreSQL for tests on port ${this.port}` +
+          (this.portChosenAutomatically
+            ? " (chosen automatically; pass `port` to pin it)"
+            : " (from the supplied `port`)"),
       );
 
       // Create a temporary directory for the database using promise-based approach
@@ -231,34 +417,18 @@ export class TestDatabaseInstance {
       this.log("info", `Created temporary directory: ${this.tempDir}`);
 
       // Create and start an embedded PostgreSQL server
-      this.db = new EmbeddedPostgres({
-        port: this.port,
-        user: this.user,
-        password: this.password,
-        persistent: false, // Don't persist data between test runs
-        databaseDir: this.tempDir,
-        // Pin initdb's locale instead of letting it inherit the host/CI
-        // shell's, for two reasons: (1) a Linux-style locale like
-        // LC_ALL=C.UTF-8 makes initdb fail on macOS ("invalid locale settings")
-        // because macOS libc has no C.UTF-8; (2) an inherited locale makes the
-        // DB's collation vary per machine. "C" + UTF8 is valid on every OS and
-        // gives the same byte-order collation everywhere — ideal for a
-        // throwaway DB (just not locale-aware sorting, so don't "fix" this to
-        // en_US).
-        initdbFlags: ["--locale=C", "--encoding=UTF8"],
-        onLog: (message: string) => {
-          this.log("pg", message);
-        },
-      });
+      this.db = this.buildEmbeddedPostgres(this.port);
 
       this.log("info", "Initializing embedded PostgreSQL...");
 
       try {
-        // Initialize and start the PostgreSQL server
+        // Initialize and start the PostgreSQL server. initdb writes no port
+        // anywhere, so the cluster it produces belongs to no port in
+        // particular and a retry below can reuse it as it stands.
         await this.db.initialise();
         this.log("info", "PostgreSQL initialized successfully");
 
-        await this.db.start();
+        await this.startWithPortRetry();
         this.log("info", "PostgreSQL server started successfully");
 
         // Create the test database
