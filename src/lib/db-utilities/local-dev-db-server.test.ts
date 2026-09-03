@@ -2661,6 +2661,133 @@ describe("LocalDevDBServer", () => {
     ).toEqual([]);
   }, 30000);
 
+  it("should report a claim that vanished mid-put-back as an absence", async () => {
+    // A temp reaper, or somebody clearing the directory, can take the claim
+    // file away between the rename that made it and the put-back. The record
+    // then exists nowhere: not at `path`, which this call renamed away, and
+    // not at the claim, which something else removed. That is the end state a
+    // clean shutdown leaves.
+    //
+    // Reported as `stranded` it read as a live record standing in the way, and
+    // cleanupExistingProcess refused the start over two paths that were both
+    // empty, sending a person to look at a claim file that was not there.
+    type Internals = {
+      removeRecordIfUnchanged(
+        path: string,
+        accounted: string,
+        identify: (raw: string) => string,
+      ): Promise<{ outcome: string }>;
+      readClaimedRecord(
+        path: string,
+      ): Promise<{ raw: string } | { error: unknown }>;
+    };
+
+    const internals = server as unknown as Internals;
+    const originalReadClaimedRecord = internals.readClaimedRecord.bind(server);
+    const record = join(tempDir.name, "vanishing-record");
+
+    // Both ways round, because they take different routes out. A claim removed
+    // BEFORE the read comes back as the empty string readClaimedRecord maps
+    // ENOENT to, so the put-back is the bare `link`; removed AFTER it, there
+    // are bytes in hand and the put-back goes through publishWithoutReplacing.
+    // Both end at the same ENOENT and both used to be stranded.
+    for (const removeBeforeRead of [true, false]) {
+      writeFileSync(record, "the record that was claimed");
+
+      internals.readClaimedRecord = async (path: string) => {
+        if (path === record) {
+          return originalReadClaimedRecord(path);
+        }
+
+        if (removeBeforeRead) {
+          unlinkSync(path);
+
+          return originalReadClaimedRecord(path);
+        }
+
+        const held = await originalReadClaimedRecord(path);
+
+        unlinkSync(path);
+
+        return held;
+      };
+
+      try {
+        expect(
+          (
+            await internals.removeRecordIfUnchanged(
+              record,
+              "the record this start accounted for",
+              (raw) => raw,
+            )
+          ).outcome,
+        ).toBe("absent");
+      } finally {
+        internals.readClaimedRecord = originalReadClaimedRecord;
+      }
+
+      // And the name really is free, which is what "absent" promised.
+      expect(existsSync(record)).toBe(false);
+      expect(
+        readdirSync(tempDir.name).filter((name) => name.endsWith(".claim")),
+      ).toEqual([]);
+    }
+  }, 30000);
+
+  it("should not read a vanished claim as an absence while the name is taken", async () => {
+    // `link` resolves its source before its destination, so a claim that has
+    // gone reports ENOENT even where a third record already holds the name —
+    // the same errno as the case above, over a data directory that is anything
+    // but free. Calling that an absence would let the start proceed against
+    // files something else is using, so it has to come back as the discard it
+    // is.
+    type Internals = {
+      removeRecordIfUnchanged(
+        path: string,
+        accounted: string,
+        identify: (raw: string) => string,
+      ): Promise<{ outcome: string }>;
+      readClaimedRecord(
+        path: string,
+      ): Promise<{ raw: string } | { error: unknown }>;
+    };
+
+    const internals = server as unknown as Internals;
+    const originalReadClaimedRecord = internals.readClaimedRecord.bind(server);
+    const record = join(tempDir.name, "overtaken-record");
+
+    writeFileSync(record, "the record that was claimed");
+
+    internals.readClaimedRecord = async (path: string) => {
+      if (path === record) {
+        return originalReadClaimedRecord(path);
+      }
+
+      // The reaper and the third server, in the one window either can land in.
+      unlinkSync(path);
+      writeFileSync(record, "a third server's newer record");
+
+      return originalReadClaimedRecord(path);
+    };
+
+    try {
+      expect(
+        (
+          await internals.removeRecordIfUnchanged(
+            record,
+            "the record this start accounted for",
+            (raw) => raw,
+          )
+        ).outcome,
+      ).toBe("discarded");
+    } finally {
+      internals.readClaimedRecord = originalReadClaimedRecord;
+    }
+
+    // The newer record keeps the name, untouched.
+    expect(readFileSync(record, "utf8")).toBe("a third server's newer record");
+  }, 30000);
+
   it("should not delete another cluster's live record it never examined", async () => {
     // probeStatusFromFiles answers from postmaster.pid and returns without
     // reading strataline's own record at all, so a start whose own cluster

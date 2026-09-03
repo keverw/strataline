@@ -1538,6 +1538,34 @@ export class LocalDevDBServer {
         return { outcome: "discarded", displaced: held };
       }
 
+      // ENOENT is the claim itself having gone between the rename and this
+      // put-back — a temp reaper, or somebody clearing the directory. The
+      // claim is a sibling of `path`, so it cannot be missing for want of a
+      // parent directory that the rename above already used, which leaves the
+      // record simply not existing any more: not at `path`, since this call
+      // renamed it away, and not at `claimed`, since something removed it.
+      //
+      // That is an absence, and reporting it as `stranded` describes neither
+      // path truthfully: the caller refuses the start naming a record that is
+      // in the way, points a person at a claim file that is not there, and
+      // does it over a data directory that is in fact free. The end state is
+      // the one a clean shutdown leaves, so say so.
+      //
+      // Unless `path` is taken by then, which is the EEXIST case above reached
+      // by another route rather than an absence. `link` resolves its source
+      // before its destination, so a source that has vanished reports ENOENT
+      // whether or not the name is already held, and from here the two are
+      // indistinguishable. Answering "absent" over a live record would let a
+      // start proceed against a data directory something else has, which is
+      // the one mistake this whole protocol exists to prevent.
+      if ((e as NodeJS.ErrnoException)?.code === "ENOENT") {
+        if (await fileExists(path)) {
+          return { outcome: "discarded", displaced: held };
+        }
+
+        return { outcome: "absent" };
+      }
+
       return { outcome: "stranded", heldAt: claimed, displaced: held };
     }
   }

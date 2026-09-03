@@ -5,6 +5,10 @@ import {
   isBindFailure,
 } from "./test-db-instance";
 import { Migration } from "../migration-system";
+import * as tmp from "tmp";
+import { existsSync, writeFileSync } from "fs";
+import { join } from "path";
+import type EmbeddedPostgres from "embedded-postgres";
 
 describe("TestDatabaseInstance", () => {
   let db: TestDatabaseInstance;
@@ -408,4 +412,111 @@ describe("isBindFailure", () => {
       expect(isBindFailure(output)).toBe(false);
     }
   });
+});
+
+/**
+ * What a stop that never returns is allowed to conclude.
+ *
+ * The bound around `EmbeddedPostgres.stop()` exists for a postmaster that had
+ * already exited, whose `exit` event fired before the listener was attached.
+ * A postmaster that is merely SLOW — writing its shutdown checkpoint on a
+ * loaded machine — reaches the same timeout, and treating that one as gone had
+ * cleanup() delete the data directory out from under a live server.
+ *
+ * Driven through the private members rather than a real cluster, because the
+ * two cases differ only in whether a process is alive, and a real postmaster
+ * cannot be asked to be slow on demand.
+ */
+describe("stopping past the bound", () => {
+  /** A stop that never returns, which is the whole case under test. */
+  const stallingDb = {
+    stop: () => new Promise<void>(() => {}),
+  } as unknown as EmbeddedPostgres;
+
+  /** A PID high enough that nothing on the machine is using it. */
+  const ABSENT_PID = 2_147_483_647;
+
+  interface Internals {
+    db?: EmbeddedPostgres;
+    tempDir?: string;
+    serverStillRunning(): Promise<boolean>;
+  }
+
+  const dirs: tmp.DirResult[] = [];
+
+  /** A data directory, optionally with a postmaster.pid naming `pid`. */
+  const cluster = (pid?: number): string => {
+    const dir = tmp.dirSync({ unsafeCleanup: true, prefix: "pg-stop-test-" });
+
+    dirs.push(dir);
+
+    if (pid !== undefined) {
+      // PostgreSQL's own layout: PID, data directory, start time in epoch
+      // seconds, port.
+      writeFileSync(
+        join(dir.name, "postmaster.pid"),
+        `${pid}\n${dir.name}\n${Math.floor(Date.now() / 1000)}\n5432\n`,
+      );
+    }
+
+    return dir.name;
+  };
+
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) {
+      try {
+        dir.removeCallback();
+      } catch {
+        // Already gone, which is what most of these tests are about.
+      }
+    }
+  });
+
+  it("reads the cluster's own postmaster.pid to decide whether it is still there", async () => {
+    const instance = new TestDatabaseInstance();
+    const internals = instance as unknown as Internals;
+
+    // Removed on a clean exit, so no file is a server that finished.
+    internals.tempDir = cluster();
+    expect(await internals.serverStillRunning()).toBe(false);
+
+    // Left behind by a kill or a reboot, naming a number nothing is using.
+    internals.tempDir = cluster(ABSENT_PID);
+    expect(await internals.serverStillRunning()).toBe(false);
+
+    // This process is the one number certain to be alive.
+    internals.tempDir = cluster(process.pid);
+    expect(await internals.serverStillRunning()).toBe(true);
+  });
+
+  it("leaves the data directory alone when the stop gives up on a live postmaster", async () => {
+    const instance = new TestDatabaseInstance();
+    const internals = instance as unknown as Internals;
+    const dataDir = cluster(process.pid);
+
+    internals.tempDir = dataDir;
+    internals.db = stallingDb;
+
+    await instance.stop();
+
+    // The regression this encodes against: the timeout alone was read as "it
+    // had already exited", and these files went out from under a server that
+    // was still writing to them.
+    expect(existsSync(dataDir)).toBe(true);
+  }, 30_000);
+
+  it("still removes the data directory when the stop gives up on a postmaster that is gone", async () => {
+    const instance = new TestDatabaseInstance();
+    const internals = instance as unknown as Internals;
+    const dataDir = cluster(ABSENT_PID);
+
+    internals.tempDir = dataDir;
+    internals.db = stallingDb;
+
+    await instance.stop();
+
+    // The case the bound was written for. Erring toward caution must not turn
+    // every abandoned stop into a temporary directory nobody removes.
+    expect(existsSync(dataDir)).toBe(false);
+  }, 30_000);
 });

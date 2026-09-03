@@ -13,6 +13,7 @@ import {
 import EmbeddedPostgres from "embedded-postgres";
 import * as tmp from "tmp";
 import { findFreePort } from "./free-port";
+import { isProcessAlive, readPostmasterPidFile } from "./pid-file";
 import * as fs from "fs";
 
 // Default configuration for test database
@@ -270,6 +271,17 @@ export class TestDatabaseInstance {
    * Giving up on it is safe in the case that produces it, because the process
    * being gone is the whole reason the event never came.
    *
+   * Which is why the timeout alone does not settle it. A postmaster that is
+   * merely SLOW reaches the same timeout: `stop()` sends SIGINT, PostgreSQL
+   * reads that as a fast shutdown, and writing the shutdown checkpoint on a
+   * loaded machine can take longer than the bound. Treating that as "it had
+   * already exited" hands cleanup() a live server and it deletes the data
+   * directory out from under it. So a timeout asks the cluster whether it is
+   * still there — its own postmaster.pid, which PostgreSQL removes only on a
+   * clean exit — and reports which of the two happened. A PID that has been
+   * recycled reads as still running, which errs toward leaving a temporary
+   * directory behind rather than removing a live cluster's.
+   *
    * What this does NOT cover is the second half of that issue. embedded-postgres
    * keeps a module-level set of every instance ever initialized, never prunes
    * it, and calls `stop()` on all of them from its own exit hook. That call is
@@ -279,7 +291,9 @@ export class TestDatabaseInstance {
    * it is a protected field, and a stalled exit is a great deal cheaper than
    * this file quietly depending on the shape of somebody else's internals.
    */
-  private async stopServerWithinBound(db: EmbeddedPostgres): Promise<void> {
+  private async stopServerWithinBound(
+    db: EmbeddedPostgres,
+  ): Promise<"stopped" | "still-running"> {
     let timer: ReturnType<typeof setTimeout> | undefined;
 
     const abandoned = new Promise<"timed-out">((resolve) => {
@@ -295,15 +309,56 @@ export class TestDatabaseInstance {
         abandoned,
       ]);
 
-      if (outcome === "timed-out") {
+      if (outcome === "stopped") {
+        return "stopped";
+      }
+
+      if (await this.serverStillRunning()) {
         this.log(
           "warn",
-          "Stopping embedded PostgreSQL did not return. It had most likely already exited, " +
-            "which is a wait that never completes rather than a server still running. Carrying on with cleanup.",
+          "Stopping embedded PostgreSQL did not return within " +
+            `${TestDatabaseInstance.STOP_TIMEOUT_MS}ms and its postmaster is still running. ` +
+            "It is most likely still writing its shutdown checkpoint. Leaving its data directory in place " +
+            "rather than removing it out from under a live server.",
         );
+
+        return "still-running";
       }
+
+      this.log(
+        "warn",
+        "Stopping embedded PostgreSQL did not return. Its postmaster is gone, so this is a wait " +
+          "that never completes rather than a server still running. Carrying on with cleanup.",
+      );
+
+      return "stopped";
     } finally {
       clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Whether the cluster's own postmaster is still alive.
+   *
+   * Read from `postmaster.pid`, which PostgreSQL writes at startup and removes
+   * only when it exits cleanly, rather than from the child handle: that handle
+   * is private to embedded-postgres, and depending on the shape of somebody
+   * else's internals is what the note above declines to do.
+   *
+   * Unknown counts as running. This gates deleting a data directory, so an
+   * answer it could not get must not license that.
+   */
+  private async serverStillRunning(): Promise<boolean> {
+    if (!this.tempDir) {
+      return false;
+    }
+
+    try {
+      const record = await readPostmasterPidFile(this.tempDir);
+
+      return record !== null && isProcessAlive(record.pid);
+    } catch {
+      return true;
     }
   }
 
@@ -728,17 +783,43 @@ export class TestDatabaseInstance {
       this.pool = undefined;
     }
 
+    // Whether the data directory is this cleanup's to delete. Only a server
+    // confirmed gone frees it: removing the files under a postmaster that is
+    // still shutting down leaves it writing into a directory that is not there
+    // and still holding the port.
+    let serverStopped = true;
+
     if (this.db) {
       try {
-        await this.stopServerWithinBound(this.db);
+        serverStopped =
+          (await this.stopServerWithinBound(this.db)) === "stopped";
       } catch (error) {
         this.log(
           "error",
           `Error stopping embedded PostgreSQL: ${(error as Error).message}`,
         );
+
+        // A stop that threw settled nothing about the postmaster, and the
+        // initializer above is the answer that deletes the directory. `stop()`
+        // can reject with the server untouched — its Windows branch spawns
+        // taskkill from inside the wait, so a spawn that fails takes the whole
+        // promise down while the postmaster carries on — so ask the cluster
+        // the same question a timeout asks rather than assuming.
+        serverStopped = !(await this.serverStillRunning());
       }
       this.db = undefined;
       this.migrationsApplied = false;
+    }
+
+    if (this.tempDir && !serverStopped) {
+      this.log(
+        "warn",
+        `Leaving the temporary directory in place: ${this.tempDir}. ` +
+          "PostgreSQL was still running there when the stop gave up, so removing it now would " +
+          "delete a live cluster's files. Delete it once that server is gone.",
+      );
+
+      this.tempDir = undefined;
     }
 
     // Clean up the temporary directory with a delay
