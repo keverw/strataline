@@ -240,6 +240,12 @@ export class TestDatabaseInstance {
    * Stops the server under a bound, because the stop it calls can never
    * return.
    *
+   * Reported upstream as leinelissen/embedded-postgres#32, "stop() never
+   * resolves if the postmaster already exited, so the exit hook stalls process
+   * exit by 10s", open since July 2026 and unchanged in the 18.4.0-beta.17
+   * this depends on. Watch that issue rather than this comment: when it is
+   * fixed the bound below becomes dead weight and can go.
+   *
    * `EmbeddedPostgres.stop()` waits for the child's `exit` event and sends
    * SIGINT to provoke it:
    *
@@ -263,6 +269,15 @@ export class TestDatabaseInstance {
    * A bound rather than a fix, since the wait belongs to somebody else's code.
    * Giving up on it is safe in the case that produces it, because the process
    * being gone is the whole reason the event never came.
+   *
+   * What this does NOT cover is the second half of that issue. embedded-postgres
+   * keeps a module-level set of every instance ever initialized, never prunes
+   * it, and calls `stop()` on all of them from its own exit hook. That call is
+   * not this one and cannot be bounded from here, so a postmaster that died
+   * out of band can still add its ten seconds to process exit. Reaching in to
+   * clear the reference their guard reads would prevent it, and is not done:
+   * it is a protected field, and a stalled exit is a great deal cheaper than
+   * this file quietly depending on the shape of somebody else's internals.
    */
   private async stopServerWithinBound(db: EmbeddedPostgres): Promise<void> {
     let timer: ReturnType<typeof setTimeout> | undefined;
