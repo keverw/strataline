@@ -1176,15 +1176,18 @@ describe("LocalDevDBServer", () => {
     });
 
     type Internals = {
-      serverOutput: string[];
+      serverOutput: { append(chunk: string): void; clear(): void };
       withServerOutput(message: string): string;
     };
     const internals = failing as unknown as Internals;
 
-    internals.serverOutput = [
-      "FATAL:  could not create semaphores: No space left on device",
-      "DETAIL:  Failed system call was semget(345485937, 17, 03600).",
-    ];
+    // Fed as two chunks that split the word the hint matches on, which is what
+    // a pipe flushing mid-message does and what a buffer that reassembled
+    // trimmed lines could not survive. See PostgresOutputBuffer.
+    internals.serverOutput.append("FATAL:  could not create sema");
+    internals.serverOutput.append(
+      "phores: No space left on device\nDETAIL:  Failed system call was semget(345485937, 17, 03600).",
+    );
 
     const message = internals.withServerOutput("PostgreSQL failed to start");
 
@@ -1194,7 +1197,8 @@ describe("LocalDevDBServer", () => {
 
     // Only for that failure. Every other startup error keeps its own wording
     // rather than being told to go clearing IPC objects.
-    internals.serverOutput = ["FATAL:  database files are incompatible"];
+    internals.serverOutput.clear();
+    internals.serverOutput.append("FATAL:  database files are incompatible");
 
     expect(
       internals.withServerOutput("PostgreSQL failed to start"),

@@ -21,16 +21,13 @@ const POSTGRES_SEVERITIES: Readonly<Record<string, LogLevel>> = {
  * DEBUG1, INFO, NOTICE, WARNING, ERROR, LOG, FATAL, PANIC — plus the fields
  * elog prints alongside a message.
  *
- * English, which is not an assumption so much as something the callers
- * arrange, by two different routes. LocalDevDBServer runs initdb with
- * `--locale=C`, which writes `lc_messages = C` into the cluster.
- * TestDatabaseInstance does not get that far: embedded-postgres passes its own
- * `--lc-messages` ahead of any flag given to it, and an explicit one wins over
- * `--locale`, so that cluster takes whatever its locale detection found,
- * normally `en_US.UTF-8`. Either way the severities are English, and the
- * bundled PostgreSQL ships no translation catalogs to render them any other
- * way. A cluster created elsewhere under a different lc_messages could print a
- * translated severity,
+ * English, which is not an assumption so much as something both callers
+ * arrange: each runs initdb so that the cluster is written with
+ * `lc_messages = C`, and the bundled PostgreSQL ships no translation catalogs
+ * to render the words any other way. TestDatabaseInstance has to say so twice
+ * to get there, since embedded-postgres supplies an `--lc-messages` of its own
+ * ahead of anything passed to it. A cluster created elsewhere under a
+ * different lc_messages could print a translated severity,
  * and the scan would not recognize it — that chunk falls back to `info`,
  * which is where every line used to go. Matching all of them and then looking the match up is what stops the
  * scan reading a word out of the middle of a message: `STATEMENT:  SELECT ...`
@@ -127,4 +124,64 @@ export function ipcExhaustionHint(output: string): string {
     "since PostgreSQL frees them on a clean shutdown and not on a hard kill, so they accumulate across crashed or force-killed servers. " +
     "List them with `ipcs -m` and `ipcs -s`, and remove the abandoned ones with `ipcrm`."
   );
+}
+
+/**
+ * How much of a server's output to keep for a diagnosis.
+ *
+ * Counted in CHARACTERS rather than in lines, which is the whole point of
+ * this being one number in one place. Both buffers are read as well as
+ * reported: {@link ipcExhaustionHint} scans the dev server's, and
+ * TestDatabaseInstance additionally scans its own to decide whether a lost
+ * port is worth retrying. A cap counted in lines requires splitting the
+ * chunks to apply it, and splitting into lines and rejoining them is not the
+ * identity function.
+ *
+ * Generous, because the only thing this has to prevent is a server that runs
+ * for a week accumulating its own log in memory. A startup failure is a few
+ * hundred characters, so nothing that diagnoses anything is ever reached by
+ * the trim.
+ */
+const OUTPUT_BUFFER_CHARS = 8000;
+
+/**
+ * The last of what a PostgreSQL wrote, kept for a failure that has to explain
+ * itself.
+ *
+ * Bytes as PostgreSQL emitted them, trimmed only at the front. That is the
+ * property the readers need and the one an earlier line-based version of this
+ * quietly did not have: a chunk boundary falls wherever the pipe happened to
+ * flush, so a message can arrive as `could not create sema` and then
+ * `phores: No space left on device`. Split those into trimmed lines and
+ * rejoin them and the text carries a newline through the middle of a word,
+ * which matches neither {@link ipcExhaustionHint} nor the bind-failure scan
+ * that decides whether to retry a lost port. Appending verbatim cannot go
+ * wrong that way, and bounding by length rather than by line is what lets it
+ * stay verbatim.
+ *
+ * @internal Not part of the published API.
+ */
+export class PostgresOutputBuffer {
+  private text = "";
+
+  constructor(private readonly limit: number = OUTPUT_BUFFER_CHARS) {}
+
+  /** Records a chunk exactly as it arrived, dropping the oldest if over. */
+  append(chunk: string): void {
+    this.text += chunk;
+
+    if (this.text.length > this.limit) {
+      this.text = this.text.slice(-this.limit);
+    }
+  }
+
+  /** Forgets everything, for the start of a fresh attempt. */
+  clear(): void {
+    this.text = "";
+  }
+
+  /** What was written, ready to put in a message or scan. */
+  read(): string {
+    return this.text.trim();
+  }
 }

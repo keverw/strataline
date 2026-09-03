@@ -6,7 +6,7 @@ import {
 } from "./test-db-instance";
 import { Migration } from "../migration-system";
 import * as tmp from "tmp";
-import { existsSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import type EmbeddedPostgres from "embedded-postgres";
 
@@ -471,6 +471,40 @@ describe("stopping past the bound", () => {
       }
     }
   });
+
+  it("initializes the cluster with lc_messages = C", async () => {
+    // Not a preference. postgresOutputLevel and ipcExhaustionHint read English
+    // severity words out of this server's output, so the language the cluster
+    // prints in is load-bearing, and LocalDevDBServer's clusters are C.
+    //
+    // Asserted rather than trusted because getting here takes beating a flag
+    // that belongs to somebody else: embedded-postgres passes its own
+    // `--lc-messages` from a locale it detects, ahead of anything given to it,
+    // and initdb lets an explicit `--lc-messages` beat `--locale` whatever the
+    // order. Only repeating the flag after theirs settles it, and only initdb
+    // taking the LAST occurrence makes that work. An upstream that reorders
+    // its argv, or stops passing the flag, would quietly put this cluster back
+    // on the host's locale, which is exactly the kind of change a version bump
+    // makes without saying so.
+    const instance = new TestDatabaseInstance();
+
+    try {
+      await instance.start();
+
+      const dataDir = (instance as unknown as Internals).tempDir;
+
+      expect(dataDir).toBeDefined();
+
+      const conf = readFileSync(
+        join(dataDir as string, "postgresql.conf"),
+        "utf8",
+      );
+
+      expect(/^lc_messages = '?C'?\s/m.test(conf)).toBe(true);
+    } finally {
+      await instance.stop();
+    }
+  }, 120_000);
 
   it("reads the cluster's own postmaster.pid to decide whether it is still there", async () => {
     const instance = new TestDatabaseInstance();

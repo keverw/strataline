@@ -26,7 +26,11 @@ import {
   type Logger,
 } from "../logger";
 import { PostgresBinaries, getBinaries } from "./pg-bin-helper";
-import { ipcExhaustionHint, postgresOutputLevel } from "./postgres-output";
+import {
+  ipcExhaustionHint,
+  PostgresOutputBuffer,
+  postgresOutputLevel,
+} from "./postgres-output";
 import {
   buildDevDBPidRecord,
   dataDirFromCommand,
@@ -418,11 +422,15 @@ export class LocalDevDBServer {
   // Why the spawned server never became usable, when it did not.
   private startupFailure: Error | null = null;
 
-  // The last few lines the spawned PostgreSQL wrote, kept so a failure can say
+  // The end of what the spawned PostgreSQL wrote, kept so a failure can say
   // what it said. Bounded, because a server that runs for a week must not
   // accumulate its own log in memory, and only the end of it diagnoses a
   // startup that died: the postmaster reports the reason and then exits.
-  private serverOutput: string[] = [];
+  //
+  // The same buffer TestDatabaseInstance keeps, for the same reasons and with
+  // the same bound. See PostgresOutputBuffer, which is also where the reason
+  // it counts characters rather than lines is written down.
+  private readonly serverOutput = new PostgresOutputBuffer();
 
   // The child a failed start left behind because it outlived even SIGKILL.
   // Held as the reference rather than a flag so it needs no clearing: it only
@@ -2585,17 +2593,16 @@ export class LocalDevDBServer {
     return [...new Set([LocalDevDBServer.BOOTSTRAP_USER, this.currentUser])];
   }
 
-  /** How many lines of the server's own output to keep for a diagnosis. */
-  private static readonly SERVER_OUTPUT_LINES = 12;
-
   /**
    * Records what PostgreSQL wrote, logging it too when there is a logger.
    *
-   * Split into lines rather than kept as chunks, because a chunk boundary is
-   * wherever the pipe happened to flush and the cap is meant to be a number of
-   * messages. Blank lines are dropped so they cannot use the budget up.
+   * The chunk goes into the buffer exactly as it arrived. What is LOGGED is
+   * trimmed, since that is one message to a person; what is kept is not, since
+   * ipcExhaustionHint reads it. See PostgresOutputBuffer.
    */
   private noteServerOutput(chunk: string): void {
+    this.serverOutput.append(chunk);
+
     const text = chunk.trim();
 
     if (!text) {
@@ -2606,20 +2613,6 @@ export class LocalDevDBServer {
     // lets a startup failure reach a logger's error level rather than sitting
     // at `info` alongside "listening on IPv4 address".
     this.log("pg", text, postgresOutputLevel(text));
-
-    for (const line of text.split(/\r?\n/)) {
-      const trimmed = line.trim();
-
-      if (trimmed) {
-        this.serverOutput.push(trimmed);
-      }
-    }
-
-    const cap = LocalDevDBServer.SERVER_OUTPUT_LINES;
-
-    if (this.serverOutput.length > cap) {
-      this.serverOutput = this.serverOutput.slice(-cap);
-    }
   }
 
   /**
@@ -2633,7 +2626,7 @@ export class LocalDevDBServer {
    * reaches the caller as an exit code and nothing else.
    */
   private withServerOutput(message: string): string {
-    const detail = this.serverOutput.join("\n");
+    const detail = this.serverOutput.read();
 
     return detail
       ? `${message}. PostgreSQL said:\n${detail}${ipcExhaustionHint(detail)}`
@@ -2692,7 +2685,7 @@ export class LocalDevDBServer {
     // than failing start() — see runPgCommand. Recording it instead lets
     // waitForServerReady stop waiting for a server that will never appear.
     this.startupFailure = null;
-    this.serverOutput = [];
+    this.serverOutput.clear();
     this.pgProcess.on("error", (err) => {
       this.startupFailure = err;
       this.log("error", `PostgreSQL process could not be started: ${err}`);

@@ -15,7 +15,11 @@ import EmbeddedPostgres from "embedded-postgres";
 import * as tmp from "tmp";
 import { findFreePort } from "./free-port";
 import { isProcessAlive, readPostmasterPidFile } from "./pid-file";
-import { ipcExhaustionHint, postgresOutputLevel } from "./postgres-output";
+import {
+  ipcExhaustionHint,
+  PostgresOutputBuffer,
+  postgresOutputLevel,
+} from "./postgres-output";
 import * as fs from "fs";
 
 // Default configuration for test database
@@ -454,24 +458,6 @@ export class TestDatabaseInstance {
   private static readonly PORT_RETRIES = 3;
 
   /**
-   * How many characters of PostgreSQL's output to keep for a diagnosis.
-   *
-   * Counted in characters rather than in lines, which is where this parts
-   * company with LocalDevDBServer's equivalent, and deliberately. That buffer
-   * is only ever reported; this one is READ — {@link failedToBind} runs a
-   * regex over it to decide whether a lost port is worth retrying — so the
-   * bytes have to stay exactly as PostgreSQL wrote them. Splitting chunks into
-   * trimmed lines and rejoining them is not the identity function: a message
-   * flushed across two chunks, `could not b` then `ind IPv4 address ...`,
-   * comes back with a newline through the middle of the word and matches
-   * nothing, and the retry that buffer exists for never fires.
-   *
-   * Generous, because a bind failure is a few hundred characters and the only
-   * thing this bound has to prevent is a running database's whole log.
-   */
-  private static readonly ATTEMPT_OUTPUT_CHARS = 8000;
-
-  /**
    * Everything PostgreSQL wrote during the current start attempt.
    *
    * `EmbeddedPostgres.start()` rejects with no value at all, so the reason a
@@ -479,12 +465,13 @@ export class TestDatabaseInstance {
    * and that output arrives in several chunks. Reset per attempt, so a retry
    * is judged on its own failure rather than the previous one's.
    *
-   * Bounded, for the reason LocalDevDBServer bounds its own: `onLog` keeps
-   * firing for the life of the server, and nothing resets this once the start
-   * has succeeded, so an unbounded one accumulates a running database's entire
-   * log in memory for a diagnosis nobody is going to ask for.
+   * The same buffer LocalDevDBServer keeps, bounded the same way and for the
+   * same reasons. `onLog` keeps firing for the life of the server and nothing
+   * resets this once the start has succeeded, so an unbounded one accumulates
+   * a running database's entire log in memory for a diagnosis nobody is going
+   * to ask for. See PostgresOutputBuffer for why the bound counts characters.
    */
-  private attemptOutput = "";
+  private readonly attemptOutput = new PostgresOutputBuffer();
 
   /**
    * Builds the embedded server for one port, against this run's directory.
@@ -514,7 +501,20 @@ export class TestDatabaseInstance {
       // gives the same byte-order collation everywhere — ideal for a
       // throwaway DB (just not locale-aware sorting, so don't "fix" this to
       // en_US).
-      initdbFlags: ["--locale=C", "--encoding=UTF8"],
+      // `--lc-messages=C` as well as `--locale=C`, and the redundancy is the
+      // point. embedded-postgres passes its OWN `--lc-messages`, from a locale
+      // it detects (normally en_US.UTF-8), and it passes it ahead of anything
+      // given here -- and initdb lets an explicit `--lc-messages` beat
+      // `--locale` however they are ordered. So `--locale=C` alone left this
+      // cluster on en_US.UTF-8 while LocalDevDBServer's was on C. Repeating
+      // the flag after theirs is what settles it: initdb takes the last
+      // occurrence, verified against the bundled binary rather than assumed.
+      //
+      // Worth settling because postgresOutputLevel and ipcExhaustionHint read
+      // English severity words out of this server's output. Both clusters now
+      // arrange that rather than one arranging it and the other happening to
+      // detect an English locale.
+      initdbFlags: ["--locale=C", "--encoding=UTF8", "--lc-messages=C"],
       // IPv4 only, the same pin LocalDevDBServer applies and for the same
       // reason. embedded-postgres passes no `listen_addresses`, so the cluster
       // takes PostgreSQL's default of `localhost`, which binds BOTH 127.0.0.1
@@ -539,7 +539,7 @@ export class TestDatabaseInstance {
         // system is shut down`. Keeping only the last chunk therefore tested
         // the shutdown notice, matched nothing, and made the retry below
         // unreachable.
-        this.noteAttemptOutput(message);
+        this.attemptOutput.append(message);
         // PostgreSQL says how bad the line is, in the line. Reading it is what
         // keeps `pgVerbose: false` a filter on routine output rather than one
         // that also hides the FATAL saying why the server would not start.
@@ -560,24 +560,7 @@ export class TestDatabaseInstance {
    * the same failure.
    */
   private failedToBind(): boolean {
-    return isBindFailure(this.attemptOutput);
-  }
-
-  /**
-   * Records what PostgreSQL wrote, keeping only the end of it.
-   *
-   * Appended verbatim and trimmed only at the front, so what the matchers see
-   * is the text PostgreSQL emitted rather than a reassembly of it. See
-   * {@link TestDatabaseInstance.ATTEMPT_OUTPUT_CHARS}.
-   */
-  private noteAttemptOutput(chunk: string): void {
-    this.attemptOutput += chunk;
-
-    const cap = TestDatabaseInstance.ATTEMPT_OUTPUT_CHARS;
-
-    if (this.attemptOutput.length > cap) {
-      this.attemptOutput = this.attemptOutput.slice(-cap);
-    }
+    return isBindFailure(this.attemptOutput.read());
   }
 
   /**
@@ -600,7 +583,7 @@ export class TestDatabaseInstance {
       return error;
     }
 
-    const detail = this.attemptOutput.trim();
+    const detail = this.attemptOutput.read();
 
     return new Error(
       detail
@@ -671,7 +654,7 @@ export class TestDatabaseInstance {
       attempt <= TestDatabaseInstance.PORT_RETRIES;
       attempt++
     ) {
-      this.attemptOutput = "";
+      this.attemptOutput.clear();
 
       try {
         await db.start();
