@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import * as os from "os";
+import { readOsUsername } from "../src/lib/os-user";
 import { cleanSemaphores, type SemaphoreProbes } from "./clean-ipc";
 
 /**
@@ -18,7 +18,17 @@ function semaphoreRow(id: string, owner: string, nsems: number): string {
 
 // The real one: the pass only ever touches sets this user owns, so a made-up
 // name would be filtered out and every assertion below would pass vacuously.
-const OWNER = os.userInfo().username;
+//
+// Null where the operating system has no passwd entry for this uid, which a
+// container run as an unmapped uid produces routinely. Read through the same
+// guard the script uses rather than a bare `userInfo()`, which THROWS in that
+// case and would take this whole file down before a single test ran.
+const OS_USER = readOsUsername();
+
+// Never reached: the pass declines to act at all when the user is unknown, so
+// there is no behavior left for these to exercise and the block below is
+// skipped. The placeholder exists only so the rows are typed as strings.
+const OWNER = OS_USER ?? "no-such-user";
 const LEAKED = "111111";
 const LIVE_SERVERS = "222222";
 
@@ -78,7 +88,11 @@ function machineWherePostgresStartsMidRun(removed: string[]): {
   };
 }
 
-describe("cleanSemaphores", () => {
+// A machine that cannot name its own user cannot arrange the premise these
+// need: every row is matched on the owner column, and the pass stops before
+// reading any of them. Skipped rather than failed, the same as any other test
+// whose fixture the host will not build.
+describe.skipIf(OS_USER === null)("cleanSemaphores", () => {
   it("lists the sets before asking whether PostgreSQL is running", () => {
     // The ordering itself, asserted directly. Everything below follows from
     // it, and a reordering is the one way to reintroduce the race.

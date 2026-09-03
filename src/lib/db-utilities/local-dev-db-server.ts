@@ -14,9 +14,9 @@ import {
 } from "fs/promises";
 import { constants } from "fs";
 import { dirname, isAbsolute, join, resolve } from "path";
-import { userInfo } from "os";
 import { Client } from "pg";
 import { callHost, makeSafeLogger } from "../callback-safety";
+import { readOsUsername } from "../os-user";
 import {
   BaseLogger,
   ConsoleLogger,
@@ -376,22 +376,6 @@ async function fileExists(path: string): Promise<boolean> {
     return true;
   } catch {
     return false;
-  }
-}
-
-/**
- * The username the operating system reports for this process, or null where it
- * cannot say.
- *
- * `userInfo()` throws rather than returning nothing when there is no passwd
- * entry for the effective uid, which is ordinary inside a container run with
- * `--user 1000:1000` against an image that does not know that uid.
- */
-function readOsUsername(): string | null {
-  try {
-    return userInfo().username || null;
-  } catch {
-    return null;
   }
 }
 

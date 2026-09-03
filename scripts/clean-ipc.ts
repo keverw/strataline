@@ -35,6 +35,7 @@
 
 import { execFileSync, execSync } from "child_process";
 import * as os from "os";
+import { readOsUsername } from "../src/lib/os-user";
 
 /** PostgreSQL allocates its semaphores in sets of exactly this size. */
 const POSTGRES_SEMAPHORES_PER_SET = 17;
@@ -75,9 +76,45 @@ function livePostgresCount(): number {
   }
 }
 
-const user = os.userInfo().username;
+/**
+ * The account whose IPC objects a pass may remove, or null where the operating
+ * system will not say.
+ *
+ * Read per pass rather than once at module scope, and through the shared guard
+ * rather than a bare `userInfo()`. That call THROWS where the effective uid has
+ * no passwd entry, which a container run with `--user 1000:1000` produces
+ * routinely, and at module scope the throw takes the whole module with it —
+ * including the import in clean-ipc.test.ts, so a machine that cannot name its
+ * own user failed the ordering test with a stack trace about `os`.
+ *
+ * Null stops a pass rather than narrowing it. Both passes match on the owner
+ * column, so an unknown user quietly matches no row: `ipcrm` is never called,
+ * which is safe, and the pass then reports having removed nothing — which on a
+ * machine that is failing with "No space left on device" reads as "there was
+ * no leak" and sends the reader looking somewhere else. Saying why it could
+ * not look is the whole difference. See readOsUsername.
+ */
+function ownerOrSkip(pass: string): string | null {
+  const user = readOsUsername();
+
+  if (user === null) {
+    console.log(
+      `clean-ipc: skipped ${pass}, the operating system reports no username for this uid. ` +
+        "Every object here is matched by its owner, so there is no way to tell yours from anybody else's. " +
+        "This is usual in a container running as an unmapped uid; run it on the host instead.",
+    );
+  }
+
+  return user;
+}
 
 function cleanSharedMemory(): void {
+  const user = ownerOrSkip("shared memory");
+
+  if (user === null) {
+    return;
+  }
+
   let output: string;
 
   try {
@@ -167,6 +204,15 @@ const systemSemaphoreProbes: SemaphoreProbes = {
 export function cleanSemaphores(
   probes: SemaphoreProbes = systemSemaphoreProbes,
 ): void {
+  // Ahead of the snapshot below, so a pass that cannot act spends no `ipcs`
+  // and, more to the point, does not take a reading whose ordering against the
+  // liveness check it is then going to throw away.
+  const user = ownerOrSkip("semaphores");
+
+  if (user === null) {
+    return;
+  }
+
   let output: string;
 
   // The snapshot FIRST and the liveness check second, which is the whole of
