@@ -154,11 +154,24 @@ export abstract class BaseLogger implements Logger {
  * doubled and its only caller was a test using a mock that records rather than
  * renders.
  *
- * Subclassing this rather than `BaseLogger` makes that unwriteable. A
- * forwarder gets no say in what a line looks like: {@link transform} returns
- * the data to pass on or `null` to drop it, so the whole of its vocabulary is
- * fields, and there is nowhere to put a rendered string. The `warn` fallback
- * lives here too, in one copy rather than one per subclass.
+ * Subclassing this rather than `BaseLogger` is what keeps the two apart, and
+ * it leaves a forwarder exactly two questions to answer. {@link transform} is
+ * what the line IS: return the data to pass on, or `null` to drop it.
+ * {@link deliver} is how the CALL is made: wrap it, guard it, fall back from
+ * it. Neither seam is shaped to hold a rendered string, and a subclass that
+ * needs neither writes nothing at all.
+ *
+ * Shaped, not sealed, and the difference is worth stating rather than
+ * glossing. `LogDataInput` carries a `message`, so a `transform` CAN return
+ * `{ ...data, message: prefix + data.message }` and put the prefix straight
+ * back where MutableLogger had it. Nothing in the types prevents that.
+ * Claiming otherwise would be worse than claiming nothing, because the next
+ * person would trust the claim instead of the rule: a forwarder leaves
+ * `message` alone, the sink at the bottom renders, and a forwarder that
+ * breaks that doubles every line it touches exactly as before.
+ *
+ * The `warn` fallback lives here too, in one copy rather than one per
+ * subclass.
  */
 export abstract class ForwardingLogger extends BaseLogger {
   protected readonly next: Logger;
@@ -168,26 +181,51 @@ export abstract class ForwardingLogger extends BaseLogger {
     this.next = next;
   }
 
-  info(data: LogDataInput): void {
-    this.forward("info", data);
+  /**
+   * The three levels, each handing back whatever the logger beneath returned.
+   *
+   * Declared `unknown` rather than `void`, which is what lets that value out.
+   * `Logger` declares these `void`, and a method returning anything satisfies
+   * a `void` one, so this is a wrapper that keeps its own promise rather than
+   * a wider contract: nothing may act on what comes back except a wrapper that
+   * knows what it wrapped.
+   *
+   * Returning it is the whole of what makes the guard hold through a chain.
+   * SafeLogger catches an async logger's rejection by attaching to the promise
+   * {@link deliver} hands up, and a wrapped logger's prefixed child is
+   * SafeLogger -> PrefixedLogger -> logger, so the promise crosses a forwarder
+   * that is not the guard. A synchronous throw crosses it by itself; a
+   * rejection dropped here belongs to nobody, and Node ends the process over
+   * exactly the failure makeSafeLogger exists to absorb.
+   */
+  info(data: LogDataInput): unknown {
+    return this.forward("info", data);
   }
 
-  warn(data: LogDataInput): void {
-    this.forward("warn", data);
+  warn(data: LogDataInput): unknown {
+    return this.forward("warn", data);
   }
 
-  error(data: LogDataInput): void {
-    this.forward("error", data);
+  error(data: LogDataInput): unknown {
+    return this.forward("error", data);
   }
 
   /**
-   * What to pass on, or `null` to drop the line. Forwards unchanged by
-   * default, which is what a subclass that only overrides {@link deliver}
-   * wants.
+   * What the line is: the data to pass on, or `null` to drop it. Forwards
+   * unchanged by default, which is what a subclass that only overrides
+   * {@link deliver} wants.
+   *
+   * The two below are the two things this can do. MutableLogger returns
+   * `null` and nothing beneath it is called at all; PrefixedLogger fills in
+   * absent fields and hands the line on.
    */
   protected transform(
     data: LogDataInput,
-    // Named for the subclasses that branch on it. Unused here.
+    // For a subclass that wants to gate or fill per level. Neither of the two
+    // in this file does, so it is unused today and kept on purpose rather
+    // than by oversight: `deliver` already takes a level, and a `transform`
+    // that could not see one would push anything level-dependent into the
+    // seam that wraps the call instead of the seam that decides the line.
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     level: LogLevel,
   ): LogDataInput | null {
@@ -219,14 +257,26 @@ export abstract class ForwardingLogger extends BaseLogger {
     return this.next[level](data);
   }
 
-  private forward(level: LogLevel, data: LogDataInput): void {
+  /**
+   * The body `info`, `warn`, and `error` share, and the whole of what it is.
+   *
+   * Not a third seam. The two a forwarder answers are {@link transform} and
+   * {@link deliver}; this is the plumbing that runs one and then the other,
+   * in one place rather than three copies differing only by a string literal.
+   * It is `private` so that stays true — nothing overrides it, and a subclass
+   * reaching for it wants one of the other two.
+   */
+  private forward(level: LogLevel, data: LogDataInput): unknown {
     const forwarded = this.transform(data, level);
 
+    // A dropped line has nothing to hand back, and undefined is the right
+    // nothing: a caller inspecting this for a promise finds none, which is
+    // true — no logger beneath was called.
     if (forwarded === null) {
-      return;
+      return undefined;
     }
 
-    this.deliver(level, forwarded);
+    return this.deliver(level, forwarded);
   }
 }
 

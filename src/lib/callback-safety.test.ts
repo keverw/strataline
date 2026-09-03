@@ -3,6 +3,7 @@ import { callHost, logSafely, makeSafeLogger } from "./callback-safety";
 import {
   BaseLogger,
   createPrefixedLogger,
+  getErrorMessage,
   type LogDataInput,
   type Logger,
 } from "./logger";
@@ -832,6 +833,47 @@ describe("makeSafeLogger", () => {
     } finally {
       stub.restore();
     }
+  });
+
+  it("catches a rejection from the prefixed child a wrapped logger builds", async () => {
+    // The async twin of the test above, and the case a synchronous throw
+    // cannot reach. A BaseLogger subclass INHERITS createPrefixed, so the
+    // chain a wrapped one produces is SafeLogger -> PrefixedLogger -> logger:
+    // the guard is no longer the immediate wrapper. A throw propagates up
+    // through the forwarder in the middle by itself, but a promise only
+    // survives if that forwarder hands back what it was given — otherwise the
+    // rejection is nobody's, and Node ends the process over the one thing
+    // makeSafeLogger exists to absorb.
+    watcher = watchUnhandledRejections();
+
+    const escalated: string[] = [];
+
+    class AsyncLogger extends BaseLogger {
+      // `Logger` declares these `void`, which an `async` implementation
+      // satisfies with a promise. This is that logger, rejecting.
+      info(): Promise<void> {
+        return Promise.reject(new Error("async line lost"));
+      }
+
+      warn(): void {}
+
+      error(data: LogDataInput): void {
+        escalated.push(getErrorMessage(data.error));
+      }
+    }
+
+    const child = createPrefixedLogger(makeSafeLogger(new AsyncLogger()), {
+      stage: "child",
+    });
+
+    child.info({ message: "swallowed" });
+
+    await settle();
+
+    // Caught by the guard on the outside and re-reported through `error`,
+    // rather than left to the runtime.
+    expect(watcher.seen).toEqual([]);
+    expect(escalated).toEqual(["async line lost"]);
   });
 
   it("keeps `warn` usable on the prefixed child of a logger without one", () => {
