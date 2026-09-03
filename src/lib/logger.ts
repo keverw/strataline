@@ -136,7 +136,20 @@ export class ConsoleLogger extends BaseLogger {
 }
 
 /**
- * Mutable logger that can be toggled on/off for unit tests
+ * Mutable logger that can be toggled on/off for unit tests.
+ *
+ * A gate and nothing else: what passes through reaches the logger beneath
+ * exactly as it arrived. That is the whole of what this adds, and adding
+ * anything to the payload is how it went wrong before — it built the
+ * `[task] [stage] ` prefix out of the CALLER's own fields, put it in front of
+ * the message, and then forwarded those fields as well, so a base logger that
+ * renders them (ConsoleLogger, which is what one usually is) rendered them a
+ * second time and every line came out "[migrate] [up] [migrate] [up] ...".
+ *
+ * There was never a prefix of its own to contribute, since this takes none.
+ * Which logger renders the fields is a question with one answer here, and it
+ * is the same one PrefixedLogger relies on: the logger at the bottom does it,
+ * once. Anything in between forwards.
  */
 export class MutableLogger extends BaseLogger {
   private baseLogger: Logger;
@@ -172,10 +185,7 @@ export class MutableLogger extends BaseLogger {
    */
   info(data: LogDataInput): void {
     if (this.verbose) {
-      const logData: LogData = { ...data, level: "info" };
-      const prefix = buildLogPrefix(logData);
-      // Assuming baseLogger handles the actual console logging or equivalent
-      this.baseLogger.info({ ...data, message: `${prefix}${logData.message}` });
+      this.baseLogger.info(data);
     }
   }
 
@@ -184,14 +194,7 @@ export class MutableLogger extends BaseLogger {
    */
   error(data: LogDataInput): void {
     if (this.verbose) {
-      const logData: LogData = { ...data, level: "error" };
-      const prefix = buildLogPrefix(logData);
-      // Assuming baseLogger handles the actual console logging or equivalent
-      this.baseLogger.error({
-        ...data,
-        message: `${prefix}${logData.message}`,
-        error: logData.error,
-      });
+      this.baseLogger.error(data);
     }
   }
 
@@ -207,18 +210,13 @@ export class MutableLogger extends BaseLogger {
    */
   warn(data: LogDataInput): void {
     if (this.verbose) {
-      const logData: LogData = { ...data, level: "warn" };
-      const prefix = buildLogPrefix(logData);
-      const prefixed = { ...data, message: `${prefix}${logData.message}` };
-
-      // Assuming baseLogger handles the actual console logging or equivalent
       if (typeof this.baseLogger.warn === "function") {
-        this.baseLogger.warn(prefixed);
+        this.baseLogger.warn(data);
 
         return;
       }
 
-      this.baseLogger.info(prefixed);
+      this.baseLogger.info(data);
     }
   }
 }
