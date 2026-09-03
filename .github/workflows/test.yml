@@ -106,6 +106,18 @@ jobs:
           icacls $env:GITHUB_WORKSPACE /grant "${name}:(OI)(CI)F" /T /Q | Out-Null
           icacls $env:USERPROFILE\.bun /grant "${name}:(OI)(CI)RX" /T /Q | Out-Null
 
+          # TEMP points into the runner's own profile, which this account
+          # cannot read: the suite creates its data directories there through
+          # tmp.dir(), and every one of them failed with
+          # "EPERM: operation not permitted, lstat 'C:\Users\RUNNER~1\AppData'".
+          # Start-Process passes the caller's environment on unless told to
+          # build a new one, so redirecting it here is enough.
+          $temp = Join-Path $env:GITHUB_WORKSPACE 'ci-temp'
+          New-Item -ItemType Directory -Path $temp -Force | Out-Null
+          icacls $temp /grant "${name}:(OI)(CI)F" /T /Q | Out-Null
+          $env:TEMP = $temp
+          $env:TMP = $temp
+
           $bun = (Get-Command bun).Source
           $credential = New-Object System.Management.Automation.PSCredential($name, $password)
 
