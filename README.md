@@ -1579,11 +1579,16 @@ You can customize logging behavior using the built-in console logger:
 import { createDevDBConsoleLogger } from "strataline/local-dev-db-server";
 
 // Create a logger with custom verbosity settings.
+// `pgVerbose` gates PostgreSQL's routine output only. Strataline reads the
+// severity PostgreSQL prints in its own lines, so a WARNING, ERROR, FATAL or
+// PANIC reaches your logger at that level and is shown either way: passing
+// false quiets "listening on IPv4 address" without hiding the FATAL that says
+// why the server would not start.
 // Defaults: createDevDBConsoleLogger(pgVerbose = true, setupVerbose = true) —
 // note both default to verbose here, unlike createTestDBConsoleLogger whose
 // pgVerbose defaults to false.
 const logger = createDevDBConsoleLogger(
-  true, // pgVerbose: show PostgreSQL server logs
+  true, // pgVerbose: show PostgreSQL's routine server logs
   true, // setupVerbose: show setup/initialization logs
 );
 

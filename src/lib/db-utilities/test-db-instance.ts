@@ -87,7 +87,9 @@ class TestDBConsoleLogger extends BaseLogger {
   }
 
   private write(level: LogLevel, data: LogDataInput): void {
-    if (!this.pgVerbose && data.source === "pg") {
+    // Routine output only, as with migration lines below: a PostgreSQL
+    // warning or error is not what `pgVerbose: false` was asking to be spared.
+    if (!this.pgVerbose && level === "info" && data.source === "pg") {
       return;
     }
 

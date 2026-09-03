@@ -152,6 +152,89 @@ const DEV_DB_LOG_TAGS = {
 type DevDBLogTag = keyof typeof DEV_DB_LOG_TAGS;
 
 /**
+ * PostgreSQL's own severity words, and what each is to a `Logger`.
+ *
+ * Only the ones that are not ordinary. Everything else PostgreSQL emits —
+ * LOG, NOTICE, INFO, DEBUG, and the DETAIL/HINT/CONTEXT/STATEMENT lines that
+ * accompany a message — is routine output and stays `info`, which is where
+ * every line used to go regardless.
+ */
+const POSTGRES_SEVERITIES: Readonly<Record<string, LogLevel>> = {
+  PANIC: "error",
+  FATAL: "error",
+  ERROR: "error",
+  WARNING: "warn",
+};
+
+/**
+ * Every severity word PostgreSQL can print, whether or not it raises the
+ * level. The set is the one `log_min_messages` accepts — DEBUG5 through
+ * DEBUG1, INFO, NOTICE, WARNING, ERROR, LOG, FATAL, PANIC — plus the fields
+ * elog prints alongside a message.
+ *
+ * English, which is not an assumption so much as something this class
+ * arranges: initializeDataDirectory runs initdb with `--locale=C`, which
+ * writes `lc_messages = C` into the cluster, and the bundled PostgreSQL ships
+ * no translation catalogs to render them any other way. A cluster created
+ * elsewhere under a different lc_messages could print a translated severity,
+ * and the scan would not recognize it — that chunk falls back to `info`,
+ * which is where every line used to go. Matching all of them and then looking the match up is what stops the
+ * scan reading a word out of the middle of a message: `STATEMENT:  SELECT ...`
+ * is matched by STATEMENT, so an `ERROR:` quoted inside that statement is
+ * never reached.
+ */
+const POSTGRES_SEVERITY_PATTERN =
+  /(?:^|\s)(PANIC|FATAL|ERROR|WARNING|LOG|NOTICE|INFO|DEBUG[1-5]?|DETAIL|HINT|CONTEXT|STATEMENT|QUERY|LOCATION):/;
+
+/**
+ * The level PostgreSQL's output is asking to be logged at.
+ *
+ * PostgreSQL says how bad a line is, in the line. It writes
+ * `2026-09-02 19:32:50.954 MDT [64506] FATAL:  ...`, where the leading part is
+ * `log_line_prefix` and the severity follows it, so the word is neither at the
+ * start of the string nor at a fixed offset — the prefix is configurable and
+ * carries a timestamp whose length varies with the zone. Hence a scan for the
+ * word rather than a parse of the line.
+ *
+ * The highest severity in the chunk wins, and the whole chunk is logged at it.
+ * A FATAL is followed by its own DETAIL and HINT lines, and splitting a
+ * message up to give each line its own level would take the explanation away
+ * from the thing it explains.
+ *
+ * Anything unrecognized is `info`, which is what every line used to get. A
+ * chunk this cannot read is therefore no worse off than before, and that is
+ * the direction to be wrong in: this decides whether output is shown when the
+ * caller has asked for quiet, so a false ERROR is noise nobody asked for while
+ * a missed one is the status quo.
+ *
+ * @internal Exported so the scan can be tested against real PostgreSQL output
+ * without having to provoke a server into producing each severity.
+ */
+export function postgresOutputLevel(text: string): LogLevel {
+  let level: LogLevel = "info";
+
+  for (const line of text.split(/\r?\n/)) {
+    const match = POSTGRES_SEVERITY_PATTERN.exec(line);
+
+    if (!match) {
+      continue;
+    }
+
+    const severity = POSTGRES_SEVERITIES[match[1]];
+
+    if (severity === "error") {
+      return "error";
+    }
+
+    if (severity === "warn") {
+      level = "warn";
+    }
+  }
+
+  return level;
+}
+
+/**
  * Reports that the server exited without being asked to, and why.
  *
  * A notification, not a decision. This library never ends your process, so
@@ -218,10 +301,20 @@ class DevDBConsoleLogger extends BaseLogger {
   }
 
   private write(level: LogLevel, data: LogDataInput): void {
-    // A source this logger was told to quieten. An unknown source is shown:
-    // a host logging through this with a source of its own asked for that
-    // line, and silence it never requested is the worse failure.
-    if (data.source !== undefined && this.show[data.source] === false) {
+    // A source this logger was told to quieten, but only its routine output.
+    // A warning or an error is not chatter, and PostgreSQL now says which of
+    // its lines are which — see postgresOutputLevel — so `pgVerbose: false`
+    // quiets "listening on IPv4 address" without also hiding the FATAL that
+    // says why the server would not start.
+    //
+    // An unknown source is shown whatever its level: a host logging through
+    // this with a source of its own asked for that line, and silence it never
+    // requested is the worse failure.
+    if (
+      level === "info" &&
+      data.source !== undefined &&
+      this.show[data.source] === false
+    ) {
       return;
     }
 
@@ -483,12 +576,13 @@ export class LocalDevDBServer {
    * @param type Message type
    * @param message Message content
    */
-  private log(type: DevDBLogTag, message: string): void {
+  private log(type: DevDBLogTag, message: string, override?: LogLevel): void {
     if (!this.logger) {
       return;
     }
 
-    const [level, source] = DEV_DB_LOG_TAGS[type];
+    const [defaultLevel, source] = DEV_DB_LOG_TAGS[type];
+    const level = override ?? defaultLevel;
 
     // Guarded once when it was stored rather than here, so every call is
     // covered by construction. See makeSafeLogger.
@@ -2501,7 +2595,10 @@ export class LocalDevDBServer {
       return;
     }
 
-    this.log("pg", text);
+    // PostgreSQL says how bad the line is, in the line. Reading it is what
+    // lets a startup failure reach a logger's error level rather than sitting
+    // at `info` alongside "listening on IPv4 address".
+    this.log("pg", text, postgresOutputLevel(text));
 
     for (const line of text.split(/\r?\n/)) {
       const trimmed = line.trim();

@@ -15,6 +15,7 @@ import {
   identifyViaConnection,
   type LocalDevDBServerConfig,
   type ProcessProbes,
+  postgresOutputLevel,
 } from "./local-dev-db-server";
 import { Pool } from "pg";
 import * as tmp from "tmp";
@@ -3974,5 +3975,71 @@ describe("LocalDevDBServer", () => {
       console.error = originalError;
       console.warn = originalWarn;
     }
+  });
+});
+
+describe("postgresOutputLevel", () => {
+  // The real shape, captured from a running server: log_line_prefix defaults
+  // to "%m [%p] ", so the severity is neither at the start of the line nor at
+  // a fixed offset — the timestamp's length varies with the zone.
+  const line = (severity: string, message: string) =>
+    `2026-09-02 19:32:50.954 MDT [64506] ${severity}:  ${message}`;
+
+  it("leaves routine output at info", () => {
+    expect(postgresOutputLevel(line("LOG", "starting PostgreSQL 18.4"))).toBe(
+      "info",
+    );
+    expect(postgresOutputLevel(line("NOTICE", "extension exists"))).toBe(
+      "info",
+    );
+    expect(postgresOutputLevel(line("DEBUG1", "forked new backend"))).toBe(
+      "info",
+    );
+  });
+
+  it("raises the levels PostgreSQL raises", () => {
+    expect(postgresOutputLevel(line("WARNING", "already a transaction"))).toBe(
+      "warn",
+    );
+    expect(postgresOutputLevel(line("ERROR", 'relation "x" does not exist'))).toBe(
+      "error",
+    );
+    expect(postgresOutputLevel(line("FATAL", "files are incompatible"))).toBe(
+      "error",
+    );
+    expect(postgresOutputLevel(line("PANIC", "could not write to file"))).toBe(
+      "error",
+    );
+  });
+
+  it("takes the highest severity in a chunk and keeps the chunk together", () => {
+    // A FATAL arrives with its own DETAIL and HINT. Splitting them to level
+    // each line separately would take the explanation away from the thing it
+    // explains, so the whole chunk goes at the worst level in it.
+    const chunk = [
+      line("FATAL", "database files are incompatible with server"),
+      line("DETAIL", "The data directory was initialized by version 17."),
+      line("HINT", "You may need to initdb."),
+    ].join("\n");
+
+    expect(postgresOutputLevel(chunk)).toBe("error");
+  });
+
+  it("does not read a severity out of the middle of a message", () => {
+    // log_statement echoes the query under STATEMENT, so a query mentioning
+    // ERROR must not make a routine echo look like a failure. STATEMENT is
+    // matched first and is not a raising severity, so the scan stops there.
+    const echoed = line("STATEMENT", "SELECT 'ERROR: not really'");
+
+    expect(postgresOutputLevel(echoed)).toBe("info");
+  });
+
+  it("treats anything it cannot read as routine", () => {
+    // The `pg` source also carries this class's own lines, and an unreadable
+    // chunk must be no worse off than it was when every line was info.
+    expect(postgresOutputLevel("Running: /path/to/initdb -D /tmp/pgdata")).toBe(
+      "info",
+    );
+    expect(postgresOutputLevel("")).toBe("info");
   });
 });
