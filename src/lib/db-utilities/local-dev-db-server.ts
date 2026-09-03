@@ -2522,9 +2522,26 @@ export class LocalDevDBServer {
       // no such locale, and an inherited one makes collation vary per machine.
       // "C" + UTF8 is valid everywhere and sorts by byte order — right for a
       // throwaway DB, so do not "fix" it to en_US.
+      // `-U postgres`, so the cluster's superuser is a name this code chose
+      // rather than one it has to work out. Without it initdb names the
+      // bootstrap superuser after whoever ran it, and the connection then has
+      // to arrive at the same name independently -- which means asking the
+      // operating system who this process is, and being right on every
+      // platform and runtime. Where that guess was wrong, every start failed
+      // with `role "..." does not exist` against a database it had just
+      // created, and the guess was wrong in ordinary situations: an inherited
+      // USERNAME, a container that pins it, a process launched under other
+      // credentials.
+      //
+      // A name that is decided here cannot disagree with itself. It also makes
+      // the cluster independent of the account that happened to create it, so
+      // a data directory still works when the next start runs as somebody
+      // else.
       const initResult = await this.runPgCommand(pgBinaries.initdb, [
         "-D",
         stagedDataDir,
+        "-U",
+        LocalDevDBServer.BOOTSTRAP_USER,
         "--locale=C",
         "--encoding=UTF8",
       ]);
@@ -2608,6 +2625,38 @@ export class LocalDevDBServer {
         `PostgreSQL data directory already initialized at ${this.pgDataDir}.`,
       );
     }
+  }
+
+  /**
+   * The superuser every cluster this code creates is initialized with.
+   *
+   * `postgres` because that is the name PostgreSQL installations use by
+   * convention, so a person reaching for psql against this data directory
+   * guesses right.
+   */
+  private static readonly BOOTSTRAP_USER = "postgres";
+
+  /**
+   * The superuser this cluster actually answers to, once one has connected.
+   *
+   * Not simply {@link BOOTSTRAP_USER}, because a data directory initialized by
+   * an older strataline has a superuser named after whoever ran initdb that
+   * day. Those clusters keep working: readiness tries the names in order and
+   * remembers the one that answered, so an upgrade needs no migration and no
+   * flag.
+   */
+  private bootstrapUser: string | null = null;
+
+  /**
+   * Who to try connecting as, best first.
+   *
+   * The current OS user is still a candidate, and last, since that is what an
+   * older cluster was initialized with. It may well be the wrong name -- that
+   * is the whole reason it is no longer relied on -- but a wrong name simply
+   * fails to connect, and the right one is already ahead of it.
+   */
+  private superuserCandidates(): string[] {
+    return [...new Set([LocalDevDBServer.BOOTSTRAP_USER, this.currentUser])];
   }
 
   /** How many lines of the server's own output to keep for a diagnosis. */
@@ -3153,20 +3202,21 @@ export class LocalDevDBServer {
       }
 
       try {
-        // Try to make a single connection test using our optimized client method
-        const currentUser = this.currentUser;
         // Sized from what is left of the budget, so an attempt admitted near
         // the end cannot run long past it. The loop guard above is what keeps
         // this clear of zero, which pg would read as no bound at all — see
         // READINESS_MIN_ATTEMPT_MS.
-        const client = await this.createClient(
-          currentUser,
-          "postgres",
-          Math.min(
-            LocalDevDBServer.READINESS_ATTEMPT_TIMEOUT_MS,
-            deadline - Date.now(),
-          ),
+        const attemptTimeout = Math.min(
+          LocalDevDBServer.READINESS_ATTEMPT_TIMEOUT_MS,
+          deadline - Date.now(),
         );
+
+        // Whichever superuser this cluster has. A name that fails to connect
+        // is not a server that is not ready, so the candidates are tried
+        // within one attempt rather than across the poll: otherwise a wrong
+        // first name would spend the whole thirty seconds proving itself
+        // wrong. The one that answers is remembered for setup.
+        const client = await this.connectAsSuperuser(attemptTimeout);
 
         // Ended in a finally, because a server that accepts the connection but
         // is not yet answering queries — or one that outlasts createClient's
@@ -3236,14 +3286,52 @@ export class LocalDevDBServer {
   }
 
   /**
+   * Connects as this cluster's superuser, working out which one that is.
+   *
+   * Settled once and then reused. The candidates differ only for a data
+   * directory an older strataline initialized, where the superuser is named
+   * after whoever ran initdb, so the first successful connection is the answer
+   * for the life of this instance.
+   *
+   * The last candidate's failure is what propagates, since by then every name
+   * has been refused and the caller wants an error rather than a list.
+   */
+  private async connectAsSuperuser(timeoutMs?: number): Promise<Client> {
+    const candidates =
+      this.bootstrapUser === null
+        ? this.superuserCandidates()
+        : [this.bootstrapUser];
+
+    let lastFailure: unknown;
+
+    for (const candidate of candidates) {
+      try {
+        const client = await this.createClient(
+          candidate,
+          "postgres",
+          timeoutMs,
+        );
+
+        if (this.bootstrapUser !== candidate) {
+          this.bootstrapUser = candidate;
+        }
+
+        return client;
+      } catch (e) {
+        lastFailure = e;
+      }
+    }
+
+    throw lastFailure;
+  }
+
+  /**
    * Sets up PostgreSQL users and databases
    */
   private async setupUsersAndDatabases(): Promise<void> {
-    // Get the current system user
-    const currentUser = this.currentUser;
-
-    // Connect as the current system user initially to set up postgres superuser
-    let client = await this.createClient(currentUser, "postgres");
+    // Whichever superuser answered during readiness. It has already been
+    // established that this one connects, so there is nothing to try here.
+    let client = await this.connectAsSuperuser();
 
     try {
       // Check if postgres role exists using the current connection
