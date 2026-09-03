@@ -99,6 +99,98 @@ export abstract class BaseLogger implements Logger {
 }
 
 /**
+ * A logger that hands its lines to another one.
+ *
+ * The loggers here fall into two kinds, and keeping the two apart is the point
+ * of this class. A SINK renders: it turns `task` and `stage` into
+ * `[task] [stage] ` and writes the line somewhere. `ConsoleLogger` is one. A
+ * FORWARDER passes the line on to the next logger, having gated it, filled in
+ * a field, or wrapped the call.
+ *
+ * Rendering belongs to the sink alone, and once. A forwarder that renders puts
+ * the prefix in the message and then hands on the fields it was built from, so
+ * the sink renders them again — which is precisely what MutableLogger did, and
+ * for long enough to reach a release, because every line it produced was
+ * doubled and its only caller was a test using a mock that records rather than
+ * renders.
+ *
+ * Subclassing this rather than `BaseLogger` makes that unwriteable. A
+ * forwarder gets no say in what a line looks like: {@link transform} returns
+ * the data to pass on or `null` to drop it, so the whole of its vocabulary is
+ * fields, and there is nowhere to put a rendered string. The `warn` fallback
+ * lives here too, in one copy rather than one per subclass.
+ */
+export abstract class ForwardingLogger extends BaseLogger {
+  protected readonly next: Logger;
+
+  constructor(next: Logger) {
+    super();
+    this.next = next;
+  }
+
+  info(data: LogDataInput): void {
+    this.forward("info", data);
+  }
+
+  warn(data: LogDataInput): void {
+    this.forward("warn", data);
+  }
+
+  error(data: LogDataInput): void {
+    this.forward("error", data);
+  }
+
+  /**
+   * What to pass on, or `null` to drop the line. Forwards unchanged by
+   * default, which is what a subclass that only overrides {@link deliver}
+   * wants.
+   */
+  protected transform(
+    data: LogDataInput,
+    // Named for the subclasses that branch on it. Unused here.
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    level: LogLevel,
+  ): LogDataInput | null {
+    return data;
+  }
+
+  /**
+   * Hands one line to the logger beneath, falling back to `info` where that
+   * logger cannot warn.
+   *
+   * The fallback is here rather than in each subclass because it is a fact
+   * about the logger underneath rather than about any wrapper. `Logger`
+   * declares `warn`, but a JavaScript caller can hand over an object without
+   * it, and wrapping such a logger produces one that HAS `warn` — so a call
+   * site with nothing to feature-detect calls it and reaches the one that is
+   * not there. A wrapper is never worse than what it wraps.
+   *
+   * Returns whatever the logger beneath returned, which `Logger` declares as
+   * `void` and an `async` implementation satisfies with a promise. Dropping it
+   * would leave that promise with nobody holding it, so a subclass wrapping
+   * this call — SafeLogger does — would have nothing to attach a `catch` to
+   * and the rejection would reach the process instead.
+   */
+  protected deliver(level: LogLevel, data: LogDataInput): unknown {
+    if (level === "warn" && typeof this.next.warn !== "function") {
+      return this.next.info(data);
+    }
+
+    return this.next[level](data);
+  }
+
+  private forward(level: LogLevel, data: LogDataInput): void {
+    const forwarded = this.transform(data, level);
+
+    if (forwarded === null) {
+      return;
+    }
+
+    this.deliver(level, forwarded);
+  }
+}
+
+/**
  * Console logger implementation
  */
 export class ConsoleLogger extends BaseLogger {
@@ -149,10 +241,10 @@ export class ConsoleLogger extends BaseLogger {
  * There was never a prefix of its own to contribute, since this takes none.
  * Which logger renders the fields is a question with one answer here, and it
  * is the same one PrefixedLogger relies on: the logger at the bottom does it,
- * once. Anything in between forwards.
+ * once. Anything in between forwards. See {@link ForwardingLogger}, which is
+ * where that is now enforced rather than remembered.
  */
-export class MutableLogger extends BaseLogger {
-  private baseLogger: Logger;
+export class MutableLogger extends ForwardingLogger {
   private verbose: boolean;
 
   /**
@@ -161,8 +253,7 @@ export class MutableLogger extends BaseLogger {
    * @param verbose Whether to output logs (defaults to true)
    */
   constructor(baseLogger: Logger, verbose: boolean = true) {
-    super();
-    this.baseLogger = baseLogger;
+    super(baseLogger);
     this.verbose = verbose;
   }
 
@@ -180,111 +271,39 @@ export class MutableLogger extends BaseLogger {
     return this.verbose;
   }
 
-  /**
-   * Log an informational message if verbose is enabled
-   */
-  info(data: LogDataInput): void {
-    if (this.verbose) {
-      this.baseLogger.info(data);
-    }
-  }
-
-  /**
-   * Log an error message if verbose is enabled
-   */
-  error(data: LogDataInput): void {
-    if (this.verbose) {
-      this.baseLogger.error(data);
-    }
-  }
-
-  /**
-   * Log a warning message if verbose is enabled, or inform where the logger
-   * beneath cannot warn.
-   *
-   * Same fallback PrefixedLogger makes, and for the same reason: `Logger`
-   * declares `warn`, but a JavaScript caller can hand over an object without
-   * it, and wrapping such a logger here produces one that HAS `warn` — so a
-   * call site with nothing to feature-detect calls it and reaches the one that
-   * is not there. A wrapper is never worse than what it wraps.
-   */
-  warn(data: LogDataInput): void {
-    if (this.verbose) {
-      if (typeof this.baseLogger.warn === "function") {
-        this.baseLogger.warn(data);
-
-        return;
-      }
-
-      this.baseLogger.info(data);
-    }
+  /** Passes everything on, or nothing. The whole of what this class does. */
+  protected override transform(data: LogDataInput): LogDataInput | null {
+    return this.verbose ? data : null;
   }
 }
 
 /**
  * Prefixed logger that adds task and stage information to log messages
+ *
+ * Fills the fields in and forwards. It does NOT render them: the sink at the
+ * bottom does that, once, which is the rule {@link ForwardingLogger} exists to
+ * hold. A caller's own `task` or `stage` wins over this logger's, so a nested
+ * prefix describes the outermost thing that named itself.
+ *
  * @internal This class is intended for internal use only
  */
-export class PrefixedLogger extends BaseLogger {
-  private baseLogger: Logger;
+export class PrefixedLogger extends ForwardingLogger {
   private prefix: { task?: string; stage?: string };
 
   /**
    * Create a new prefixed logger
    */
   constructor(baseLogger: Logger, prefix: { task?: string; stage?: string }) {
-    super();
-    this.baseLogger = baseLogger;
+    super(baseLogger);
     this.prefix = prefix;
   }
 
-  /**
-   * Log an informational message with prefix
-   */
-  info(data: LogDataInput): void {
-    this.baseLogger.info({
-      ...data,
-      task: data.task || this.prefix.task,
-      stage: data.stage || this.prefix.stage,
-    });
-  }
-
-  /**
-   * Log an error message with prefix
-   */
-  error(data: LogDataInput): void {
-    this.baseLogger.error({
-      ...data,
-      task: data.task || this.prefix.task,
-      stage: data.stage || this.prefix.stage,
-    });
-  }
-
-  /**
-   * Log a warning message with prefix, or inform where the logger beneath
-   * cannot warn.
-   *
-   * This class is where a missing `warn` actually bites. `Logger` declares the
-   * method, but a JavaScript caller can hand over an object without it, and
-   * wrapping such a logger here produces a child that HAS `warn` — so a call
-   * site with nothing to feature-detect calls it, and it reaches the one that
-   * is not there. Falling back here means a prefixed child is never worse than
-   * what it wraps.
-   */
-  warn(data: LogDataInput): void {
-    const prefixed = {
+  protected override transform(data: LogDataInput): LogDataInput {
+    return {
       ...data,
       task: data.task || this.prefix.task,
       stage: data.stage || this.prefix.stage,
     };
-
-    if (typeof this.baseLogger.warn === "function") {
-      this.baseLogger.warn(prefixed);
-
-      return;
-    }
-
-    this.baseLogger.info(prefixed);
   }
 }
 

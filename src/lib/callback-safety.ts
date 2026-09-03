@@ -1,5 +1,6 @@
 import {
   BaseLogger,
+  ForwardingLogger,
   buildLogPrefix,
   getErrorMessage,
   type LogDataInput,
@@ -214,33 +215,38 @@ export function makeSafeLogger(logger: Logger): Logger {
   return new SafeLogger(logger);
 }
 
-class SafeLogger extends BaseLogger {
+/**
+ * A forwarder that changes nothing about a line and everything about the call.
+ *
+ * Which is why it overrides `deliver` rather than `transform`: what it adds
+ * sits around handing the line on, not in the line. Inheriting the rest means
+ * the `warn` fallback is the same one every other forwarder uses instead of a
+ * third copy of it, and a throw from the feature detection itself is inside
+ * the guard rather than beside it.
+ */
+class SafeLogger extends ForwardingLogger {
   private readonly inner: Logger;
   private readonly escalate: (error: unknown) => void;
 
   constructor(inner: Logger) {
-    super();
+    super(inner);
     this.inner = inner;
     this.escalate = (error) =>
       inner.error({ message: ESCALATION_MESSAGE, error });
   }
 
-  info(data: LogDataInput): void {
-    logSafely(() => this.inner.info(data), this.escalate);
-  }
-
-  warn(data: LogDataInput): void {
+  protected override deliver(level: LogLevel, data: LogDataInput): void {
+    // No escalation for `error`: reporting a failed error through the same
+    // error method is the call that just failed, so that one goes out of band.
+    //
+    // super.deliver's return value is what carries an async logger's promise
+    // up to logSafely, which is the whole of how a rejection is caught rather
+    // than left to end the process. Nothing is returned from here: the promise
+    // has been taken care of, and handing it on would invite a second catch.
     logSafely(
-      () =>
-        typeof this.inner.warn === "function"
-          ? this.inner.warn(data)
-          : this.inner.info(data),
-      this.escalate,
+      () => super.deliver(level, data),
+      level === "error" ? null : this.escalate,
     );
-  }
-
-  error(data: LogDataInput): void {
-    logSafely(() => this.inner.error(data), null);
   }
 
   createPrefixed(prefix: { task?: string; stage?: string }): Logger {
