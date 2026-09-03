@@ -1777,67 +1777,6 @@ export interface DevDBConnectionResult {
   error: string | null;
 }
 
-/** How long a client is given to close before its socket is dropped. */
-const CLIENT_END_TIMEOUT_MS = 2000;
-
-/**
- * Closes a client, and drops its socket where closing does not return.
- *
- * pg's `end()` resolves when the connection emits `end`. A client whose
- * connect timed out has had its stream destroyed underneath it by pg's own
- * timeout handler, and against a peer that accepted the socket and then said
- * nothing that event may never arrive, so awaiting it is a wait with no end.
- * It is the same shape as the stop() that hangs in ./test-db-instance: an
- * event that already happened, or is never going to.
- *
- * Passing locally and hanging on CI is what that looks like from outside,
- * since which of the two it is comes down to how the socket happened to be
- * torn down. Both are covered by not waiting indefinitely for either.
- *
- * Destroying the stream is the other half and not optional. A live socket
- * handle keeps the event loop up, so a caller that already has its answer and
- * returns would never exit -- the same leaked-handle hang that
- * local-dev-db-server destroys its child's stdio to avoid.
- */
-async function endClientWithinBound(client: Client): Promise<void> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-
-  const abandoned = new Promise<"timed-out">((resolve) => {
-    timer = setTimeout(() => resolve("timed-out"), CLIENT_END_TIMEOUT_MS);
-  });
-
-  try {
-    const outcome = await Promise.race([
-      client.end().then(() => "ended" as const),
-      abandoned,
-    ]);
-
-    if (outcome === "ended") {
-      return;
-    }
-  } catch {
-    // Never opened, or already gone. Nothing to close, and the destroy below
-    // is harmless on a stream that is already destroyed.
-  } finally {
-    clearTimeout(timer);
-  }
-
-  // Reaching for pg's own socket, which it does not expose. Deliberate: the
-  // alternative is leaving a handle nothing will close, and an optional chain
-  // over an internal shape costs nothing when that shape changes.
-  const stream = (
-    client as unknown as {
-      connection?: { stream?: { destroy?: () => void } };
-    }
-  ).connection?.stream;
-
-  try {
-    stream?.destroy?.();
-  } catch {
-    // Best effort. There is nothing further to try.
-  }
-}
-
 /**
  * Asks a running PostgreSQL to identify itself.
  *
@@ -1920,9 +1859,11 @@ export async function identifyViaConnection(
       error: message,
     };
   } finally {
-    // Bounded, because this is the call that can never return. See
-    // endClientWithinBound.
-    await endClientWithinBound(client);
+    try {
+      await client.end();
+    } catch {
+      // Connection may never have opened.
+    }
   }
 }
 

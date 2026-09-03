@@ -70,4 +70,55 @@ jobs:
       # Bun's own default timeout is per test. The suite already passes
       # --timeout, and the job timeout above is what covers a wedged run.
       - name: Test
+        if: runner.os != 'Windows'
         run: bun test
+
+      # PostgreSQL refuses to start under an account with administrative
+      # privileges, by design and with no way to override it:
+      #
+      #   Execution of PostgreSQL by a user with administrative permissions is
+      #   not permitted.
+      #
+      # GitHub's Windows runner IS such an account, so every test that needs a
+      # database failed there while everything else passed. embedded-postgres
+      # has no answer either: its `createPostgresUser` option reads
+      # `process.getuid()`, which does not exist on Windows.
+      #
+      # So the suite is run as a local user made for it. Start-Process is what
+      # can launch under other credentials and still be waited on for an exit
+      # code, at the cost of not being able to share this console, hence the
+      # redirected output read back afterwards.
+      - name: Test (as a non-administrator)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = 'pgrunner'
+          $plain = 'Str@taline-CI-' + [guid]::NewGuid().ToString('N').Substring(0, 12)
+          $password = ConvertTo-SecureString $plain -AsPlainText -Force
+
+          New-LocalUser -Name $name -Password $password -AccountNeverExpires -PasswordNeverExpires | Out-Null
+          Add-LocalGroupMember -Group 'Users' -Member $name
+
+          # The workspace, and the Bun install that lives outside it. Both have
+          # to be readable and executable by an account that did not create
+          # them, and the data directories the suite makes must be writable.
+          icacls $env:GITHUB_WORKSPACE /grant "${name}:(OI)(CI)F" /T /Q | Out-Null
+          icacls $env:USERPROFILE\.bun /grant "${name}:(OI)(CI)RX" /T /Q | Out-Null
+
+          $bun = (Get-Command bun).Source
+          $credential = New-Object System.Management.Automation.PSCredential($name, $password)
+
+          $process = Start-Process -FilePath $bun -ArgumentList 'test' `
+            -Credential $credential `
+            -WorkingDirectory $env:GITHUB_WORKSPACE `
+            -RedirectStandardOutput bun-test-out.txt `
+            -RedirectStandardError bun-test-err.txt `
+            -Wait -PassThru
+
+          # Read back what could not be streamed. Both, and stdout first, since
+          # bun writes its results there and its diagnostics to stderr.
+          Get-Content bun-test-out.txt -ErrorAction SilentlyContinue
+          Get-Content bun-test-err.txt -ErrorAction SilentlyContinue
+
+          exit $process.ExitCode

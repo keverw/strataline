@@ -33,7 +33,7 @@ import {
   lstatSync,
 } from "fs";
 import { spawn, execFileSync } from "child_process";
-import { createServer } from "net";
+import { createServer, type Socket } from "net";
 import { findFreePort } from "./free-port";
 import type { LogDataInput, LogLevel, Logger } from "../logger";
 
@@ -3306,9 +3306,21 @@ describe("LocalDevDBServer", () => {
     // that only reads `code` calls it a response. The reason string built from
     // this goes into a refusal, and telling somebody a server answered on a
     // port sends them looking for one that is not there.
-    const silent = createServer(() => {
+    // Kept so they can be destroyed by hand below. `server.close()` stops the
+    // listener and then waits for every connection it accepted to end, and the
+    // one this test makes never does: pg's connect timeout destroys the CLIENT
+    // side, and a handler that says nothing never closes the server side. So
+    // closing waits forever, and the wait is in a `finally` after the
+    // assertions, which is a test that passes and then hangs.
+    //
+    // Bun 1.3 returned from close() without waiting, so this only ever showed
+    // up somewhere running 1.4.
+    const accepted: Socket[] = [];
+
+    const silent = createServer((socket) => {
       // Accept the socket and then say nothing, so the connection attempt can
       // only end in pg's timeout.
+      accepted.push(socket);
     });
 
     const silentPort = await findFreePort();
@@ -3328,6 +3340,11 @@ describe("LocalDevDBServer", () => {
       expect(result.dataDir).toBeNull();
       expect(result.startedAt).toBeNull();
     } finally {
+      // Before the close, which is what waits on them.
+      for (const socket of accepted) {
+        socket.destroy();
+      }
+
       await new Promise<void>((resolve) => silent.close(() => resolve()));
     }
   }, 30000);
@@ -4001,9 +4018,9 @@ describe("postgresOutputLevel", () => {
     expect(postgresOutputLevel(line("WARNING", "already a transaction"))).toBe(
       "warn",
     );
-    expect(postgresOutputLevel(line("ERROR", 'relation "x" does not exist'))).toBe(
-      "error",
-    );
+    expect(
+      postgresOutputLevel(line("ERROR", 'relation "x" does not exist')),
+    ).toBe("error");
     expect(postgresOutputLevel(line("FATAL", "files are incompatible"))).toBe(
       "error",
     );

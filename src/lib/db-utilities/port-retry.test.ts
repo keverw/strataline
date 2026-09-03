@@ -47,9 +47,15 @@ class CollidingDatabase extends TestDatabaseInstance {
 async function holdPort(
   port: number,
 ): Promise<{ close: () => Promise<void> } | null> {
+  // Anything that connects is dropped at once. A net.Server accepts a
+  // connection whether or not anything is listening for one, and close() then
+  // waits for it, so a server that merely holds a port can still be a close
+  // that never returns. Nothing is expected to connect here, since PostgreSQL
+  // fails at bind rather than reaching the listener, but the trap is cheap to
+  // stay out of.
   const listen = (host: string): Promise<Server | null> =>
     new Promise((resolve) => {
-      const server = createServer();
+      const server = createServer((socket) => socket.destroy());
 
       server.once("error", () => resolve(null));
       server.listen(port, host, () => resolve(server));
