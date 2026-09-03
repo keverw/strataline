@@ -49,52 +49,33 @@ class CollidingDatabase extends TestDatabaseInstance {
 }
 
 /**
- * Holds a port against PostgreSQL on both address families.
+ * Holds a port against PostgreSQL.
  *
- * Both matters. EmbeddedPostgres does not pin `listen_addresses`, so the
- * postmaster tries `localhost`, which resolves to both. Holding only one leaves
- * it able to start on the other with nothing worse than a warning, and the
- * failure this is about never happens.
- *
- * Returns null where IPv6 is unavailable, which some CI networks are.
+ * One address family is enough, and that is a fact about the code under test
+ * rather than a simplification. TestDatabaseInstance pins its clusters to
+ * `listen_addresses=127.0.0.1`, so holding 127.0.0.1 is holding everything the
+ * postmaster will try. This used to have to take ::1 as well, because an
+ * unpinned cluster fell back to the family that was free and the failure never
+ * happened — and it returned null where IPv6 was unavailable, which skipped
+ * both tests below on such a host and reported green with the retry loop
+ * unexecuted. Neither is true any more.
  */
-async function holdPort(
-  port: number,
-): Promise<{ close: () => Promise<void> } | null> {
+async function holdPort(port: number): Promise<{ close: () => Promise<void> }> {
   // Anything that connects is dropped at once. A net.Server accepts a
   // connection whether or not anything is listening for one, and close() then
   // waits for it, so a server that merely holds a port can still be a close
   // that never returns. Nothing is expected to connect here, since PostgreSQL
   // fails at bind rather than reaching the listener, but the trap is cheap to
   // stay out of.
-  const listen = (host: string): Promise<Server | null> =>
-    new Promise((resolve) => {
-      const server = createServer((socket) => socket.destroy());
+  const server = await new Promise<Server>((resolve, reject) => {
+    const listener = createServer((socket) => socket.destroy());
 
-      server.once("error", () => resolve(null));
-      server.listen(port, host, () => resolve(server));
-    });
-
-  const v4 = await listen("127.0.0.1");
-  const v6 = await listen("::1");
-
-  if (!v4 || !v6) {
-    await Promise.all(
-      [v4, v6].map(
-        (s) =>
-          new Promise<void>((done) => (s ? s.close(() => done()) : done())),
-      ),
-    );
-
-    return null;
-  }
+    listener.once("error", reject);
+    listener.listen(port, "127.0.0.1", () => resolve(listener));
+  });
 
   return {
-    close: async () => {
-      await Promise.all(
-        [v4, v6].map((s) => new Promise<void>((done) => s.close(() => done()))),
-      );
-    },
+    close: () => new Promise<void>((done) => server.close(() => done())),
   };
 }
 
@@ -113,12 +94,6 @@ describe("port retry", () => {
     const taken = await findFreePort();
 
     held = await holdPort(taken);
-
-    if (!held) {
-      // No IPv6 on this host, so the postmaster would start on the family that
-      // is free and the race being tested cannot be staged.
-      return;
-    }
 
     db = new CollidingDatabase(taken);
 
@@ -156,10 +131,6 @@ describe("port retry", () => {
     const taken = await findFreePort();
 
     held = await holdPort(taken);
-
-    if (!held) {
-      return;
-    }
 
     const explicit = new TestDatabaseInstance({ port: taken });
 

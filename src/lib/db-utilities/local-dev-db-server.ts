@@ -26,6 +26,7 @@ import {
   type Logger,
 } from "../logger";
 import { PostgresBinaries, getBinaries } from "./pg-bin-helper";
+import { ipcExhaustionHint, postgresOutputLevel } from "./postgres-output";
 import {
   buildDevDBPidRecord,
   dataDirFromCommand,
@@ -41,6 +42,12 @@ import {
 // Re-exported so consumers can probe for a running server without reaching
 // into internal paths. See ./pid-file for the verification rules.
 export * from "./pid-file";
+
+// Re-exported from where it moved to, so this stays the path it has always
+// been imported from. TestDatabaseInstance reads the same severities, and
+// importing this module for one pure function would take a whole process
+// lifecycle manager into a bundle with no use for one.
+export { postgresOutputLevel } from "./postgres-output";
 
 /**
  * Three rules run through this file, stated once here rather than at each of
@@ -152,89 +159,6 @@ const DEV_DB_LOG_TAGS = {
 type DevDBLogTag = keyof typeof DEV_DB_LOG_TAGS;
 
 /**
- * PostgreSQL's own severity words, and what each is to a `Logger`.
- *
- * Only the ones that are not ordinary. Everything else PostgreSQL emits —
- * LOG, NOTICE, INFO, DEBUG, and the DETAIL/HINT/CONTEXT/STATEMENT lines that
- * accompany a message — is routine output and stays `info`, which is where
- * every line used to go regardless.
- */
-const POSTGRES_SEVERITIES: Readonly<Record<string, LogLevel>> = {
-  PANIC: "error",
-  FATAL: "error",
-  ERROR: "error",
-  WARNING: "warn",
-};
-
-/**
- * Every severity word PostgreSQL can print, whether or not it raises the
- * level. The set is the one `log_min_messages` accepts — DEBUG5 through
- * DEBUG1, INFO, NOTICE, WARNING, ERROR, LOG, FATAL, PANIC — plus the fields
- * elog prints alongside a message.
- *
- * English, which is not an assumption so much as something this class
- * arranges: initializeDataDirectory runs initdb with `--locale=C`, which
- * writes `lc_messages = C` into the cluster, and the bundled PostgreSQL ships
- * no translation catalogs to render them any other way. A cluster created
- * elsewhere under a different lc_messages could print a translated severity,
- * and the scan would not recognize it — that chunk falls back to `info`,
- * which is where every line used to go. Matching all of them and then looking the match up is what stops the
- * scan reading a word out of the middle of a message: `STATEMENT:  SELECT ...`
- * is matched by STATEMENT, so an `ERROR:` quoted inside that statement is
- * never reached.
- */
-const POSTGRES_SEVERITY_PATTERN =
-  /(?:^|\s)(PANIC|FATAL|ERROR|WARNING|LOG|NOTICE|INFO|DEBUG[1-5]?|DETAIL|HINT|CONTEXT|STATEMENT|QUERY|LOCATION):/;
-
-/**
- * The level PostgreSQL's output is asking to be logged at.
- *
- * PostgreSQL says how bad a line is, in the line. It writes
- * `2026-09-02 19:32:50.954 MDT [64506] FATAL:  ...`, where the leading part is
- * `log_line_prefix` and the severity follows it, so the word is neither at the
- * start of the string nor at a fixed offset — the prefix is configurable and
- * carries a timestamp whose length varies with the zone. Hence a scan for the
- * word rather than a parse of the line.
- *
- * The highest severity in the chunk wins, and the whole chunk is logged at it.
- * A FATAL is followed by its own DETAIL and HINT lines, and splitting a
- * message up to give each line its own level would take the explanation away
- * from the thing it explains.
- *
- * Anything unrecognized is `info`, which is what every line used to get. A
- * chunk this cannot read is therefore no worse off than before, and that is
- * the direction to be wrong in: this decides whether output is shown when the
- * caller has asked for quiet, so a false ERROR is noise nobody asked for while
- * a missed one is the status quo.
- *
- * @internal Exported so the scan can be tested against real PostgreSQL output
- * without having to provoke a server into producing each severity.
- */
-export function postgresOutputLevel(text: string): LogLevel {
-  let level: LogLevel = "info";
-
-  for (const line of text.split(/\r?\n/)) {
-    const match = POSTGRES_SEVERITY_PATTERN.exec(line);
-
-    if (!match) {
-      continue;
-    }
-
-    const severity = POSTGRES_SEVERITIES[match[1]];
-
-    if (severity === "error") {
-      return "error";
-    }
-
-    if (severity === "warn") {
-      level = "warn";
-    }
-  }
-
-  return level;
-}
-
-/**
  * Reports that the server exited without being asked to, and why.
  *
  * A notification, not a decision. This library never ends your process, so
@@ -339,35 +263,6 @@ class DevDBConsoleLogger extends BaseLogger {
  */
 function postmasterRecordIdentity(raw: string): string {
   return raw.split("\n").slice(0, 7).join("\n");
-}
-
-/**
- * Names the cause when PostgreSQL could not get its SysV IPC objects.
- *
- * Worth a sentence of our own because PostgreSQL's wording sends the reader
- * somewhere else entirely. Both failures read "No space left on device", which
- * is a full disk everywhere else it appears, and the actual cause is a
- * per-machine kernel limit on shared memory segments or semaphore sets. macOS
- * ships low defaults for both, and PostgreSQL releases neither on a hard kill,
- * so a suite that force-kills servers accumulates them until an unrelated
- * start fails.
- *
- * PostgreSQL's own HINT does say this, and is carried through with the rest of
- * its output. What it cannot say is that leaked objects, rather than a limit
- * that is genuinely too low, are the usual reason a developer machine reaches
- * one. So the remedy is spelled out in terms anyone can act on rather than
- * pointing at a script only this repository has.
- */
-function ipcExhaustionHint(output: string): string {
-  if (!/could not create (shared memory segment|semaphores)/i.test(output)) {
-    return "";
-  }
-
-  return (
-    "\n\nThis is a kernel limit on SysV IPC objects rather than disk space. Leaked objects are the usual reason it is reached, " +
-    "since PostgreSQL frees them on a clean shutdown and not on a hard kill, so they accumulate across crashed or force-killed servers. " +
-    "List them with `ipcs -m` and `ipcs -s`, and remove the abandoned ones with `ipcrm`."
-  );
 }
 
 async function fileExists(path: string): Promise<boolean> {

@@ -15,12 +15,25 @@ import EmbeddedPostgres from "embedded-postgres";
 import * as tmp from "tmp";
 import { findFreePort } from "./free-port";
 import { isProcessAlive, readPostmasterPidFile } from "./pid-file";
+import { ipcExhaustionHint, postgresOutputLevel } from "./postgres-output";
 import * as fs from "fs";
 
 // Default configuration for test database
 const DEFAULT_DB_USER = "test_user";
 const DEFAULT_DB_PASSWORD = "test_password";
 const DEFAULT_DB_NAME = "test_database";
+
+/**
+ * The one address this cluster listens on, and the only one to dial it by.
+ *
+ * A literal rather than "localhost", which is a NAME and can resolve to ::1.
+ * See the pinned `listen_addresses` in
+ * {@link TestDatabaseInstance.buildEmbeddedPostgres}: the server is bound to
+ * IPv4 alone, so every client side has to say so too. Named once because
+ * "every client side" turned out to include one that is easy to miss, the
+ * connection embedded-postgres opens for `createDatabase()`.
+ */
+const LOOPBACK_HOST = "127.0.0.1";
 
 /**
  * Logger function type for TestDatabaseInstance
@@ -55,17 +68,19 @@ type TestDBLogTag = keyof typeof TEST_DB_LOG_TAGS;
  * is the mistake this encodes against. PostgreSQL reports a taken port over
  * several lines and the bind line is never the last of them:
  *
- *   LOG:  could not bind IPv6 address "::1": Address already in use
- *   WARNING:  could not create listen socket for "localhost"
+ *   LOG:  could not bind IPv4 address "127.0.0.1": Address already in use
+ *   WARNING:  could not create listen socket for "127.0.0.1"
  *   FATAL:  could not create any TCP/IP sockets
  *   LOG:  database system is shut down
  *
  * Testing only the final chunk tests the shutdown notice, which matches
  * nothing, so the retry never ran at all.
  *
- * The socket-creation lines are matched as well as the bind line because a
- * host with IPv6 disabled, or one where only one address family is taken,
- * reaches the same failure by a different sentence.
+ * The socket-creation lines are matched as well as the bind line because the
+ * wording varies with what was taken and with which address families exist.
+ * The IPv6 spellings stay matched too: `listen_addresses` is pinned to IPv4
+ * for the clusters this starts, but the same reader is handed the output of
+ * ones started elsewhere.
  *
  * @internal Exported so the match can be checked against real PostgreSQL
  * output without provoking a port collision.
@@ -257,12 +272,13 @@ export class TestDatabaseInstance {
    * @param type Message type
    * @param message Message content
    */
-  private log(type: TestDBLogTag, message: string): void {
+  private log(type: TestDBLogTag, message: string, override?: LogLevel): void {
     if (!this.logger) {
       return;
     }
 
-    const [level, source] = TEST_DB_LOG_TAGS[type];
+    const [defaultLevel, source] = TEST_DB_LOG_TAGS[type];
+    const level = override ?? defaultLevel;
 
     this.logger[level](source ? { source, message } : { message });
   }
@@ -438,12 +454,35 @@ export class TestDatabaseInstance {
   private static readonly PORT_RETRIES = 3;
 
   /**
+   * How many characters of PostgreSQL's output to keep for a diagnosis.
+   *
+   * Counted in characters rather than in lines, which is where this parts
+   * company with LocalDevDBServer's equivalent, and deliberately. That buffer
+   * is only ever reported; this one is READ — {@link failedToBind} runs a
+   * regex over it to decide whether a lost port is worth retrying — so the
+   * bytes have to stay exactly as PostgreSQL wrote them. Splitting chunks into
+   * trimmed lines and rejoining them is not the identity function: a message
+   * flushed across two chunks, `could not b` then `ind IPv4 address ...`,
+   * comes back with a newline through the middle of the word and matches
+   * nothing, and the retry that buffer exists for never fires.
+   *
+   * Generous, because a bind failure is a few hundred characters and the only
+   * thing this bound has to prevent is a running database's whole log.
+   */
+  private static readonly ATTEMPT_OUTPUT_CHARS = 8000;
+
+  /**
    * Everything PostgreSQL wrote during the current start attempt.
    *
    * `EmbeddedPostgres.start()` rejects with no value at all, so the reason a
    * start failed exists nowhere except the output it logged on the way down,
    * and that output arrives in several chunks. Reset per attempt, so a retry
    * is judged on its own failure rather than the previous one's.
+   *
+   * Bounded, for the reason LocalDevDBServer bounds its own: `onLog` keeps
+   * firing for the life of the server, and nothing resets this once the start
+   * has succeeded, so an unbounded one accumulates a running database's entire
+   * log in memory for a diagnosis nobody is going to ask for.
    */
   private attemptOutput = "";
 
@@ -476,6 +515,22 @@ export class TestDatabaseInstance {
       // throwaway DB (just not locale-aware sorting, so don't "fix" this to
       // en_US).
       initdbFlags: ["--locale=C", "--encoding=UTF8"],
+      // IPv4 only, the same pin LocalDevDBServer applies and for the same
+      // reason. embedded-postgres passes no `listen_addresses`, so the cluster
+      // takes PostgreSQL's default of `localhost`, which binds BOTH 127.0.0.1
+      // and ::1 -- and on some hosts the per-connection backends fail to set
+      // TCP_NODELAY on an IPv6 socket and log a FATAL, sometimes crashing.
+      // Binding one family also halves what a start has to acquire: a port
+      // free on IPv4 and taken on ::1 currently fails the whole start, which
+      // is the bind race free-port.ts and the retry below exist to narrow.
+      //
+      // Every client side is pinned to match: the pool, getCredentials(), and
+      // createTestDatabase(), which exists because embedded-postgres would
+      // otherwise dial `localhost` for that one step. A server listening only
+      // on 127.0.0.1 and a client resolving `localhost` to ::1 is a connection
+      // refused, so pinning one end without the other trades a rare failure
+      // for a certain one.
+      postgresFlags: ["-c", `listen_addresses=${LOOPBACK_HOST}`],
       onLog: (message: string) => {
         // Appended, not replaced. PostgreSQL writes a failed bind across
         // several chunks and the bind line is never the last of them: the real
@@ -484,8 +539,11 @@ export class TestDatabaseInstance {
         // system is shut down`. Keeping only the last chunk therefore tested
         // the shutdown notice, matched nothing, and made the retry below
         // unreachable.
-        this.attemptOutput += message;
-        this.log("pg", message);
+        this.noteAttemptOutput(message);
+        // PostgreSQL says how bad the line is, in the line. Reading it is what
+        // keeps `pgVerbose: false` a filter on routine output rather than one
+        // that also hides the FATAL saying why the server would not start.
+        this.log("pg", message, postgresOutputLevel(message));
       },
     });
   }
@@ -503,6 +561,23 @@ export class TestDatabaseInstance {
    */
   private failedToBind(): boolean {
     return isBindFailure(this.attemptOutput);
+  }
+
+  /**
+   * Records what PostgreSQL wrote, keeping only the end of it.
+   *
+   * Appended verbatim and trimmed only at the front, so what the matchers see
+   * is the text PostgreSQL emitted rather than a reassembly of it. See
+   * {@link TestDatabaseInstance.ATTEMPT_OUTPUT_CHARS}.
+   */
+  private noteAttemptOutput(chunk: string): void {
+    this.attemptOutput += chunk;
+
+    const cap = TestDatabaseInstance.ATTEMPT_OUTPUT_CHARS;
+
+    if (this.attemptOutput.length > cap) {
+      this.attemptOutput = this.attemptOutput.slice(-cap);
+    }
   }
 
   /**
@@ -529,9 +604,35 @@ export class TestDatabaseInstance {
 
     return new Error(
       detail
-        ? `PostgreSQL failed to start. PostgreSQL said:\n${detail}`
+        ? `PostgreSQL failed to start. PostgreSQL said:\n${detail}${ipcExhaustionHint(detail)}`
         : "PostgreSQL failed to start, and it wrote no output explaining why.",
     );
+  }
+
+  /**
+   * Creates the test database over the pinned address.
+   *
+   * Deliberately not `EmbeddedPostgres.createDatabase()`, which builds its
+   * client through `getPgClient()` and takes that method's default host of
+   * `localhost`. Against a cluster bound to 127.0.0.1 alone, a host whose
+   * resolver answers ::1 first would fail the start here with ECONNREFUSED,
+   * on a step that worked before the pin only because the cluster happened to
+   * be listening on both families. `getPgClient` takes the host as an
+   * argument, so the same work is done a line lower down and reaches the
+   * address the server is actually on.
+   */
+  private async createTestDatabase(db: RetargetablePostgres): Promise<void> {
+    const client = db.getPgClient("postgres", LOOPBACK_HOST);
+
+    await client.connect();
+
+    try {
+      await client.query(
+        `CREATE DATABASE ${client.escapeIdentifier(this.databaseName)}`,
+      );
+    } finally {
+      await client.end();
+    }
   }
 
   /**
@@ -681,7 +782,7 @@ export class TestDatabaseInstance {
         this.log("info", "PostgreSQL server started successfully");
 
         // Create the test database
-        await this.db.createDatabase(this.databaseName);
+        await this.createTestDatabase(this.db);
         this.log("info", `Created test database: ${this.databaseName}`);
       } catch (error) {
         this.log(
@@ -693,7 +794,9 @@ export class TestDatabaseInstance {
 
       // Create a connection pool to the test database
       this.pool = new Pool({
-        host: "localhost",
+        // Matches the pinned `listen_addresses` above rather than resolving
+        // `localhost`, which can answer ::1 where nothing is listening.
+        host: LOOPBACK_HOST,
         port: this.port,
         database: this.databaseName,
         user: this.user,
@@ -768,7 +871,11 @@ export class TestDatabaseInstance {
     }
 
     return {
-      host: "localhost",
+      // The address the server is actually listening on. See the pinned
+      // `listen_addresses` in buildEmbeddedPostgres: handing back `localhost`
+      // would give a caller a name that can resolve to ::1, where this cluster
+      // is deliberately not bound.
+      host: LOOPBACK_HOST,
       port: this.port,
       database: this.databaseName,
       user: this.user,

@@ -1272,6 +1272,8 @@ const pool = testDb.getPool();
 
 // Or get connection credentials for direct connection. Returns
 // { host, port, database, user, password }, or null until start() has completed.
+// `host` is 127.0.0.1: the cluster listens on IPv4 only, so a name that can
+// resolve to ::1 is not what you want to hand to a client.
 const credentials = testDb.getCredentials();
 
 // Reset the database (drops all tables in the `public` schema and reapplies
@@ -1882,7 +1884,10 @@ Once the dev server is running, configure your application to connect to it:
 import { Pool } from "pg";
 
 const pool = new Pool({
-  host: "localhost",
+  // 127.0.0.1 rather than "localhost", which can resolve to ::1. The dev
+  // server listens on IPv4 only, deliberately: on some hosts PostgreSQL's
+  // per-connection backends fail to set TCP_NODELAY on an IPv6 socket.
+  host: "127.0.0.1",
   port: 5433, // Match your dev server port
   user: "myapp_user", // Match your dev server user
   password: "myapp_pass", // Match your dev server password
@@ -1895,7 +1900,7 @@ Or use a connection string:
 ```typescript
 const pool = new Pool({
   connectionString:
-    "postgresql://myapp_user:myapp_pass@localhost:5433/myapp_dev",
+    "postgresql://myapp_user:myapp_pass@127.0.0.1:5433/myapp_dev",
 });
 ```
 
