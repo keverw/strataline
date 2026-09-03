@@ -36,6 +36,11 @@ import { spawn, execFileSync } from "child_process";
 import { createServer, type Socket } from "net";
 import { findFreePort } from "./free-port";
 import {
+  PostgresLineAssembler,
+  PostgresOutputReader,
+  postgresSeverity,
+} from "./postgres-output";
+import {
   createConsoleLogger,
   type LogDataInput,
   type LogLevel,
@@ -4251,6 +4256,222 @@ describe("postgresOutputLevel", () => {
       "info",
     );
     expect(postgresOutputLevel("")).toBe("info");
+  });
+});
+
+describe("postgresSeverity", () => {
+  const line = (severity: string, message: string) =>
+    `2026-09-02 19:32:50.954 MDT [64506] ${severity}:  ${message}`;
+
+  it("separates a routine info from having stated nothing", () => {
+    // The distinction postgresOutputLevel cannot make, and the whole reason
+    // this exists: both answer `info` there, and only one of them should let
+    // a previous level carry across.
+    expect(postgresSeverity(line("LOG", "database system is ready"))).toBe(
+      "info",
+    );
+    expect(postgresSeverity("Running: /path/to/initdb")).toBeNull();
+    expect(postgresSeverity("")).toBeNull();
+  });
+
+  it("reports no severity for the fields of the message above", () => {
+    // DETAIL and HINT are not messages, they are the rest of one. Read as
+    // fresh routine lines they log at info, which is what a `{ pg: false }`
+    // filter drops -- so the sentence explaining a FATAL disappears while the
+    // FATAL itself is shown.
+    expect(
+      postgresSeverity(line("DETAIL", "Failed system call was semget().")),
+    ).toBeNull();
+    expect(
+      postgresSeverity(line("HINT", "You may need to initdb.")),
+    ).toBeNull();
+    expect(
+      postgresSeverity(line("STATEMENT", "SELECT 'ERROR: not really'")),
+    ).toBeNull();
+  });
+
+  it("keeps the highest severity when a group holds several", () => {
+    const group = [
+      line("LOG", 'could not bind IPv4 address "127.0.0.1"'),
+      line("WARNING", "could not create listen socket"),
+    ].join("\n");
+
+    // The routine LOG must not overwrite the WARNING that followed it.
+    expect(postgresSeverity(group)).toBe("warn");
+    expect(
+      postgresSeverity([group, line("FATAL", "no sockets")].join("\n")),
+    ).toBe("error");
+  });
+});
+
+describe("PostgresLineAssembler", () => {
+  it("holds a chunk back until its line is whole", () => {
+    const assembler = new PostgresLineAssembler();
+
+    // The tear this exists for: neither half is a severity word, so a scan of
+    // either one reads the FATAL as routine output.
+    expect(assembler.take("2026-09-02 19:32:50.954 MDT [64506] FAT")).toBe("");
+    expect(assembler.take("AL:  could not create semaphores\n")).toBe(
+      "2026-09-02 19:32:50.954 MDT [64506] FATAL:  could not create semaphores\n",
+    );
+  });
+
+  it("emits the complete lines and keeps only the partial one", () => {
+    const assembler = new PostgresLineAssembler();
+
+    expect(assembler.take("LOG:  one\nLOG:  two\nLOG:  thr")).toBe(
+      "LOG:  one\nLOG:  two\n",
+    );
+    expect(assembler.take("ee\n")).toBe("LOG:  three\n");
+  });
+
+  it("gives up what it is holding when the stream ends", () => {
+    const assembler = new PostgresLineAssembler();
+
+    // A postmaster's last write is the reason it is exiting and need not end
+    // in a newline, so holding it forever loses more than reading it early.
+    assembler.take("FATAL:  could not create any TCP/IP sockets");
+
+    expect(assembler.flush()).toBe(
+      "FATAL:  could not create any TCP/IP sockets",
+    );
+    expect(assembler.flush()).toBe("");
+  });
+});
+
+describe("PostgresOutputReader", () => {
+  const line = (severity: string, message: string) =>
+    `2026-09-02 19:32:50.954 MDT [64506] ${severity}:  ${message}`;
+
+  it("reads a severity torn across two chunks", () => {
+    const reader = new PostgresOutputReader();
+
+    // Scanned per chunk, neither half contains a severity word, so both go at
+    // `info` -- and `info` from source `pg` is exactly what
+    // createConsoleLogger({ pg: false }) drops.
+    expect(reader.take("2026-09-02 19:32:50.954 MDT [64506] FAT")).toEqual([]);
+    expect(
+      reader.take("AL:  database files are incompatible with server\n"),
+    ).toEqual([
+      {
+        text: line("FATAL", "database files are incompatible with server"),
+        level: "error",
+      },
+    ]);
+  });
+
+  it("splits a chunk at each message rather than levelling it as one", () => {
+    const reader = new PostgresOutputReader();
+
+    // The whole reason the boundary is taken from PostgreSQL's structure and
+    // not from the pipe's. Levelled as one unit the routine LOG goes out at
+    // `error` with the FATAL, and which lines shared a level would depend on
+    // where the kernel happened to flush.
+    expect(
+      reader.take(
+        [
+          line("LOG", 'could not bind IPv4 address "127.0.0.1"'),
+          line("FATAL", "could not create any TCP/IP sockets"),
+          "",
+        ].join("\n"),
+      ),
+    ).toEqual([
+      {
+        text: line("LOG", 'could not bind IPv4 address "127.0.0.1"'),
+        level: "info",
+      },
+      {
+        text: line("FATAL", "could not create any TCP/IP sockets"),
+        level: "error",
+      },
+    ]);
+  });
+
+  it("keeps a message's own DETAIL and HINT with it", () => {
+    const reader = new PostgresOutputReader();
+
+    // Splitting per LINE would get the test above and lose this one: the
+    // fields state no severity, so they belong to the message they explain
+    // rather than standing alone at `info`.
+    const detail = line("DETAIL", "Failed system call was semget().");
+    const hint = line("HINT", "This does not mean you are out of disk space.");
+
+    expect(
+      reader.take(
+        [line("FATAL", "could not create semaphores"), detail, hint, ""].join(
+          "\n",
+        ),
+      ),
+    ).toEqual([
+      {
+        text: [line("FATAL", "could not create semaphores"), detail, hint].join(
+          "\n",
+        ),
+        level: "error",
+      },
+    ]);
+  });
+
+  it("carries the level across a message the pipe broke in half", () => {
+    const reader = new PostgresOutputReader();
+
+    expect(
+      reader.take(line("FATAL", "could not create semaphores") + "\n"),
+    ).toEqual([
+      { text: line("FATAL", "could not create semaphores"), level: "error" },
+    ]);
+
+    // The continuation states no severity of its own. Read alone it is `info`,
+    // which filters the explanation away from the failure it explains.
+    const continuation = [
+      line("DETAIL", "Failed system call was semget()."),
+      "",
+      line("HINT", "This does not mean you are out of disk space."),
+    ];
+
+    expect(reader.take(continuation.join("\n") + "\n")).toEqual([
+      { text: continuation.join("\n"), level: "error" },
+    ]);
+  });
+
+  it("stops carrying at the next message", () => {
+    const reader = new PostgresOutputReader();
+
+    reader.take(line("FATAL", "could not create any TCP/IP sockets") + "\n");
+
+    // A primary severity word ends the previous message's reach, so one FATAL
+    // does not make every routine line that follows it an error.
+    expect(
+      reader.take(line("LOG", "database system is shut down") + "\n"),
+    ).toEqual([
+      { text: line("LOG", "database system is shut down"), level: "info" },
+    ]);
+  });
+
+  it("stops carrying a level once the stream has ended", () => {
+    const reader = new PostgresOutputReader();
+
+    reader.take(line("FATAL", "could not create any TCP/IP sockets") + "\n");
+    reader.flush();
+
+    // Both surfaces keep one reader for longer than one postmaster: a dev
+    // server can be started again on the same instance, and a test database
+    // that loses its port retries against a new child. A level carried across
+    // that boundary puts the dead server's FATAL on the first unrecognized
+    // line the live one writes.
+    expect(reader.take("Running: /path/to/initdb -D /tmp/pgdata\n")).toEqual([
+      { text: "Running: /path/to/initdb -D /tmp/pgdata", level: "info" },
+    ]);
+  });
+
+  it("says nothing for a chunk that completes nothing", () => {
+    const reader = new PostgresOutputReader();
+
+    expect(reader.take("LOG:  partial")).toEqual([]);
+    expect(reader.take("\n\n")).toEqual([
+      { text: "LOG:  partial", level: "info" },
+    ]);
+    expect(reader.flush()).toEqual([]);
   });
 });
 

@@ -15,7 +15,8 @@ import { isProcessAlive, readPostmasterPidFile } from "./pid-file";
 import {
   ipcExhaustionHint,
   PostgresOutputBuffer,
-  postgresOutputLevel,
+  PostgresOutputReader,
+  type PostgresOutputRead,
 } from "./postgres-output";
 import * as fs from "fs";
 
@@ -413,6 +414,45 @@ export class TestDatabaseInstance {
   private readonly attemptOutput = new PostgresOutputBuffer();
 
   /**
+   * The same output again, held back at a line that has not finished arriving.
+   *
+   * One assembler rather than the two LocalDevDBServer keeps, because there is
+   * only one stream to keep them for: embedded-postgres reads the postmaster's
+   * stderr alone, and hands every chunk of it to a single `onLog`.
+   *
+   * See {@link PostgresOutputReader} for why what is logged is assembled
+   * while {@link attemptOutput} above stays exactly as it arrived.
+   */
+  private readonly attemptLines = new PostgresOutputReader();
+
+  /**
+   * Puts a whole message through the logger at the level it asks for.
+   *
+   * PostgreSQL says how bad the line is, in the line. Reading it is what keeps
+   * `pgVerbose: false` a filter on routine output rather than one that also
+   * hides the FATAL saying why the server would not start. Which message the
+   * level belongs to, when a chunk broke one in half, is
+   * PostgresOutputReader's.
+   */
+  private logServerOutput(reads: PostgresOutputRead[]): void {
+    for (const read of reads) {
+      this.log("pg", read.text, read.level);
+    }
+  }
+
+  /**
+   * Logs a line the assembler is still holding, once nothing more is coming.
+   *
+   * A postmaster that refuses to start writes the reason and exits, and
+   * nothing promises that last write ended in a newline. Called where an
+   * attempt has settled rather than on a stream event, since the stream
+   * belongs to embedded-postgres and this never sees it end.
+   */
+  private flushServerOutput(): void {
+    this.logServerOutput(this.attemptLines.flush());
+  }
+
+  /**
    * Builds the embedded server for one port, against this run's directory.
    *
    * Once per start, never per attempt. A retry rebinds the port on this
@@ -479,10 +519,14 @@ export class TestDatabaseInstance {
         // the shutdown notice, matched nothing, and made the retry below
         // unreachable.
         this.attemptOutput.append(message);
-        // PostgreSQL says how bad the line is, in the line. Reading it is what
-        // keeps `pgVerbose: false` a filter on routine output rather than one
-        // that also hides the FATAL saying why the server would not start.
-        this.log("pg", message, postgresOutputLevel(message));
+        // Whole lines only for the part that is LOGGED, while the buffer above
+        // keeps the bytes as they arrived. embedded-postgres hands on whatever
+        // `chunk.toString('utf-8')` produced, so a severity word can arrive as
+        // `FAT` and then `AL:  ...` — and neither half reads as a severity, so
+        // the FATAL saying why the server would not start is logged at `info`
+        // and a logger built with `{ pg: false }` drops it. See
+        // PostgresOutputReader.
+        this.logServerOutput(this.attemptLines.take(message));
       },
     });
   }
@@ -600,6 +644,12 @@ export class TestDatabaseInstance {
 
         return;
       } catch (error) {
+        // The postmaster is gone by the time start() rejects, so a line still
+        // held is the last thing it wrote — which on this path is the reason
+        // it would not start. Ahead of every exit below, since both of them
+        // leave: one throws and the other loops on to clear the buffer.
+        this.flushServerOutput();
+
         const canRetry =
           this.portChosenAutomatically &&
           attempt < TestDatabaseInstance.PORT_RETRIES &&
@@ -943,6 +993,11 @@ export class TestDatabaseInstance {
       }
       this.db = undefined;
       this.migrationsApplied = false;
+
+      // Nothing more will arrive through `onLog` now that the server this
+      // built is let go, so anything the assembler is still holding is the
+      // last of what it wrote and has nowhere later to be logged from.
+      this.flushServerOutput();
     }
 
     if (this.tempDir && !serverStopped) {

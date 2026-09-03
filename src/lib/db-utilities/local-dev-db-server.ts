@@ -22,7 +22,8 @@ import { PostgresBinaries, getBinaries } from "./pg-bin-helper";
 import {
   ipcExhaustionHint,
   PostgresOutputBuffer,
-  postgresOutputLevel,
+  PostgresOutputReader,
+  type PostgresOutputRead,
 } from "./postgres-output";
 import {
   buildDevDBPidRecord,
@@ -365,6 +366,15 @@ export class LocalDevDBServer {
   // it counts characters rather than lines is written down.
   private readonly serverOutput = new PostgresOutputBuffer();
 
+  // One per pipe, because they are two streams and a half-written line on one
+  // is not the start of the next line on the other. See PostgresOutputReader,
+  // which is also where the reason the LOGGED text is assembled while
+  // serverOutput above stays verbatim is written down.
+  private readonly serverLines = {
+    stdout: new PostgresOutputReader(),
+    stderr: new PostgresOutputReader(),
+  };
+
   // The child a failed start left behind because it outlived even SIGKILL.
   // Held as the reference rather than a flag so it needs no clearing: it only
   // means anything while pgProcess is still that same child, and every other
@@ -577,6 +587,10 @@ export class LocalDevDBServer {
       // lifecycle settles `closed` from the child's `exit` rather than its
       // `close`, so waiting on that says nothing about the pipes and cannot be
       // what decides this.
+      //
+      // Dropping them is also this stream ending, and it ends without an
+      // "end", so the last line PostgreSQL wrote goes out first or not at all.
+      this.flushServerOutput();
       proc.stdout?.destroy();
       proc.stderr?.destroy();
       proc.stdin?.destroy();
@@ -2533,19 +2547,64 @@ export class LocalDevDBServer {
    * trimmed, since that is one message to a person; what is kept is not, since
    * ipcExhaustionHint reads it. See PostgresOutputBuffer.
    */
-  private noteServerOutput(chunk: string): void {
+  private noteServerOutput(
+    chunk: string,
+    stream: keyof typeof this.serverLines,
+  ): void {
+    // Verbatim, because ipcExhaustionHint and withServerOutput read this and a
+    // line structure imposed here is one the pipe did not have.
     this.serverOutput.append(chunk);
 
-    const text = chunk.trim();
+    // Whole lines only, because the severity is read out of what comes out and
+    // a severity word torn across a chunk boundary reads as no severity at
+    // all. See PostgresOutputReader.
+    this.logServerOutput(this.serverLines[stream].take(chunk));
+  }
 
-    if (!text) {
-      return;
+  /**
+   * Logs a line one stream's assembler is still holding, once that stream has
+   * ended.
+   *
+   * The last thing a postmaster writes is the reason it is exiting, and
+   * nothing guarantees it ends in a newline, so this is what stops the one
+   * line that matters being the one held back forever.
+   *
+   * One stream at a time, because they end one at a time. Flushing the pair
+   * whenever either one ended would take the other's half-written line and log
+   * it as a message, then log the rest of it as a second one, which is the tear
+   * the assembler exists to prevent.
+   */
+  private flushServerStream(stream: keyof typeof this.serverLines): void {
+    this.logServerOutput(this.serverLines[stream].flush());
+  }
+
+  /**
+   * The same for both streams, where this code is the one deciding nothing
+   * more is coming.
+   *
+   * For the two moments that is true rather than heard from the stream: a
+   * failed start whose drain is done, and a shutdown that destroys the read
+   * ends itself. A pipe destroyed here emits no `end`, so without this the
+   * held line goes with it, and the assembler would carry it into whatever the
+   * next start writes.
+   */
+  private flushServerOutput(): void {
+    this.flushServerStream("stdout");
+    this.flushServerStream("stderr");
+  }
+
+  /**
+   * Puts a whole message through the logger at the level it asks for.
+   *
+   * PostgreSQL says how bad the line is, in the line. Reading it is what lets
+   * a startup failure reach a logger's error level rather than sitting at
+   * `info` alongside "listening on IPv4 address". Which message the level
+   * belongs to, when the pipe broke one in half, is PostgresOutputReader's.
+   */
+  private logServerOutput(reads: PostgresOutputRead[]): void {
+    for (const read of reads) {
+      this.log("pg", read.text, read.level);
     }
-
-    // PostgreSQL says how bad the line is, in the line. Reading it is what
-    // lets a startup failure reach a logger's error level rather than sitting
-    // at `info` alongside "listening on IPv4 address".
-    this.log("pg", text, postgresOutputLevel(text));
   }
 
   /**
@@ -2633,17 +2692,36 @@ export class LocalDevDBServer {
     // Capture and optionally log PostgreSQL output. Captured whether or not
     // there is a logger: without a logger the process output goes nowhere, and
     // that is exactly the caller who has nothing but the thrown error to go on.
+    // `setEncoding` rather than decoding each chunk, so a multi-byte character
+    // split across a read is held by Node's own decoder rather than turned
+    // into two replacement characters. It is the same tear the assembler
+    // handles a line above, at the byte level, and this is where it is already
+    // solved: `data.toString()` on a Buffer ending mid-sequence cannot recover
+    // what the next Buffer starts with.
     if (this.pgProcess.stdout) {
-      this.pgProcess.stdout.on("data", (data) => {
-        this.noteServerOutput(data.toString());
+      this.pgProcess.stdout.setEncoding("utf8");
+      this.pgProcess.stdout.on("data", (data: string) => {
+        this.noteServerOutput(data, "stdout");
       });
     }
 
     if (this.pgProcess.stderr) {
-      this.pgProcess.stderr.on("data", (data) => {
-        this.noteServerOutput(data.toString());
+      this.pgProcess.stderr.setEncoding("utf8");
+      this.pgProcess.stderr.on("data", (data: string) => {
+        this.noteServerOutput(data, "stderr");
       });
     }
+
+    // The stream saying it has ended is the one moment a held partial line is
+    // known to be all there is, so it is where the flush belongs rather than
+    // at the process's exit: `exit` can fire with data still in the pipe, and
+    // flushing then would emit half a line and log the rest of it separately.
+    // Each stream flushes only its own for the same reason, since one being
+    // done says nothing about the other. A pipe this code destroys emits no
+    // "end", which is why the startup path and every shutdown flush for
+    // themselves.
+    this.pgProcess.stdout?.once("end", () => this.flushServerStream("stdout"));
+    this.pgProcess.stderr?.once("end", () => this.flushServerStream("stderr"));
 
     // Save PID to file for future cleanup. This is written as a structured
     // record rather than a bare integer so that a leftover file can later be
@@ -2905,6 +2983,14 @@ export class LocalDevDBServer {
       // an ordinary stop should not pay for this.
       if (startOwnsThisExit) {
         await this.drainServerOutput(proc);
+
+        // Nothing more is coming: either `close` arrived, which means both
+        // pipes are done, or the bound expired and waiting longer would only
+        // delay the diagnosis. So a line still held back is the last one
+        // PostgreSQL wrote, which on this path is the sentence saying why it
+        // would not start. Logged now rather than left to an "end" that a
+        // destroyed pipe never emits.
+        this.flushServerOutput();
 
         // Still ahead of the cleanup below, and well ahead of start() asking:
         // waitForServerReady polls this once a second, so the short wait above
@@ -3400,7 +3486,10 @@ export class LocalDevDBServer {
       // The read ends are ours and nothing else is going to close them.
       // Dropping them lets `close` fire and stops a leaked pipe holding the
       // event loop open — see performGracefulShutdown, which does the same
-      // thing for the same reason.
+      // thing for the same reason, and flushes first for the same reason too:
+      // a line still held belongs to the child being let go, and the assembler
+      // would otherwise splice it onto the first line the next one writes.
+      this.flushServerOutput();
       held.stdout?.destroy();
       held.stderr?.destroy();
       held.stdin?.destroy();
@@ -3573,6 +3662,11 @@ export class LocalDevDBServer {
     // rejection and returns would never exit. The unstoppable path above
     // returns before this, deliberately: that child is still running and its
     // output is still worth having.
+    //
+    // Flushed before they go, since a destroyed pipe emits no "end" and this
+    // is a failed start, where the line being held is the likeliest one to say
+    // why.
+    this.flushServerOutput();
     proc?.stdout?.destroy();
     proc?.stderr?.destroy();
     proc?.stdin?.destroy();
