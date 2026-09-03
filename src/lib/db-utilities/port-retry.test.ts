@@ -17,6 +17,7 @@ import { findFreePort } from "./free-port";
  */
 class CollidingDatabase extends TestDatabaseInstance {
   private handedOut = 0;
+  private built = 0;
 
   constructor(private readonly takenPort: number) {
     super({});
@@ -29,8 +30,21 @@ class CollidingDatabase extends TestDatabaseInstance {
     return this.handedOut === 1 ? this.takenPort : findFreePort();
   }
 
+  /** Counted, not changed. See {@link CollidingDatabase.serversBuilt}. */
+  protected override buildEmbeddedPostgres(
+    port: number,
+  ): ReturnType<TestDatabaseInstance["buildEmbeddedPostgres"]> {
+    this.built++;
+
+    return super.buildEmbeddedPostgres(port);
+  }
+
   get portsHandedOut(): number {
     return this.handedOut;
+  }
+
+  get serversBuilt(): number {
+    return this.built;
   }
 }
 
@@ -121,6 +135,18 @@ describe("port retry", () => {
     expect(rows[0].ok).toBe(1);
     expect(credentials?.port).not.toBe(taken);
     expect(db.portsHandedOut).toBe(2);
+
+    // And it took the second port on the server it already had, rather than
+    // building another. embedded-postgres registers every instance it
+    // CONSTRUCTS in a module-level set it never prunes, and stops all of them
+    // from its own exit hook — a stop that never returns for one whose
+    // postmaster has already exited. So an abandoned attempt is not litter,
+    // it is ten seconds added to the exit of every run that retried. The count
+    // is asserted rather than the stall because the stall happens after the
+    // test framework is done, in a hook this process does not own: reaching it
+    // takes a subprocess and a wall-clock threshold, which is a great deal of
+    // machinery and flakiness to re-derive a number this reads directly.
+    expect(db.serversBuilt).toBe(1);
   }, 120_000);
 
   test("does not retry a port the caller supplied", async () => {

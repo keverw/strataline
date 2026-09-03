@@ -75,6 +75,46 @@ export function isBindFailure(output: string): boolean {
   );
 }
 
+/**
+ * An embedded server whose port can be changed between starts.
+ *
+ * Here so the bind retry can reuse one instance rather than construct a
+ * second, which is not a tidiness point. `EmbeddedPostgres` adds `this` to a
+ * module-level set from its CONSTRUCTOR, not from `initialise()`, and nothing
+ * ever removes an entry: its own exit hook then calls `stop()` on every
+ * instance ever built. A start that failed leaves `this.process` pointing at
+ * the postmaster that has already exited, and `stop()` waits for an `exit`
+ * event that fired before its listener was attached and will not fire again —
+ * the same never-ending wait {@link TestDatabaseInstance.stopServerWithinBound}
+ * bounds, except that call is embedded-postgres's own and cannot be bounded
+ * from here. So an abandoned attempt costs ten seconds of async-exit-hook's
+ * force-exit timeout at the end of the run.
+ *
+ * Rebuilding per attempt therefore turned a SUCCESSFUL start into a stalled
+ * exit, on a path a run reaches by having lost a port rather than by having
+ * gone wrong. Reusing the instance registers nothing extra, so a start that
+ * retried and then worked exits as promptly as one that never retried.
+ *
+ * `start()` reads `this.options.port` when it SPAWNS rather than caching it, so
+ * rebinding it between attempts is the whole of what this needs. That reading
+ * is the load-bearing half and no type expresses it: an upstream that moved
+ * the read into the constructor would compile unchanged here and silently
+ * start on the old port, which is a taken port, which is the bug this exists
+ * to avoid arrived at from the other side. A subclass rather than a cast for
+ * the half that IS checked — `options` is `protected` and its `port` a
+ * documented, mutable field, so the compiler at least holds us to the shape.
+ *
+ * What this does NOT fix is the single instance a start that fails outright
+ * leaves behind. That one is embedded-postgres's to fix, and is upstream as
+ * leinelissen/embedded-postgres#32.
+ */
+class RetargetablePostgres extends EmbeddedPostgres {
+  /** Points the next `start()` at a different port. */
+  setPort(port: number): void {
+    this.options.port = port;
+  }
+}
+
 /** Somewhere for lines to go when no logger was supplied. */
 const noOpLogger: Logger = {
   info: () => {},
@@ -173,7 +213,7 @@ export interface TestDatabaseOptions {
  * await testDB.stop();
  */
 export class TestDatabaseInstance {
-  private db?: EmbeddedPostgres;
+  private db?: RetargetablePostgres;
   private pool?: Pool;
   private migrationsApplied: boolean = false;
   private tempDir?: string;
@@ -283,13 +323,29 @@ export class TestDatabaseInstance {
    * directory behind rather than removing a live cluster's.
    *
    * What this does NOT cover is the second half of that issue. embedded-postgres
-   * keeps a module-level set of every instance ever initialized, never prunes
-   * it, and calls `stop()` on all of them from its own exit hook. That call is
-   * not this one and cannot be bounded from here, so a postmaster that died
-   * out of band can still add its ten seconds to process exit. Reaching in to
-   * clear the reference their guard reads would prevent it, and is not done:
-   * it is a protected field, and a stalled exit is a great deal cheaper than
-   * this file quietly depending on the shape of somebody else's internals.
+   * keeps a module-level set of every instance it CONSTRUCTS, never prunes it,
+   * and calls `stop()` on all of them from its own exit hook. That call is not
+   * this one and cannot be bounded from here, so a postmaster that died out of
+   * band can still add its ten seconds to process exit.
+   *
+   * What that leaves is a rule about ABANDONED instances, of which the number
+   * to aim at is zero rather than few. The cost does not scale with the count:
+   * their hook stops every instance under one `Promise.all` and async-exit-hook
+   * arms a single force-exit timer over the whole set, so five stalled
+   * instances cost the same ten seconds as one. What a second instance buys is
+   * therefore nothing at all, which is why {@link RetargetablePostgres} exists
+   * and why the bind retry rebinds a port rather than building again. A start
+   * that fails and is started again does build a second, correctly: `cleanup()`
+   * has dropped the first by then, so the rule is one per start, not one per
+   * instance of this class.
+   *
+   * Clearing the child reference their exit hook reads would cure the stall
+   * outright and is still not done. That one is `private`, it would have to be
+   * gated on the child being confirmed dead — clearing it makes their `stop()`
+   * early-return, so a survivor would be left unsignaled rather than sent the
+   * fast-shutdown SIGINT that call otherwise sends it — and a stalled exit on a
+   * start that has already failed is cheaper than depending on the shape of
+   * somebody else's internals to that depth.
    */
   private async stopServerWithinBound(
     db: EmbeddedPostgres,
@@ -390,9 +446,21 @@ export class TestDatabaseInstance {
    */
   private attemptOutput = "";
 
-  /** Builds the embedded server for one port, against this run's directory. */
-  private buildEmbeddedPostgres(port: number): EmbeddedPostgres {
-    return new EmbeddedPostgres({
+  /**
+   * Builds the embedded server for one port, against this run's directory.
+   *
+   * Once per start, never per attempt. A retry rebinds the port on this
+   * instance instead of building another — see {@link RetargetablePostgres}.
+   *
+   * `protected` for the same reason {@link findPort} is: the count is the
+   * whole of what stops an abandoned instance stalling process exit, and a
+   * rule nothing checks is a rule that goes back to being broken. Counting
+   * calls here is how port-retry.test.ts holds a retry to one.
+   *
+   * @internal Not part of the published API.
+   */
+  protected buildEmbeddedPostgres(port: number): RetargetablePostgres {
+    return new RetargetablePostgres({
       port,
       user: this.user,
       password: this.password,
@@ -456,21 +524,23 @@ export class TestDatabaseInstance {
    * database at an address they are not going to connect to.
    */
   private async startWithPortRetry(): Promise<void> {
+    // One server for every attempt below, so it is read once. Nothing in the
+    // loop replaces it: a retry rebinds this instance's port rather than
+    // building another, which is the whole point of RetargetablePostgres.
+    const db = this.db;
+
+    if (!db) {
+      throw new Error(
+        "PostgreSQL server was not constructed before start was attempted",
+      );
+    }
+
     for (
       let attempt = 0;
       attempt <= TestDatabaseInstance.PORT_RETRIES;
       attempt++
     ) {
       this.attemptOutput = "";
-
-      // Rebuilt on every retry, so it is read here rather than captured once.
-      const db = this.db;
-
-      if (!db) {
-        throw new Error(
-          "PostgreSQL server was not constructed before start was attempted",
-        );
-      }
 
       try {
         await db.start();
@@ -488,8 +558,13 @@ export class TestDatabaseInstance {
 
         const taken = this.port;
 
+        // Rebound rather than rebuilt. A second instance would be registered
+        // for the life of the process and stall its exit — see
+        // RetargetablePostgres. The data directory is unchanged, and initdb
+        // wrote no port into it, so pointing this one at another number is the
+        // whole of what a retry needs.
         this.port = await this.findPort();
-        this.db = this.buildEmbeddedPostgres(this.port);
+        db.setPort(this.port);
 
         // Worth saying out loud rather than retrying quietly. It is the one
         // symptom of a machine whose ephemeral range covers the ports this
