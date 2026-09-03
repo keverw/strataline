@@ -11,10 +11,16 @@ export type LogLevel = "info" | "warn" | "error";
  * the dev server and `info | warn | error | migrate-info | migrate-warn |
  * migrate-error` on the CLI: severity and origin crossed into a single enum,
  * spelled out by hand, differently per surface. It went wrong in the ways
- * crossing two axes does. `pg` and `setup` had no severity at all, so a
- * PostgreSQL FATAL and a routine startup line were both an ordinary log; and
- * `migrate-` was a namespace built out of string prefixes, so the three tag
- * sets shared no type and adding a level meant editing each of them.
+ * crossing two axes does: `pg` and `setup` could not carry a severity at all,
+ * having spent the enum on being an origin, while `migrate-` was a namespace
+ * built out of string prefixes, so the three tag sets shared no type and
+ * adding a level meant editing each of them.
+ *
+ * Separating them makes a severity available to every origin. It does not by
+ * itself supply one: LocalDevDBServer still logs PostgreSQL's output at `info`
+ * whatever that output says, because the severity is inside the text
+ * PostgreSQL wrote and nothing here reads it. What changed is that a source is
+ * no longer the reason it cannot.
  *
  * Severity is the method you call. This is the other axis, and it is a field.
  *
