@@ -2053,11 +2053,7 @@ describe("LocalDevDBServer", () => {
     // by something unrelated, and a bare liveness check would refuse on every
     // run with no server anywhere to protect.
     type Internals = {
-      otherClusterStillLive(
-        pid: number,
-        startedAt: number | null,
-        otherDataDir: string | null,
-      ): boolean;
+      otherClusterStillLive(pid: number, otherDataDir: string | null): boolean;
     };
 
     const internals = server as unknown as Internals;
@@ -2092,20 +2088,14 @@ describe("LocalDevDBServer", () => {
 
     try {
       expect(
-        internals.otherClusterStillLive(live.pid as number, null, otherDataDir),
+        internals.otherClusterStillLive(live.pid as number, otherDataDir),
       ).toBe(true);
 
       expect(
-        internals.otherClusterStillLive(
-          unrelated.pid as number,
-          null,
-          otherDataDir,
-        ),
+        internals.otherClusterStillLive(unrelated.pid as number, otherDataDir),
       ).toBe(false);
 
-      expect(internals.otherClusterStillLive(999999, null, otherDataDir)).toBe(
-        false,
-      );
+      expect(internals.otherClusterStillLive(999999, otherDataDir)).toBe(false);
     } finally {
       live.kill("SIGKILL");
       unrelated.kill("SIGKILL");
@@ -2957,11 +2947,7 @@ describe("LocalDevDBServer", () => {
     // This PID is deliberately absent, so the old second OS read returned
     // null even though the injected verification snapshot was decisive.
     type Internals = {
-      otherClusterStillLive(
-        pid: number,
-        startedAt: number | null,
-        dataDir: string | null,
-      ): boolean;
+      otherClusterStillLive(pid: number, dataDir: string | null): boolean;
       pidVerificationProbes: ProcessProbes;
       refuseUnexaminedPidRecord(accounted: string): Promise<void>;
     };
@@ -3052,6 +3038,64 @@ describe("LocalDevDBServer", () => {
     }
 
     expect(refused).toBeNull();
+  });
+
+  it("keeps refusing a foreign record when only the clock says its server is gone", async () => {
+    // The refusal that protects another cluster's live record may not rest on
+    // a clock. Both the recorded start time and the recorded boot time are
+    // readings an adjustment moves on the live side and leaves on the recorded
+    // side, so a host whose clock stepped back since the record was written
+    // disagrees with a server that is running right now — and reading that as
+    // proof the server is gone deletes the only thing recording it.
+    //
+    // Nothing else can be read here, which is what makes the clock decisive if
+    // it is consulted at all: a flat command line on macOS, a postmaster that
+    // inherited PGDATA and names no -D, or a `ps` that simply would not answer
+    // all reach this state, and the uid matches because it is the same user's
+    // server either way.
+    type Internals = {
+      pidVerificationProbes: ProcessProbes;
+      refuseUnexaminedPidRecord(accounted: string): Promise<void>;
+    };
+
+    const internals = server as unknown as Internals;
+    const originalProbes = internals.pidVerificationProbes;
+    const otherDataDir = join(tempDir.name, "clock-stepped-other");
+    const now = Date.now();
+
+    internals.pidVerificationProbes = {
+      isAlive: () => true,
+      command: () => null,
+      // Two minutes BEFORE the record claims its server started, which is what
+      // a clock stepped back after the record was written looks like from
+      // here. Nothing about it says the process changed.
+      startTime: () => now - 120_000,
+      bootTime: () => now - 600_000,
+      // The same user, so the one check a clock cannot move says nothing.
+      uid: () => 501,
+    };
+
+    const record = JSON.stringify({
+      pid: 4243,
+      startedAt: now,
+      dataDir: otherDataDir,
+      port: 5598,
+      bootTime: now - 600_000,
+      uid: 501,
+    });
+
+    let refused: unknown = null;
+
+    try {
+      await internals.refuseUnexaminedPidRecord(record);
+    } catch (e) {
+      refused = e;
+    } finally {
+      internals.pidVerificationProbes = originalProbes;
+    }
+
+    expect(refused).toBeInstanceOf(Error);
+    expect((refused as Error).message).toMatch(/another data directory/i);
   });
 
   it("should refuse an old-format record with a relative data directory", async () => {

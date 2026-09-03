@@ -1181,10 +1181,19 @@ export class LocalDevDBServer {
    *
    * Through the shared probes, like its caller — see "One view of the machine"
    * at the top of this file.
+   *
+   * No timestamps, for the reason liveServerVerdict gives: this gates deleting
+   * another cluster's record, and both the recorded start time and the
+   * recorded boot time are readings a clock adjustment moves on the live side
+   * while leaving the recorded side. Offering either would let a clock stepped
+   * back since the record was written report a running server as `recycled`,
+   * which clears the refusal and erases the only thing recording it. What is
+   * left — the PID being gone, a command line naming another cluster or
+   * another program, an owner that cannot have changed — is disproof no
+   * adjustment can manufacture.
    */
   private otherClusterStillLive(
     pid: number,
-    startedAt: number | null,
     otherDataDir: string | null,
     uid: number | null = null,
   ): boolean {
@@ -1195,8 +1204,8 @@ export class LocalDevDBServer {
     }
 
     const check = verifyPid(pid, {
-      startedAt,
-      bootTime: probes.bootTime(),
+      startedAt: null,
+      bootTime: null,
       dataDir: otherDataDir ?? "",
       // Where the record carries one. A process cannot change uid after exec,
       // so a live PID owned by somebody else is not the recorded server, and
@@ -1945,7 +1954,7 @@ export class LocalDevDBServer {
       // Still requires the process to be identifiable as that cluster's
       // server. A dead number, or one an unrelated program picked up after a
       // reboot, must not refuse — see otherClusterStillLive.
-      if (!this.otherClusterStillLive(record.pid, null, declared)) {
+      if (!this.otherClusterStillLive(record.pid, declared)) {
         return;
       }
 
@@ -1963,14 +1972,7 @@ export class LocalDevDBServer {
     // Naming another cluster is not enough. The refusal is a hard stop, so it
     // takes evidence that the other server is actually there rather than that
     // its number is in use — see otherClusterStillLive.
-    if (
-      !this.otherClusterStillLive(
-        record.pid,
-        record.startedAt || null,
-        record.dataDir,
-        record.uid,
-      )
-    ) {
+    if (!this.otherClusterStillLive(record.pid, record.dataDir, record.uid)) {
       return;
     }
 
@@ -2096,7 +2098,7 @@ export class LocalDevDBServer {
     } else if (
       status.staleKind === "different-cluster" &&
       status.pid &&
-      this.otherClusterStillLive(status.pid, status.startedAt, status.dataDir)
+      this.otherClusterStillLive(status.pid, status.dataDir)
     ) {
       // Name the actual conflicting record so the error suggests the right fix.
       const offendingFile =

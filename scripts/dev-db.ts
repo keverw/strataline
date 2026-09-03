@@ -24,7 +24,15 @@ const server = new LocalDevDBServer({
   // right: it has no business ending this process. With nothing left pending
   // the script would then exit on its own — but with code 0, reporting a
   // crashed database as a clean run. This is here for the code, not the exit.
-  onExit: (code) => process.exit(code),
+  //
+  // `|| 1` because PostgreSQL's own code is not the whole story here. onExit
+  // fires only for an exit nobody asked THIS process for, and one of the ways
+  // to get there is somebody else shutting the server down cleanly — a
+  // `pg_ctl stop`, or an operator's SIGINT to the postmaster — which exits 0.
+  // Forwarding that would have the dev server report success while its
+  // database has gone away, which is the one thing this callback exists to
+  // stop happening quietly.
+  onExit: (code) => process.exit(code || 1),
 });
 
 // The library traps no signals, so wiring them is the host's job — and this

@@ -1436,7 +1436,10 @@ const server = new LocalDevDBServer({
   dataDir: DATA_DIR,
   pidFile: PID_FILE,
   logger: createDevDBConsoleLogger(), // Optional: remove this line to run silently
-  onExit: (code) => process.exit(code),
+  // `|| 1`: onExit fires for any exit this process did not ask for, and a
+  // clean shutdown from elsewhere (`pg_ctl stop`) exits 0, which would
+  // otherwise report a vanished database as a successful run.
+  onExit: (code) => process.exit(code || 1),
 });
 
 // Held, not just awaited. A signal can arrive during startup, and shutdown()
@@ -1558,7 +1561,7 @@ const server = new LocalDevDBServer({
   pidFile: "./.pg_pid", // File to store the PostgreSQL process ID
   // Optional
   logger: customLogger, // Optional: custom logger function
-  onExit: (exitCode) => process.exit(exitCode), // Optional: server-exit notification
+  onExit: (exitCode) => process.exit(exitCode || 1), // Optional: server-exit notification
   logConnections: false, // Optional: enable PostgreSQL connection logging (default: false)
 });
 ```
@@ -1609,7 +1612,7 @@ function render(data: LogDataInput) {
 }
 ```
 
-> **If your process _is_ the server, you own every way it can end.** This library never exits your process, so a script whose whole job is to run the dev server has two things to wire: a signal handler that stops the server and exits, and an `onExit` that exits when PostgreSQL dies on its own. Omit the second and ordinary flow control takes over. With nothing left pending the script exits by itself, but with code `0`, reporting a crashed database as a clean run. Callers that legitimately carry on afterwards, such as tests or a provisioning step that stops the server and moves on, are exactly the ones that should not exit from there.
+> **If your process _is_ the server, you own every way it can end.** This library never exits your process, so a script whose whole job is to run the dev server has two things to wire: a signal handler that stops the server and exits, and an `onExit` that exits when PostgreSQL dies on its own. Omit the second and ordinary flow control takes over. With nothing left pending the script exits by itself, but with code `0`, reporting a crashed database as a clean run. Exit non-zero from it rather than forwarding PostgreSQL's code as it stands, since a clean shutdown asked for from somewhere else, a `pg_ctl stop` for instance, reaches `onExit` with code `0` and would read as a successful run. Callers that legitimately carry on afterwards, such as tests or a provisioning step that stops the server and moves on, are exactly the ones that should not exit from there.
 
 The logger is the `Logger` interface exported from `strataline/migration`, and the `onExit` callback type is exported as `DevDBExitHandler` (`(exitCode: number) => void`), if you prefer the named types over writing the shapes inline. The constructor's configuration object is exported as `LocalDevDBServerConfig`, and `getLifecycleState()`'s return type as `DevDBLifecycleState`.
 
