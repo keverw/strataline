@@ -233,6 +233,80 @@ export class TestDatabaseInstance {
     return this.isRunning && !!this.pool;
   }
 
+  /** How long a stop is given before it is treated as already done. */
+  private static readonly STOP_TIMEOUT_MS = 10_000;
+
+  /**
+   * Stops the server under a bound, because the stop it calls can never
+   * return.
+   *
+   * `EmbeddedPostgres.stop()` waits for the child's `exit` event and sends
+   * SIGINT to provoke it:
+   *
+   *     await new Promise((resolve) => {
+   *       this.process?.on('exit', resolve);
+   *       this.process?.kill('SIGINT');
+   *     });
+   *
+   * A postmaster that has ALREADY exited fired that event before the listener
+   * was attached, and Node does not replay it. The handle is still set, so the
+   * guard above it passes, and the promise is waited on forever.
+   *
+   * Which is precisely the state a failed start leaves: the postmaster wrote
+   * why it could not start and died, and cleanup() then asks for it to be
+   * stopped. So every failed start hung here rather than rejecting, whatever
+   * the reason for it, and the caller was left with no error at all instead of
+   * the one PostgreSQL had already written. A port that could not be bound is
+   * the way this was found; an incompatible data directory or exhausted shared
+   * memory reach it identically.
+   *
+   * A bound rather than a fix, since the wait belongs to somebody else's code.
+   * Giving up on it is safe in the case that produces it, because the process
+   * being gone is the whole reason the event never came.
+   */
+  private async stopServerWithinBound(db: EmbeddedPostgres): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const abandoned = new Promise<"timed-out">((resolve) => {
+      timer = setTimeout(
+        () => resolve("timed-out"),
+        TestDatabaseInstance.STOP_TIMEOUT_MS,
+      );
+    });
+
+    try {
+      const outcome = await Promise.race([
+        db.stop().then(() => "stopped" as const),
+        abandoned,
+      ]);
+
+      if (outcome === "timed-out") {
+        this.log(
+          "warn",
+          "Stopping embedded PostgreSQL did not return. It had most likely already exited, " +
+            "which is a wait that never completes rather than a server still running. Carrying on with cleanup.",
+        );
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * The port an automatic start uses, and the seam the bind race is tested at.
+   *
+   * A `protected` method rather than a mocked module, so the retry path can be
+   * driven from a subclass without reaching into the module registry. It is
+   * the same shape as the injectable `probes` in ./pid-file: the race it exists
+   * for cannot be provoked on demand, and a loop that has never run in any test
+   * is a loop nobody has seen work.
+   *
+   * @internal Not part of the published API.
+   */
+  protected async findPort(): Promise<number> {
+    return findFreePort();
+  }
+
   /** How many ports a start may lose to the bind race before giving up. */
   private static readonly PORT_RETRIES = 3;
 
@@ -344,7 +418,7 @@ export class TestDatabaseInstance {
 
         const taken = this.port;
 
-        this.port = await findFreePort();
+        this.port = await this.findPort();
         this.db = this.buildEmbeddedPostgres(this.port);
 
         // Worth saying out loud rather than retrying quietly. It is the one
@@ -381,7 +455,7 @@ export class TestDatabaseInstance {
       // retry on the very path the retry exists for, and a log line crediting
       // the caller for a number they never gave.
       if (this.portChosenAutomatically) {
-        this.port = await findFreePort();
+        this.port = await this.findPort();
       }
 
       // Which port, and whether this picked it. An automatic port is the one
@@ -641,7 +715,7 @@ export class TestDatabaseInstance {
 
     if (this.db) {
       try {
-        await this.db.stop();
+        await this.stopServerWithinBound(this.db);
       } catch (error) {
         this.log(
           "error",
