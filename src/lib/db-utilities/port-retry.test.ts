@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createServer, type Server } from "net";
-import { TestDatabaseInstance } from "./test-db-instance";
+import { isBindFailure, TestDatabaseInstance } from "./test-db-instance";
 import { findFreePort } from "./free-port";
 
 /**
@@ -164,14 +164,24 @@ describe("port retry", () => {
     const explicit = new TestDatabaseInstance({ port: taken });
 
     let started = true;
+    let failure: unknown;
 
-    await explicit.start().catch(() => {
+    await explicit.start().catch((error: unknown) => {
       started = false;
+      failure = error;
     });
 
     expect(started).toBe(false);
     // Nothing usable came back, rather than a database somewhere else.
     expect(explicit.getCredentials()).toBeNull();
+
+    // And the caller was told why. `EmbeddedPostgres.start()` rejects with a
+    // bare `reject()`, so rethrowing what it gives handed back `undefined` and
+    // the first `.message` read on it raised a TypeError about a property of
+    // undefined, in place of the failure it was meant to report. The reason is
+    // only ever in what PostgreSQL wrote, so that is what the error carries.
+    expect(failure).toBeInstanceOf(Error);
+    expect(isBindFailure((failure as Error).message)).toBe(true);
 
     await explicit.stop().catch(() => {});
   }, 120_000);

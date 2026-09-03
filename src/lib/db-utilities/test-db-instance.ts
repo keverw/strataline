@@ -5,6 +5,7 @@ import {
   BaseLogger,
   ConsoleLogger,
   createPrefixedLogger,
+  getErrorMessage,
   type LogDataInput,
   type LogLevel,
   type LogSource,
@@ -505,6 +506,35 @@ export class TestDatabaseInstance {
   }
 
   /**
+   * Turns a failed start into an error that says why.
+   *
+   * `EmbeddedPostgres.start()` rejects with a bare `reject()` on the child's
+   * `close`, so the rejection value is `undefined` and carries nothing at all.
+   * Rethrown as it stands, the first `.message` read on it throws a TypeError
+   * that replaces the failure it was trying to report, and the caller is told
+   * about a property of `undefined` rather than about an incompatible data
+   * directory or exhausted shared memory.
+   *
+   * The reason exists — PostgreSQL wrote it, and {@link attemptOutput} has it
+   * — so a valueless rejection is replaced by an error carrying that text. A
+   * rejection that IS an error is passed through untouched: it already says
+   * more about itself than this could add.
+   */
+  private startFailure(error: unknown): unknown {
+    if (error !== undefined && error !== null) {
+      return error;
+    }
+
+    const detail = this.attemptOutput.trim();
+
+    return new Error(
+      detail
+        ? `PostgreSQL failed to start. PostgreSQL said:\n${detail}`
+        : "PostgreSQL failed to start, and it wrote no output explaining why.",
+    );
+  }
+
+  /**
    * Starts the server, taking another port if this one was claimed in the gap.
    *
    * The race this closes: {@link findFreePort} confirms a port is free and
@@ -553,7 +583,7 @@ export class TestDatabaseInstance {
           this.failedToBind();
 
         if (!canRetry) {
-          throw error;
+          throw this.startFailure(error);
         }
 
         const taken = this.port;
@@ -656,7 +686,7 @@ export class TestDatabaseInstance {
       } catch (error) {
         this.log(
           "error",
-          `Error during PostgreSQL startup: ${(error as Error).message}`,
+          `Error during PostgreSQL startup: ${getErrorMessage(error)}`,
         );
         throw error; // Will be caught by outer try-catch
       }
@@ -701,7 +731,7 @@ export class TestDatabaseInstance {
     } catch (error) {
       this.log(
         "error",
-        `Failed to start embedded PostgreSQL: ${(error as Error).message}`,
+        `Failed to start embedded PostgreSQL: ${getErrorMessage(error)}`,
       );
       try {
         // Use a separate try-catch for cleanup to ensure it never throws
