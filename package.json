@@ -9,6 +9,11 @@
       "import": "./dist/migration/migration.js",
       "require": "./dist/migration/migration.cjs"
     },
+    "./logger": {
+      "types": "./dist/logger/logger.d.ts",
+      "import": "./dist/logger/logger.js",
+      "require": "./dist/logger/logger.cjs"
+    },
     "./test-db-instance": {
       "types": "./dist/test-db-instance/test-db-instance.d.ts",
       "import": "./dist/test-db-instance/test-db-instance.js",

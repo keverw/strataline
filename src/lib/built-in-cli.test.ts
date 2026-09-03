@@ -1,16 +1,21 @@
 import { describe, it, expect, beforeEach, afterEach, mock } from "bun:test";
 import { Pool } from "pg";
-import { RunStratalineCLI, createCLIConsoleLogger } from "./built-in-cli";
-import type { LogDataInput, LogLevel, Logger } from "./logger";
+import { RunStratalineCLI } from "./built-in-cli";
+import {
+  createConsoleLogger,
+  type LogDataInput,
+  type LogLevel,
+  type Logger,
+} from "./logger";
 import { TestDatabaseInstance } from "./db-utilities/test-db-instance";
 import { Migration } from "./migration-system";
 
 // Control whether to show logs during RunStratalineCLI tests
 const CLI_TESTS_VERBOSE_LOGGING = false; // Set to true to see logs during test execution
 
-describe("createCLIConsoleLogger", () => {
+describe("createConsoleLogger", () => {
   it("should create a logger", () => {
-    const logger = createCLIConsoleLogger();
+    const logger = createConsoleLogger();
     expect(typeof logger.info).toBe("function");
     expect(typeof logger.warn).toBe("function");
     expect(typeof logger.error).toBe("function");
@@ -31,7 +36,7 @@ describe("createCLIConsoleLogger", () => {
     console.warn = mockWarn;
 
     try {
-      const logger = createCLIConsoleLogger(true);
+      const logger = createConsoleLogger();
 
       // Test regular log types
       logger.info({ message: "Test info message" });
@@ -77,7 +82,7 @@ describe("createCLIConsoleLogger", () => {
 
     try {
       // Create logger with migrateVerbose=false
-      const logger = createCLIConsoleLogger(false);
+      const logger = createConsoleLogger({ migration: false });
 
       // Regular info should still be logged
       logger.info({ message: "Regular info" });
@@ -146,7 +151,7 @@ describe("RunStratalineCLI", () => {
       if (CLI_TESTS_VERBOSE_LOGGING) {
         // Use the actual CLI logger to print to console, respecting its
         // formatting. Pass `true` for migrateVerbose so everything shows.
-        createCLIConsoleLogger(true)[level](data);
+        createConsoleLogger()[level](data);
       }
     };
 
@@ -547,7 +552,7 @@ describe("RunStratalineCLI", () => {
     console.error = mockError;
 
     try {
-      const logger = createCLIConsoleLogger(true);
+      const logger = createConsoleLogger();
 
       // Test migration error logging
       logger.error({
@@ -588,7 +593,7 @@ describe("RunStratalineCLI", () => {
     console.error = mockError;
 
     try {
-      const logger = createCLIConsoleLogger(true);
+      const logger = createConsoleLogger();
 
       // Simulate errors from different migration phases
       const beforeSchemaError = new Error("Error in beforeSchema phase");
@@ -633,7 +638,7 @@ describe("RunStratalineCLI", () => {
     console.error = mockError;
 
     try {
-      const logger = createCLIConsoleLogger(true);
+      const logger = createConsoleLogger();
 
       // Test migration errors with different phase prefixes
       logger.error({

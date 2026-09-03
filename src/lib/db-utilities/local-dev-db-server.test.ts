@@ -8,7 +8,6 @@ import {
 } from "bun:test";
 import {
   LocalDevDBServer,
-  createDevDBConsoleLogger,
   getLocalDevDBServerStatus,
   getProcessStartTime,
   getSystemBootTime,
@@ -36,7 +35,12 @@ import {
 import { spawn, execFileSync } from "child_process";
 import { createServer, type Socket } from "net";
 import { findFreePort } from "./free-port";
-import type { LogDataInput, LogLevel, Logger } from "../logger";
+import {
+  createConsoleLogger,
+  type LogDataInput,
+  type LogLevel,
+  type Logger,
+} from "../logger";
 
 /**
  * Records lines as "tag:message", the shape the assertions here were written
@@ -4137,7 +4141,7 @@ describe("LocalDevDBServer", () => {
     }
   });
   it("should create a logger", () => {
-    const logger = createDevDBConsoleLogger();
+    const logger = createConsoleLogger();
     expect(typeof logger.info).toBe("function");
     expect(typeof logger.warn).toBe("function");
     expect(typeof logger.error).toBe("function");
@@ -4159,7 +4163,7 @@ describe("LocalDevDBServer", () => {
     console.warn = (message: string) => warnCalls.push(message);
 
     try {
-      const logger = createDevDBConsoleLogger(false, false); // Silent mode
+      const logger = createConsoleLogger({ pg: false, setup: false }); // Silent mode
 
       // These should not throw errors
       logger.info({ message: "Test info message" });

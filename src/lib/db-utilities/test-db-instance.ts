@@ -2,11 +2,8 @@ import { Pool } from "pg";
 import { MigrationManager, Migration } from "../migration-system";
 import { makeSafeLogger } from "../callback-safety";
 import {
-  BaseLogger,
-  ConsoleLogger,
   createPrefixedLogger,
   getErrorMessage,
-  type LogDataInput,
   type LogLevel,
   type LogSource,
   type Logger,
@@ -141,64 +138,6 @@ const noOpLogger: Logger = {
   warn: () => {},
   error: () => {},
 };
-
-/**
- * Console-based logger implementation for TestDatabase
- *
- * A sink. Its two verbosity flags are source filters: PostgreSQL's own output
- * is `source: "pg"` and the migration system's is `source: "migration"`.
- *
- * @param pgVerbose Whether to log verbose PostgreSQL messages
- * @param migrateVerbose Whether to log verbose migration messages
- */
-export const createTestDBConsoleLogger = (
-  pgVerbose: boolean = false,
-  migrateVerbose: boolean = true,
-): Logger => new TestDBConsoleLogger(pgVerbose, migrateVerbose);
-
-class TestDBConsoleLogger extends BaseLogger {
-  private readonly console = new ConsoleLogger();
-  private readonly pgVerbose: boolean;
-  private readonly migrateVerbose: boolean;
-
-  constructor(pgVerbose: boolean, migrateVerbose: boolean) {
-    super();
-    this.pgVerbose = pgVerbose;
-    this.migrateVerbose = migrateVerbose;
-  }
-
-  info(data: LogDataInput): void {
-    this.write("info", data);
-  }
-
-  warn(data: LogDataInput): void {
-    this.write("warn", data);
-  }
-
-  error(data: LogDataInput): void {
-    this.write("error", data);
-  }
-
-  private write(level: LogLevel, data: LogDataInput): void {
-    // Routine output only, as with migration lines below: a PostgreSQL
-    // warning or error is not what `pgVerbose: false` was asking to be spared.
-    if (!this.pgVerbose && level === "info" && data.source === "pg") {
-      return;
-    }
-
-    // Only the migration system's routine chatter, as in the CLI: a warning or
-    // an error from a migration is not something a verbosity flag should hide.
-    if (
-      !this.migrateVerbose &&
-      level === "info" &&
-      data.source === "migration"
-    ) {
-      return;
-    }
-
-    this.console[level](data);
-  }
-}
 
 /**
  * Configuration options for {@link TestDatabaseInstance}. All fields are

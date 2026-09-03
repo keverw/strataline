@@ -1,9 +1,6 @@
 import { describe, it, test, expect, beforeEach, afterEach } from "bun:test";
-import {
-  TestDatabaseInstance,
-  createTestDBConsoleLogger,
-  isBindFailure,
-} from "./test-db-instance";
+import { createConsoleLogger } from "../logger";
+import { TestDatabaseInstance, isBindFailure } from "./test-db-instance";
 import { Migration } from "../migration-system";
 import * as tmp from "tmp";
 import { existsSync, readFileSync, writeFileSync } from "fs";
@@ -216,9 +213,9 @@ describe("TestDatabaseInstance", () => {
   });
 });
 
-describe("createTestDBConsoleLogger", () => {
+describe("createConsoleLogger", () => {
   it("should create a logger", () => {
-    const logger = createTestDBConsoleLogger();
+    const logger = createConsoleLogger({ pg: false });
     expect(typeof logger.info).toBe("function");
     expect(typeof logger.warn).toBe("function");
     expect(typeof logger.error).toBe("function");
@@ -240,7 +237,7 @@ describe("createTestDBConsoleLogger", () => {
     console.warn = (message: string) => warnCalls.push(message);
 
     try {
-      const logger = createTestDBConsoleLogger(false, false); // Silent mode for pg and migrate
+      const logger = createConsoleLogger({ pg: false, migration: false }); // Silent mode for pg and migrate
 
       // Test all log types
       logger.info({ message: "Test info message" });
@@ -288,7 +285,7 @@ describe("createTestDBConsoleLogger", () => {
     console.log = (message: string) => logCalls.push(message);
 
     try {
-      const logger = createTestDBConsoleLogger(true, false); // pg verbose, migrate silent
+      const logger = createConsoleLogger({ migration: false }); // pg verbose, migrate silent
 
       logger.info({ source: "pg", message: "Test PostgreSQL message" });
       logger.info({ source: "migration", message: "Test migration message" });
@@ -309,7 +306,7 @@ describe("createTestDBConsoleLogger", () => {
     console.log = (message: string) => logCalls.push(message);
 
     try {
-      const logger = createTestDBConsoleLogger(false, true); // pg silent, migrate verbose
+      const logger = createConsoleLogger({ pg: false }); // pg silent, migrate verbose
 
       logger.info({ source: "pg", message: "Test PostgreSQL message" });
       logger.info({ source: "migration", message: "Test migration message" });
@@ -330,7 +327,7 @@ describe("createTestDBConsoleLogger", () => {
     console.log = (message: string) => logCalls.push(message);
 
     try {
-      const logger = createTestDBConsoleLogger(true, true); // both verbose
+      const logger = createConsoleLogger(); // both verbose
 
       logger.info({ source: "pg", message: "Test PostgreSQL message" });
       logger.info({ source: "migration", message: "Test migration message" });
@@ -350,7 +347,7 @@ describe("createTestDBConsoleLogger", () => {
     console.log = (message: string) => logCalls.push(message);
 
     try {
-      const logger = createTestDBConsoleLogger(); // defaults: pgVerbose=false, migrateVerbose=true
+      const logger = createConsoleLogger({ pg: false }); // the usual choice for a test suite
 
       logger.info({ source: "pg", message: "Test PostgreSQL message" });
       logger.info({ source: "migration", message: "Test migration message" });

@@ -330,6 +330,97 @@ export class ConsoleLogger extends BaseLogger {
 }
 
 /**
+ * Which sources to quiet, by name. Absent means shown.
+ *
+ * Positive rather than a list of what to silence, so a call site reads as the
+ * setting it is: `{ pg: false }` is "PostgreSQL's own output, off". Open to
+ * any name for the reason {@link LogSource} is, since a host logging its own
+ * sources through this gets to quiet them the same way.
+ */
+export type SourceVerbosity = Record<string, boolean>;
+
+/**
+ * Quiets the routine output of named sources, and forwards everything else.
+ *
+ * The one filter behind every console logger this package builds, and the
+ * reason there is no longer one class per surface. The dev server, the test
+ * database and the CLI each used to carry a private copy of this, differing
+ * only in which source names were hardcoded into it — which meant the
+ * verbosity flags were welded to the console sink, and a host that supplied
+ * its own logger silently lost them. Wrap any sink in this and the policy
+ * comes with it:
+ *
+ * ```ts
+ * new SourceFilterLogger(myPinoAdapter, { pg: false })
+ * ```
+ *
+ * Two rules, both of them about not silencing anything that was worth saying.
+ *
+ * Only `info` is quieted. A warning or an error is not chatter, and
+ * PostgreSQL says which of its lines are which — see `postgresOutputLevel` —
+ * so `{ pg: false }` drops "listening on IPv4 address" without also hiding
+ * the FATAL that explains why the server would not start.
+ *
+ * And a source this was told nothing about is shown, whatever its level. A
+ * host logging through this under a source of its own asked for that line,
+ * and silence nobody requested is the worse failure. It is also what makes a
+ * filter built for one surface safe to hand to another: the wrong one is
+ * louder than intended, never quieter.
+ */
+export class SourceFilterLogger extends ForwardingLogger {
+  private readonly sources: SourceVerbosity;
+
+  constructor(next: Logger, sources: SourceVerbosity = {}) {
+    super(next);
+    this.sources = sources;
+  }
+
+  protected override transform(
+    data: LogDataInput,
+    level: LogLevel,
+  ): LogDataInput | null {
+    const quieted =
+      level === "info" &&
+      data.source !== undefined &&
+      this.sources[data.source] === false;
+
+    return quieted ? null : data;
+  }
+}
+
+/**
+ * A console logger, quieting whichever sources you name.
+ *
+ * Everything is shown by default, which is the answer for most callers: a
+ * logger you passed in order to see what is happening should not decide on
+ * your behalf that some of it is not worth reading. Name a source to turn its
+ * routine output off.
+ *
+ * ```ts
+ * createConsoleLogger()                          // everything
+ * createConsoleLogger({ pg: false })             // no routine PostgreSQL output
+ * createConsoleLogger({ pg: false, setup: false })
+ * createConsoleLogger({ migration: false })      // no migration chatter
+ * ```
+ *
+ * The sources this package emits are `pg` (PostgreSQL's own output), `setup`
+ * (a dev server's startup steps), and `migration` (the migration system).
+ * Lines a surface logs in its own voice carry no source and are never
+ * quieted, so a silenced source never takes the message that matters with it.
+ *
+ * One function rather than one per surface, deliberately. The three it
+ * replaced took positional booleans whose meaning depended on which of them
+ * you had called — `(pgVerbose, setupVerbose)` in one and
+ * `(pgVerbose, migrateVerbose)` in another, same arity, same types, different
+ * second argument and different first default — so two identical-looking call
+ * sites meant different things and TypeScript could not tell them apart.
+ * Naming the source removes the question.
+ */
+export function createConsoleLogger(sources: SourceVerbosity = {}): Logger {
+  return new SourceFilterLogger(new ConsoleLogger(), sources);
+}
+
+/**
  * Mutable logger that can be toggled on/off for unit tests.
  *
  * A gate and nothing else: what passes through reaches the logger beneath

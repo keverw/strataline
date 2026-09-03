@@ -52,6 +52,7 @@ Whether you're building a side project or orchestrating millions of rows in prod
 - [Logging & Schema Helpers](#logging--schema-helpers)
   - [Logging](#logging)
     - [Logger Module](#logger-module)
+      - [Sources and Filtering](#sources-and-filtering)
       - [Creating Custom Loggers](#creating-custom-loggers)
   - [Schema Helpers](#schema-helpers)
 - [Database Tables](#database-tables)
@@ -352,15 +353,16 @@ Create a script file to run your migrations:
 // Load environment variables - this is only needed if you are using Node.js, Bun does not need it
 // import 'dotenv/config'
 
-import { RunStratalineCLI, createCLIConsoleLogger } from "strataline/cli";
+import { RunStratalineCLI } from "strataline/cli";
+import { createConsoleLogger } from "strataline/logger";
 import { migrations } from "../path/to/your/migrations";
 
-// Use the built-in CLI console logger. The single argument is `migrateVerbose`
-// (default `true`): it gates only the verbose per-migration `[MIGRATION]` info
-// lines. Migration errors/warnings and the CLI's own info always print, so
-// passing `false` quiets the chatter without hiding problems. You can customize
-// this or implement your own logger if needed.
-const logger = createCLIConsoleLogger(true);
+// Use the built-in console logger. It shows everything by default; name a
+// source to quiet its routine output. `{ migration: false }` drops only the
+// per-migration `[MIGRATION]` info lines. Migration errors and warnings, and
+// the CLI's own info, always print, so quieting a source never hides a
+// problem. You can customize this or implement your own logger if needed.
+const logger = createConsoleLogger();
 
 // Run the CLI with environment variables.
 // RunStratalineCLI resolves with a result whose `exitCode` distinguishes the
@@ -480,7 +482,7 @@ interface StratalineCLIResult {
 
 > **`status` and `reason` are populated only for the `run` command.** The `status`/`help` commands resolve with just `{ command, exitCode: 0 }`, so `result.status` and `result.reason` are `undefined` for them. Branch on `result.command` (or check for `undefined`) before reading `status`.
 
-The `logger` you pass to `RunStratalineCLI`, and what `createCLIConsoleLogger` returns, is the `Logger` interface exported from `strataline/migration`. The CLI's own lines carry no `source`, and the migration system's carry `source: "migration"`.
+The `logger` you pass to `RunStratalineCLI`, and what `createConsoleLogger` returns, is the `Logger` interface exported from `strataline/logger`. The CLI's own lines carry no `source`, and the migration system's carry `source: "migration"`.
 
 #### Graceful Shutdown
 
@@ -827,7 +829,7 @@ Alongside `MigrationResult`, `MigrationStatus`, `DataMigrationJobResult`, and `D
 
 > **`Migration` is generic: `Migration<TPayload, TReturn>`.** The examples use the bare `Migration` (which defaults to `Migration<Record<string, unknown>, unknown>`), but you can parameterize it to type the two values that flow through a single migration: `TPayload` types `ctx.payload` (the per-batch input you pass to `runDataMigrationJobOnly`), and `TReturn` types the `data` argument to `ctx.complete(data)` / `ctx.defer(reason, data)` (and `ctx.updateMetadata`). For example, `Migration<{ startId: number; endId: number }, { processed: number }>` gives you a fully typed `ctx.payload` and a checked `ctx.complete({ processed })`. `register<TPayload, TReturn>()` and `runDataMigrationJobOnly<TPayload, TReturn>()` carry the same parameters.
 
-The logger the `MigrationManager` constructor accepts is the [`Logger`](#logger-module) interface. If `Logger` collides with a type already in your codebase, alias it on import: `import type { Logger as StratalineLogger } from "strataline/migration"`.
+The logger the `MigrationManager` constructor accepts is the [`Logger`](#logger-module) interface. If `Logger` collides with a type already in your codebase, alias it on import: `import type { Logger as StratalineLogger } from "strataline/logger"`.
 
 ## Backpressure Handling
 
@@ -989,14 +991,50 @@ Strataline includes a dedicated logger module that provides:
 
 The logger system automatically formats messages with task and stage prefixes, making it easy to trace the origin of each log message in complex migration scenarios.
 
-A few lower-level building blocks are also exported from `strataline/migration` for advanced use: the `LogData` / `LogLevel` / `LogDataInput` types, the `buildLogPrefix` and `getErrorMessage` helpers, a `MutableLogger` (wraps another logger and can be toggled on/off via `setVerbose`, with `isVerbose()` to read the current state, handy in tests), `createPrefixedLogger` (a standalone function that creates a prefixed logger. Handles both `BaseLogger` subclasses and plain `Logger` objects), and `PrefixedLogger` (the internal class behind `createPrefixed`/`createPrefixedLogger`. Prefer those over constructing it directly). Most users only need `BaseLogger`, `ConsoleLogger`, and `consoleLogger`.
+A few lower-level building blocks are also exported from `strataline/logger` for advanced use: the `LogData` / `LogLevel` / `LogDataInput` types, the `buildLogPrefix` and `getErrorMessage` helpers, a `MutableLogger` (wraps another logger and can be toggled on/off via `setVerbose`, with `isVerbose()` to read the current state, handy in tests), `createPrefixedLogger` (a standalone function that creates a prefixed logger. Handles both `BaseLogger` subclasses and plain `Logger` objects), and `PrefixedLogger` (the internal class behind `createPrefixed`/`createPrefixedLogger`. Prefer those over constructing it directly). Most users only need `BaseLogger`, `ConsoleLogger`, and `consoleLogger`.
+
+##### Sources and Filtering
+
+Every line carries two independent things: a severity, which is the method you call (`info`, `warn`, `error`), and a `source`, which says where the line came from. The sources Strataline emits are:
+
+| `source`      | What it is                                      |
+| ------------- | ----------------------------------------------- |
+| `"pg"`        | PostgreSQL's own server output                  |
+| `"setup"`     | A dev server's startup and initialization steps |
+| `"migration"` | The migration system                            |
+
+Lines a surface logs in its own voice carry no `source` at all. That is deliberate, so quieting a source can never take the message that matters with it.
+
+`createConsoleLogger` builds a console logger that quiets whichever sources you name. The whole logging API lives at `strataline/logger`, which is its own entry point rather than a passenger on any one surface, since the dev server and the test database need it as much as migrations do:
+
+```typescript
+import { createConsoleLogger } from "strataline/logger";
+
+createConsoleLogger(); // everything, the default
+createConsoleLogger({ pg: false }); // no routine PostgreSQL output
+createConsoleLogger({ pg: false, setup: false }); // also no dev server startup steps
+createConsoleLogger({ migration: false }); // no per-migration chatter
+```
+
+Two rules make this safe to use without reading the source list first:
+
+- **Only routine `info` output is quieted.** A warning or an error is never hidden. Strataline reads the severity PostgreSQL prints in its own lines, so a `WARNING`, `ERROR`, `FATAL`, or `PANIC` reaches your logger at that level and prints even under `{ pg: false }`. That means `{ pg: false }` drops `listening on IPv4 address` without also hiding the `FATAL` explaining why the server would not start.
+- **A source you did not name is shown.** Absent means visible, so a filter built for one surface is safe to hand to another. The wrong one is louder than you intended, never quieter, and a logger you wrote for your own sources keeps printing them.
+
+To apply the same filtering to a logger of your own rather than to the console, wrap it in `SourceFilterLogger`:
+
+```typescript
+import { SourceFilterLogger } from "strataline/logger";
+
+const logger = new SourceFilterLogger(myPinoAdapter, { pg: false });
+```
 
 ##### Creating Custom Loggers
 
 You can create your own logger by extending the `BaseLogger` class:
 
 ```typescript
-import { BaseLogger, LogDataInput } from "strataline/migration";
+import { BaseLogger, LogDataInput } from "strataline/logger";
 
 // Create a custom logger that sends logs to a service
 class ApiLogger extends BaseLogger {
@@ -1235,10 +1273,7 @@ This helper creates short-lived, non-persistent Postgres clusters for testing pu
 #### Usage
 
 ```typescript
-import {
-  TestDatabaseInstance,
-  createTestDBConsoleLogger,
-} from "strataline/test-db-instance";
+import { TestDatabaseInstance } from "strataline/test-db-instance";
 import { migrations } from "./path/to/your/migrations";
 
 // Create a test database with migrations
@@ -1290,14 +1325,18 @@ await testDb.stop();
 You can use the built-in console logger or implement your own:
 
 ```typescript
-// Use the built-in console logger with options.
-// Defaults: createTestDBConsoleLogger(pgVerbose = false, migrateVerbose = true),
-// so PostgreSQL server logs are hidden unless you opt in (errors always show).
+import { createConsoleLogger } from "strataline/logger";
+
+// Use the built-in console logger, naming any source you want quieted.
+// Everything is shown by default. `{ pg: false }` is the usual choice for a
+// test suite, since PostgreSQL's routine output is rarely what a failing test
+// is about. Only routine `info` lines are affected: a PostgreSQL WARNING,
+// ERROR, FATAL or PANIC reaches your logger at that level and still prints.
 const testDb = new TestDatabaseInstance({
-  logger: createTestDBConsoleLogger(
-    true, // true enables verbose PostgreSQL logs
-    true, // true enables verbose migration logs
-  ),
+  logger: createConsoleLogger({
+    pg: false, // quiet PostgreSQL's routine server logs
+    // migration: false,  // quiet the migration system's routine chatter
+  }),
 });
 
 // Or implement your own logger
@@ -1317,7 +1356,7 @@ function render(data: LogDataInput) {
 }
 ```
 
-The logger is the `Logger` interface exported from `strataline/migration`, and the data it receives is `LogDataInput`. The constructor's options object is exported as `TestDatabaseOptions`.
+The logger is the `Logger` interface exported from `strataline/logger`, and the data it receives is `LogDataInput`. The constructor's options object is exported as `TestDatabaseOptions`.
 
 ##### Migration Logging
 
@@ -1418,10 +1457,8 @@ Create a script to run your local development database server:
 // scripts/dev-db.ts
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
-import {
-  LocalDevDBServer,
-  createDevDBConsoleLogger,
-} from "strataline/local-dev-db-server";
+import { LocalDevDBServer } from "strataline/local-dev-db-server";
+import { createConsoleLogger } from "strataline/logger";
 
 // Calculate paths relative to the current script
 const __filename = fileURLToPath(import.meta.url);
@@ -1437,7 +1474,7 @@ const server = new LocalDevDBServer({
   database: "myapp_dev",
   dataDir: DATA_DIR,
   pidFile: PID_FILE,
-  logger: createDevDBConsoleLogger(), // Optional: remove this line to run silently
+  logger: createConsoleLogger(), // Optional: remove this line to run silently
   // `|| 1`: onExit fires for any exit this process did not ask for, and a
   // clean shutdown from elsewhere (`pg_ctl stop`) exits 0, which would
   // otherwise report a vanished database as a successful run.
@@ -1581,21 +1618,18 @@ const server = new LocalDevDBServer({
 You can customize logging behavior using the built-in console logger:
 
 ```typescript
-import { createDevDBConsoleLogger } from "strataline/local-dev-db-server";
+import { createConsoleLogger } from "strataline/logger";
 
-// Create a logger with custom verbosity settings.
-// `pgVerbose` gates PostgreSQL's routine output only. Strataline reads the
-// severity PostgreSQL prints in its own lines, so a WARNING, ERROR, FATAL or
-// PANIC reaches your logger at that level and is shown either way: passing
-// false quiets "listening on IPv4 address" without hiding the FATAL that says
-// why the server would not start.
-// Defaults: createDevDBConsoleLogger(pgVerbose = true, setupVerbose = true) —
-// note both default to verbose here, unlike createTestDBConsoleLogger whose
-// pgVerbose defaults to false.
-const logger = createDevDBConsoleLogger(
-  true, // pgVerbose: show PostgreSQL's routine server logs
-  true, // setupVerbose: show setup/initialization logs
-);
+// Create a logger, naming any source you want quieted. Everything is shown
+// by default. Quieting affects routine `info` output only: Strataline reads
+// the severity PostgreSQL prints in its own lines, so a WARNING, ERROR, FATAL
+// or PANIC reaches your logger at that level and is shown either way. So
+// `{ pg: false }` quiets "listening on IPv4 address" without hiding the FATAL
+// that says why the server would not start.
+const logger = createConsoleLogger({
+  pg: false, // quiet PostgreSQL's routine server logs
+  setup: false, // quiet the startup and initialization steps
+});
 
 // Or implement your own logger
 const customLogger: Logger = {
@@ -1616,7 +1650,7 @@ function render(data: LogDataInput) {
 
 > **If your process _is_ the server, you own every way it can end.** This library never exits your process, so a script whose whole job is to run the dev server has two things to wire: a signal handler that stops the server and exits, and an `onExit` that exits when PostgreSQL dies on its own. Omit the second and ordinary flow control takes over. With nothing left pending the script exits by itself, but with code `0`, reporting a crashed database as a clean run. Exit non-zero from it rather than forwarding PostgreSQL's code as it stands, since a clean shutdown asked for from somewhere else, a `pg_ctl stop` for instance, reaches `onExit` with code `0` and would read as a successful run. Callers that legitimately carry on afterwards, such as tests or a provisioning step that stops the server and moves on, are exactly the ones that should not exit from there.
 
-The logger is the `Logger` interface exported from `strataline/migration`, and the `onExit` callback type is exported as `DevDBExitHandler` (`(exitCode: number) => void`), if you prefer the named types over writing the shapes inline. The constructor's configuration object is exported as `LocalDevDBServerConfig`, and `getLifecycleState()`'s return type as `DevDBLifecycleState`.
+The logger is the `Logger` interface exported from `strataline/logger`, and the `onExit` callback type is exported as `DevDBExitHandler` (`(exitCode: number) => void`), if you prefer the named types over writing the shapes inline. The constructor's configuration object is exported as `LocalDevDBServerConfig`, and `getLifecycleState()`'s return type as `DevDBLifecycleState`.
 
 #### Data Persistence
 

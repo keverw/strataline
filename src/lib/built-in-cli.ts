@@ -5,66 +5,7 @@ import {
 } from "./migration-system";
 import { Pool } from "pg";
 import { makeSafeLogger } from "./callback-safety";
-import {
-  BaseLogger,
-  ConsoleLogger,
-  createPrefixedLogger,
-  type LogDataInput,
-  type LogLevel,
-  type Logger,
-} from "./logger";
-
-/**
- * Console-based logger implementation for Strataline CLI
- *
- * A sink, so it is the one thing here that renders. Which lines it keeps is
- * decided by `source` rather than by a tag naming both the origin and the
- * severity: the migration system's own chatter is `source: "migration"`, and
- * quieting it is dropping that source at the `info` level rather than
- * recognizing a `migrate-info` string.
- *
- * @param migrateVerbose Whether to log verbose migration messages
- */
-export const createCLIConsoleLogger = (
-  migrateVerbose: boolean = true,
-): Logger => new CLIConsoleLogger(migrateVerbose);
-
-class CLIConsoleLogger extends BaseLogger {
-  private readonly console = new ConsoleLogger();
-  private readonly migrateVerbose: boolean;
-
-  constructor(migrateVerbose: boolean) {
-    super();
-    this.migrateVerbose = migrateVerbose;
-  }
-
-  info(data: LogDataInput): void {
-    this.write("info", data);
-  }
-
-  warn(data: LogDataInput): void {
-    this.write("warn", data);
-  }
-
-  error(data: LogDataInput): void {
-    this.write("error", data);
-  }
-
-  private write(level: LogLevel, data: LogDataInput): void {
-    // Only the migration system's routine chatter is quietened. Its warnings
-    // and errors are not: they were not gated before either, and a run that
-    // went wrong should say so however verbose the caller asked for.
-    if (
-      !this.migrateVerbose &&
-      level === "info" &&
-      data.source === "migration"
-    ) {
-      return;
-    }
-
-    this.console[level](data);
-  }
-}
+import { createPrefixedLogger, type Logger } from "./logger";
 
 async function testConnection(
   pool: Pool,

@@ -1,9 +1,7 @@
 import { join, dirname } from "path";
+import { createConsoleLogger } from "../src/logger";
 import { fileURLToPath } from "url";
-import {
-  LocalDevDBServer,
-  createDevDBConsoleLogger,
-} from "../src/local-dev-db-server";
+import { LocalDevDBServer } from "../src/local-dev-db-server";
 
 // Calculate paths relative to the current script
 const __filename = fileURLToPath(import.meta.url);
@@ -19,7 +17,7 @@ const server = new LocalDevDBServer({
   database: "myapp_dev",
   dataDir: DATA_DIR,
   pidFile: PID_FILE,
-  logger: createDevDBConsoleLogger(), // Optional: remove this line to run silently
+  logger: createConsoleLogger(), // Optional: remove this line to run silently
   // The library reports a server that died and does nothing else, which is
   // right: it has no business ending this process. With nothing left pending
   // the script would then exit on its own — but with code 0, reporting a

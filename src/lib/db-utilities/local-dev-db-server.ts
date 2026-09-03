@@ -17,14 +17,7 @@ import { dirname, isAbsolute, join, resolve } from "path";
 import { Client } from "pg";
 import { callHost, makeSafeLogger } from "../callback-safety";
 import { readOsUsername } from "../os-user";
-import {
-  BaseLogger,
-  ConsoleLogger,
-  type LogDataInput,
-  type LogLevel,
-  type LogSource,
-  type Logger,
-} from "../logger";
+import { type LogLevel, type LogSource, type Logger } from "../logger";
 import { PostgresBinaries, getBinaries } from "./pg-bin-helper";
 import {
   ipcExhaustionHint,
@@ -189,66 +182,6 @@ export type DevDBLifecycleState =
   | "stopping"
   /** A failed `start()` left a child that outlived even SIGKILL. */
   | "unstoppable";
-
-/**
- * Console-based logger implementation for LocalDevDBServer
- *
- * A sink, so it renders and nothing above it does. Which lines it keeps is
- * decided by `source`: PostgreSQL's own output is `source: "pg"` and startup
- * chatter is `source: "setup"`, so the two verbosity flags are source filters
- * rather than cases in a tag switch. The server's own lines carry no source
- * and are never filtered.
- *
- * @param pgVerbose Whether to log verbose PostgreSQL messages
- * @param setupVerbose Whether to log verbose setup messages
- */
-export const createDevDBConsoleLogger = (
-  pgVerbose: boolean = true,
-  setupVerbose: boolean = true,
-): Logger => new DevDBConsoleLogger(pgVerbose, setupVerbose);
-
-class DevDBConsoleLogger extends BaseLogger {
-  private readonly console = new ConsoleLogger();
-  private readonly show: Record<string, boolean>;
-
-  constructor(pgVerbose: boolean, setupVerbose: boolean) {
-    super();
-    this.show = { pg: pgVerbose, setup: setupVerbose };
-  }
-
-  info(data: LogDataInput): void {
-    this.write("info", data);
-  }
-
-  warn(data: LogDataInput): void {
-    this.write("warn", data);
-  }
-
-  error(data: LogDataInput): void {
-    this.write("error", data);
-  }
-
-  private write(level: LogLevel, data: LogDataInput): void {
-    // A source this logger was told to quieten, but only its routine output.
-    // A warning or an error is not chatter, and PostgreSQL now says which of
-    // its lines are which — see postgresOutputLevel — so `pgVerbose: false`
-    // quiets "listening on IPv4 address" without also hiding the FATAL that
-    // says why the server would not start.
-    //
-    // An unknown source is shown whatever its level: a host logging through
-    // this with a source of its own asked for that line, and silence it never
-    // requested is the worse failure.
-    if (
-      level === "info" &&
-      data.source !== undefined &&
-      this.show[data.source] === false
-    ) {
-      return;
-    }
-
-    this.console[level](data);
-  }
-}
 
 /**
  * Helper function to check if a file exists (async equivalent of existsSync)
