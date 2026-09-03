@@ -38,12 +38,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
 
-    # Windows has never run this suite. Until it has passed once, it reports
-    # its result without failing the run, so a real regression on the other two
-    # is not buried under a platform that was never known to work. Remove this
-    # line once Windows is green.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
-
     # The suite talks to a real PostgreSQL and starts and stops it repeatedly,
     # so it is slower than a unit-test run and the default six hours is no
     # bound at all for a job that has hung.
