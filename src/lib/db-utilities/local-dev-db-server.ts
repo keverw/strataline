@@ -21,6 +21,7 @@ import { type LogLevel, type LogSource, type Logger } from "../logger";
 import { PostgresBinaries, getBinaries } from "./pg-bin-helper";
 import {
   ipcExhaustionHint,
+  PINNED_LOG_LINE_PREFIX,
   PostgresOutputBuffer,
   PostgresOutputReader,
   type PostgresOutputRead,
@@ -2647,6 +2648,12 @@ export class LocalDevDBServer {
         // Force IPv4 only to avoid TCP_NODELAY socket errors
         "-c",
         "listen_addresses=127.0.0.1",
+        // Pinned rather than inherited from the data directory's own config.
+        // See PINNED_LOG_LINE_PREFIX: `%a` in a prefix is the connecting
+        // client's application_name, which is arbitrary text sitting ahead of
+        // the severity this reads.
+        "-c",
+        `log_line_prefix=${PINNED_LOG_LINE_PREFIX}`,
         // Add TCP configuration for better connection handling
         "-c",
         "tcp_keepalives_idle=600",

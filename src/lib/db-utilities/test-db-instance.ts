@@ -14,6 +14,7 @@ import { findFreePort } from "./free-port";
 import { isProcessAlive, readPostmasterPidFile } from "./pid-file";
 import {
   ipcExhaustionHint,
+  PINNED_LOG_LINE_PREFIX,
   PostgresOutputBuffer,
   PostgresOutputReader,
   type PostgresOutputRead,
@@ -509,7 +510,15 @@ export class TestDatabaseInstance {
       // on 127.0.0.1 and a client resolving `localhost` to ::1 is a connection
       // refused, so pinning one end without the other trades a rare failure
       // for a certain one.
-      postgresFlags: ["-c", `listen_addresses=${LOOPBACK_HOST}`],
+      // The prefix is pinned for the reason PINNED_LOG_LINE_PREFIX gives, and
+      // on this surface the data directory is a throwaway, so nothing is being
+      // overridden that anybody chose.
+      postgresFlags: [
+        "-c",
+        `listen_addresses=${LOOPBACK_HOST}`,
+        "-c",
+        `log_line_prefix=${PINNED_LOG_LINE_PREFIX}`,
+      ],
       onLog: (message: string) => {
         // Appended, not replaced. PostgreSQL writes a failed bind across
         // several chunks and the bind line is never the last of them: the real

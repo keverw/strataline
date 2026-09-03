@@ -4340,8 +4340,9 @@ describe("PostgresLineAssembler", () => {
 });
 
 describe("PostgresOutputReader", () => {
+  const p = "2026-09-02 19:32:50.954 MDT [64506] ";
   const line = (severity: string, message: string) =>
-    `2026-09-02 19:32:50.954 MDT [64506] ${severity}:  ${message}`;
+    `${p}${severity}:  ${message}`;
 
   it("reads a severity torn across two chunks", () => {
     const reader = new PostgresOutputReader();
@@ -4461,6 +4462,62 @@ describe("PostgresOutputReader", () => {
     // line the live one writes.
     expect(reader.take("Running: /path/to/initdb -D /tmp/pgdata\n")).toEqual([
       { text: "Running: /path/to/initdb -D /tmp/pgdata", level: "info" },
+    ]);
+  });
+
+  it("does not let a logged statement's own text start a message", () => {
+    const reader = new PostgresOutputReader();
+
+    // Captured from a real server, not invented. PostgreSQL logs the client's
+    // SQL verbatim under STATEMENT, and append_with_tabs indents every line of
+    // a message after the first -- which is the only thing separating the
+    // server's severity on line one from the two the client put inside a
+    // string literal. Without that, one error is delivered as three messages,
+    // two of them fabricated out of SQL text and outranking the real one.
+    const block = [
+      `${p}ERROR:  division by zero`,
+      `${p}STATEMENT:  SELECT 1/0, '`,
+      "\tERROR:  not a real error",
+      "\tWARNING:  nor this",
+      "\t'",
+      "",
+    ].join("\n");
+
+    expect(reader.take(block)).toEqual([
+      { text: block.trim(), level: "error" },
+    ]);
+  });
+
+  it("reads the severity only where the prefix says the message starts", () => {
+    const reader = new PostgresOutputReader();
+
+    // Defense in depth rather than a bug that was reachable: on well-formed
+    // output the first severity-shaped token IS the severity, so the loose
+    // scan agrees. What this pins down is the intent -- a severity counts only
+    // in the one position PostgreSQL puts it, right after the prefix -- so a
+    // prefixed line whose body starts with something else cannot have a level
+    // read out of its middle.
+    const odd = `${p}duration: 1.234 ms  ERROR: not the severity`;
+
+    expect(reader.take(odd + "\n")).toEqual([{ text: odd, level: "info" }]);
+
+    // And the ordinary prefixed line still reads exactly as before.
+    expect(reader.take(line("FATAL", "no sockets") + "\n")).toEqual([
+      { text: line("FATAL", "no sockets"), level: "error" },
+    ]);
+  });
+
+  it("still reads a severity where log_line_prefix is empty", () => {
+    const reader = new PostgresOutputReader();
+
+    // The reason the continuation test above keys on the indent rather than on
+    // a timestamp: log_line_prefix is configurable and may be empty, and such
+    // a cluster writes an ordinary record starting at column zero. Requiring a
+    // prefix would take every line from one back to `info`.
+    expect(
+      reader.take("FATAL:  could not create any TCP/IP sockets\n"),
+    ).toEqual([
+      { text: "FATAL:  could not create any TCP/IP sockets", level: "error" },
     ]);
   });
 

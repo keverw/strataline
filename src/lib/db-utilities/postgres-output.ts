@@ -154,28 +154,155 @@ export function postgresSeverity(text: string): LogLevel | null {
 }
 
 /**
+ * The line prefix both surfaces pin their clusters to.
+ *
+ * PostgreSQL's own default since 15, so on an ordinary cluster this changes
+ * nothing anyone sees. It is pinned rather than inherited because the value in
+ * force comes from the DATA DIRECTORY's postgresql.conf, not from the binary
+ * we spawn: the dev server's data directory persists between runs and can be
+ * edited, and a cluster copied from somewhere else brings its own.
+ *
+ * Two things follow from leaving it to that file, and only one of them is
+ * cosmetic. `log_line_prefix` accepts `%a`, the client's own
+ * `application_name`, which is arbitrary text a connecting client chooses. A
+ * client named `FATAL: ` would then put that word at the front of every line
+ * it caused, ahead of the real severity, and `postgresLineSeverity` takes the
+ * FIRST severity word on a line. Pinning removes every client-controlled
+ * escape from the prefix, so the only severity word before the real one is one
+ * PostgreSQL put there.
+ *
+ * The other is that an empty prefix, which is a legal setting, leaves a record
+ * indistinguishable from a message body by position alone. That is survivable
+ * on its own -- see POSTGRES_CONTINUATION, which keys on the indent rather
+ * than the prefix -- but there is no reason to accept it here when one
+ * argument settles it.
+ */
+export const PINNED_LOG_LINE_PREFIX = "%m [%p] ";
+
+/**
+ * PostgreSQL's own mark for "this line is the rest of the one above".
+ *
+ * `send_message_to_server_log` writes the prefix and then the message through
+ * `append_with_tabs`, which inserts a TAB after every newline in the body. So
+ * a message that spans lines has its prefix on the first line only and a tab
+ * at the front of every line after it, and nothing PostgreSQL emits as a NEW
+ * record is indented that way.
+ *
+ * Which makes this the one structural signal available here, and it needs no
+ * `log_line_prefix` to read. That matters because the prefix cannot be relied
+ * on in the other direction: it is configurable and may be EMPTY, and a
+ * cluster running with `log_line_prefix = ''` writes a perfectly ordinary
+ * `LOG:  ...` starting at column zero. Demanding a timestamp would take every
+ * line from such a server back to `info`.
+ *
+ * What it defends against is real, and was reproduced against a live server
+ * rather than imagined: a statement logged under STATEMENT carries the
+ * client's SQL verbatim, and SQL can contain anything.
+ *
+ *   ERROR:  division by zero
+ *   STATEMENT:  SELECT 1/0, '
+ *   \tERROR:  not a real error
+ *   \tWARNING:  nor this
+ *   \t'
+ *
+ * The tab is what separates the server's own severity on line 1 from the two
+ * the user put in a string literal. Without it that one error is delivered as
+ * three messages, two of them fabricated out of SQL text, and the two invented
+ * ones outrank most of what a real server says.
+ */
+const POSTGRES_CONTINUATION = /^\t/;
+
+/**
+ * The prefix {@link PINNED_LOG_LINE_PREFIX} produces, as a shape to recognize.
+ *
+ * `%m [%p] ` renders as `2026-09-03 17:24:45.275 MDT [91459] ` — a timestamp
+ * with milliseconds, a timezone, and the pid in brackets. Matching it is what
+ * lets a line say for itself that it is a new record, and it is only worth
+ * matching because the value is pinned on the command line rather than taken
+ * from the data directory.
+ *
+ * Used as a POSITIVE signal only, which is the whole of what makes it safe. A
+ * line that has it is certainly a record and its severity is certainly the
+ * word right after it. A line that lacks it is NOT thereby a continuation, and
+ * treating it as one would be the worst mistake available here: PostgreSQL's
+ * earliest failures are written by `write_stderr` before logging is
+ * configured, and carry no prefix at all. Confirmed against the bundled
+ * binary rather than assumed:
+ *
+ *   postgres: could not access directory "/nonexistent/pgdata": No such file...
+ *   Run initdb or pg_basebackup to initialize a PostgreSQL data directory.
+ *
+ * Those are the lines that say why a server would not start, which is the case
+ * this whole reader exists for. An empty `log_line_prefix` on a cluster this
+ * did not spawn is the same story. So a line without the prefix falls through
+ * to the scan below and is no worse off than it was.
+ */
+const POSTGRES_LINE_PREFIX =
+  /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} \S+ \[\d+\] /;
+
+/**
  * The severity ONE line states, or null when it starts no message of its own.
  *
  * The primitive under both readers, and the one that decides where a message
- * begins. A line reports null in two cases that mean the same thing here: it
- * carries a {@link POSTGRES_MESSAGE_FIELDS} word, so it is the rest of the
- * message above it, or it carries nothing this recognizes — a blank line, a
- * wrapped continuation, one of this library's own lines on the `pg` source.
- * None of those starts a message, so none of them ends the previous one.
+ * begins. A line reports null in three cases that mean the same thing here: it
+ * is indented as the continuation of the line above, per
+ * {@link POSTGRES_CONTINUATION}; it carries a {@link POSTGRES_MESSAGE_FIELDS}
+ * word, so it is another field of the message above it; or it carries nothing
+ * this recognizes — a blank line, one of this library's own lines on the `pg`
+ * source. None of those starts a message, so none of them ends the previous
+ * one.
  *
  * @internal Exported so the message boundary can be tested a line at a time.
  */
 export function postgresLineSeverity(line: string): LogLevel | null {
-  const match = POSTGRES_SEVERITY_PATTERN.exec(line);
+  // Ahead of everything else. A continuation carries whatever the client
+  // wrote, so the question is not which severity word is in this line but
+  // whether this line is entitled to state one at all.
+  if (POSTGRES_CONTINUATION.test(line)) {
+    return null;
+  }
 
-  if (!match || POSTGRES_MESSAGE_FIELDS.has(match[1])) {
+  // A line wearing the pinned prefix has told us where its message starts, so
+  // read the severity THERE rather than looking for one anywhere in the line.
+  // This is the tighter of the two paths and the reason the prefix is pinned:
+  // a severity word is accepted only in the one position PostgreSQL puts it,
+  // so nothing quoted, echoed, or interpolated further along can be read as
+  // one. A prefixed line whose message does not begin with a severity word is
+  // reported as stating none, which leaves it continuing whatever came before
+  // rather than inventing a level for it.
+  const prefixed = POSTGRES_LINE_PREFIX.exec(line);
+
+  if (prefixed) {
+    return severityWord(
+      /^([A-Z][A-Z0-9]*):/.exec(line.slice(prefixed[0].length))?.[1],
+    );
+  }
+
+  // No prefix: an empty `log_line_prefix`, a pre-logging `write_stderr` line,
+  // or a cluster somebody else configured. Fall back to the loose scan, which
+  // is where this started and is no worse than it was.
+  return severityWord(POSTGRES_SEVERITY_PATTERN.exec(line)?.[1]);
+}
+
+/** What a matched severity word means, or null when it starts no message. */
+function severityWord(word: string | undefined): LogLevel | null {
+  if (word === undefined || POSTGRES_MESSAGE_FIELDS.has(word)) {
+    return null;
+  }
+
+  if (
+    !(word in POSTGRES_SEVERITIES) &&
+    !/^(LOG|NOTICE|INFO|DEBUG[1-5]?)$/.test(word)
+  ) {
+    // Something colon-terminated that is not one of PostgreSQL's severities.
+    // Not a message boundary, and not a level.
     return null;
   }
 
   // Recognized but not raising — LOG, NOTICE, INFO, DEBUG — which still STATES
   // a level, and stating one is what makes it a message rather than a
   // continuation.
-  return POSTGRES_SEVERITIES[match[1]] ?? "info";
+  return POSTGRES_SEVERITIES[word] ?? "info";
 }
 
 /**
