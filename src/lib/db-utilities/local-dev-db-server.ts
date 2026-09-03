@@ -2595,7 +2595,24 @@ export class LocalDevDBServer {
         // pointed `dataDir` at by mistake, with files in it that are not
         // PostgreSQL's at all. Nothing here can tell those apart, and only one
         // of them is safe to remove, so say what is in the way instead.
-        if (code === "ENOTEMPTY" || code === "EEXIST" || code === "EXDEV") {
+        // EPERM and EACCES join the list only where the destination is
+        // actually there, which is what tells "the name is taken" apart from
+        // "this user may not write here". POSIX rename() replaces an empty
+        // destination directory and reports ENOTEMPTY for one holding
+        // anything; Windows MoveFile refuses a destination that exists at all
+        // and reports EPERM, so the same situation arrives under a different
+        // errno and used to fall through to a bare rename error naming two
+        // paths and no cause.
+        const destinationExists =
+          (code === "EPERM" || code === "EACCES") &&
+          (await fileExists(destination));
+
+        if (
+          code === "ENOTEMPTY" ||
+          code === "EEXIST" ||
+          code === "EXDEV" ||
+          destinationExists
+        ) {
           throw new Error(
             `${this.pgDataDir} already holds files but is not an initialized PostgreSQL cluster, so a new one could not be moved into place. ` +
               "It may be the remains of an interrupted first run, or a directory that is not meant to be a data directory at all. " +

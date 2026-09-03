@@ -53,8 +53,40 @@ afterEach(() => {
   }
 
   spawned = [];
-  rmSync(dir, { recursive: true, force: true });
+  removeWhenWindowsLetsGo(dir);
 });
+
+/**
+ * Removes a directory, retrying while Windows still holds a handle in it.
+ *
+ * A killed process is not immediately a released handle there: the kernel
+ * keeps the object until every reference goes, and a directory holding one
+ * cannot be removed, so this fails with EPERM on exactly the tests that spawn
+ * stand-ins. Waiting a moment and asking again is what makes it work, and
+ * `force` does not cover it because the file is not absent, it is busy.
+ *
+ * Best effort, and deliberately silent at the end. This is teardown of a
+ * temporary directory, and failing the test that just passed because the
+ * operating system was slow to let go would report a problem that is not
+ * there. The runner reclaims the directory either way.
+ */
+function removeWhenWindowsLetsGo(dir: string): void {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+
+      return;
+    } catch {
+      // Synchronous by necessity: this runs in an afterEach that other
+      // teardown depends on having finished.
+      const until = Date.now() + 100;
+
+      while (Date.now() < until) {
+        // Spin briefly rather than sleep, so the retry stays synchronous.
+      }
+    }
+  }
+}
 
 /**
  * Starts a stand-in process that presents the same command line shape as a
