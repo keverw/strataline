@@ -1537,6 +1537,15 @@ describe("probes on the platform actually being tested", () => {
   // not reach anything this process spawns afterwards, so the in-process
   // version of this test cannot fail and would assert nothing.
   test("read a start time whatever locale the caller is running in", async () => {
+    // About `ps` rendering lstart through strftime in the caller's locale,
+    // which is a POSIX problem and a POSIX fix. Windows reads the same value
+    // from a PowerShell round-trip timestamp, which is culture-invariant by
+    // construction and has nothing for a locale to change. See
+    // parseIsoTimestamp.
+    if (process.platform === "win32") {
+      return;
+    }
+
     const pid = await spawnFakePostgres(dataDir);
     const probeScript = join(dir, "probe-start-time.ts");
     const modulePath = new URL("./pid-file.ts", import.meta.url).pathname;

@@ -16,6 +16,7 @@ import {
   type LocalDevDBServerConfig,
   type ProcessProbes,
   postgresOutputLevel,
+  sameDataDir,
 } from "./local-dev-db-server";
 import { Pool } from "pg";
 import * as tmp from "tmp";
@@ -805,6 +806,14 @@ describe("LocalDevDBServer", () => {
   }, 180000);
 
   it("initializes a data directory that is a symlink to somewhere else", async () => {
+    // Creating one needs SeCreateSymbolicLinkPrivilege on Windows, which an
+    // ordinary account does not hold unless Developer Mode is on. The
+    // behavior under test is real there, but the fixture cannot be built, and
+    // a test that cannot arrange its own premise is not a failure.
+    if (process.platform === "win32") {
+      return;
+    }
+
     // Parking pgdata on another volume through a symlink is an ordinary thing
     // to do, and initdb handles it by simply following the link. rename() does
     // not: it refuses to replace a symlink's final component, so publishing a
@@ -3279,7 +3288,12 @@ describe("LocalDevDBServer", () => {
 
     expect(result.responded).toBe(true);
     expect(result.error).toBeNull();
-    expect(result.dataDir).toBe(dataDir);
+    // Through sameDataDir rather than as a string, which is the whole reason
+    // that function is exported. PostgreSQL reports data_directory with
+    // forward slashes on Windows, so "D:/a/.../pgdata" and "D:\\a\\...\\pgdata"
+    // are the same directory spelled two ways, and a caller comparing them by
+    // hand would read its own cluster as somebody else's.
+    expect(sameDataDir(result.dataDir ?? "", dataDir)).toBe(true);
     expect(result.startedAt).toBeGreaterThan(0);
 
     await server.stop();
