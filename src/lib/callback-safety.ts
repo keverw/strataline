@@ -1,10 +1,9 @@
 import {
   BaseLogger,
   ForwardingLogger,
-  buildLogPrefix,
-  getErrorMessage,
   type LogDataInput,
   type LogLevel,
+  type LogSource,
   type Logger,
 } from "./logger";
 
@@ -125,87 +124,6 @@ export function logSafely(
 
 const ESCALATION_MESSAGE = "A logger call failed and its line was lost";
 
-export type TaggedLoggerFunction<TType extends string> = (
-  type: TType,
-  message: string,
-) => void;
-
-/**
- * Wraps a tagged logger so calls cannot throw or reject unhandled.
- *
- * @internal Not part of the published API.
- */
-export function makeSafeTaggedLogger<TType extends string>(
-  logger: TaggedLoggerFunction<TType>,
-  errorType: NoInfer<TType>,
-): TaggedLoggerFunction<TType> {
-  return (type, message) =>
-    logSafely(
-      () => logger(type, message),
-      type === errorType
-        ? null
-        : (error) => logger(errorType, `${ESCALATION_MESSAGE}: ${error}`),
-    );
-}
-
-function renderTagged(data: LogDataInput, level: LogLevel): string {
-  const prefix = buildLogPrefix({ ...data, level });
-  const message =
-    level === "error" && data.error
-      ? `${data.message}: ${getErrorMessage(data.error)}`
-      : data.message;
-  return `${prefix}${message}`;
-}
-
-/**
- * Adapts a tagged logger function into an object-shaped Logger.
- *
- * @internal Not part of the published API.
- */
-export function taggedLoggerAsLogger<TType extends string>(
-  emit: TaggedLoggerFunction<TType> | undefined,
-  tags: {
-    info: NoInfer<TType>;
-    warn: NoInfer<TType>;
-    error: NoInfer<TType>;
-  },
-): Logger {
-  return new TaggedLoggerAdapter(emit, tags);
-}
-
-class TaggedLoggerAdapter<TType extends string> extends BaseLogger {
-  private readonly emit: TaggedLoggerFunction<TType> | undefined;
-  private readonly tags: { info: TType; warn: TType; error: TType };
-
-  constructor(
-    emit: TaggedLoggerFunction<TType> | undefined,
-    tags: { info: TType; warn: TType; error: TType },
-  ) {
-    super();
-    this.emit = emit;
-    this.tags = tags;
-  }
-
-  info(data: LogDataInput): void {
-    this.send("info", data);
-  }
-
-  warn(data: LogDataInput): void {
-    this.send("warn", data);
-  }
-
-  error(data: LogDataInput): void {
-    this.send("error", data);
-  }
-
-  private send(level: LogLevel, data: LogDataInput): void {
-    if (!this.emit) {
-      return;
-    }
-    this.emit(this.tags[level], renderTagged(data, level));
-  }
-}
-
 /**
  * Wraps a Logger so method calls cannot throw or reject unhandled.
  *
@@ -249,7 +167,11 @@ class SafeLogger extends ForwardingLogger {
     );
   }
 
-  createPrefixed(prefix: { task?: string; stage?: string }): Logger {
+  createPrefixed(prefix: {
+    source?: LogSource;
+    task?: string;
+    stage?: string;
+  }): Logger {
     const own = (this.inner as Partial<BaseLogger>).createPrefixed;
     if (typeof own !== "function") {
       return super.createPrefixed(prefix);

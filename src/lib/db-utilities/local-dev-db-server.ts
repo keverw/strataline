@@ -16,11 +16,15 @@ import { constants } from "fs";
 import { dirname, isAbsolute, join, resolve } from "path";
 import { userInfo } from "os";
 import { Client } from "pg";
+import { callHost, makeSafeLogger } from "../callback-safety";
 import {
-  callHost,
-  makeSafeTaggedLogger,
-  type TaggedLoggerFunction,
-} from "../callback-safety";
+  BaseLogger,
+  ConsoleLogger,
+  type LogDataInput,
+  type LogLevel,
+  type LogSource,
+  type Logger,
+} from "../logger";
 import { PostgresBinaries, getBinaries } from "./pg-bin-helper";
 import {
   buildDevDBPidRecord,
@@ -126,11 +130,26 @@ type RecordRemoval =
 const serversOwningAChild = new Set<LocalDevDBServer>();
 
 /**
- * Logger function type for LocalDevDBServer
+ * The vocabulary this class logs in, and the two axes each word maps to.
+ *
+ * Internal shorthand rather than an interface: a call site says `this.log("pg",
+ * ...)` and the table turns that into a level and a source. It is the same set
+ * of words the public logger used to take, which is why the call sites did not
+ * have to move, but they are no longer what a caller sees.
+ *
+ * The server's own voice carries NO source. It is the primary thing talking,
+ * so its lines read as they always did, unprefixed; a source is for saying
+ * that some OTHER thing is speaking through it.
  */
-export type DevDBLoggerFunction = TaggedLoggerFunction<
-  "info" | "error" | "warn" | "pg" | "setup"
->;
+const DEV_DB_LOG_TAGS = {
+  info: ["info", undefined],
+  warn: ["warn", undefined],
+  error: ["error", undefined],
+  pg: ["info", "pg"],
+  setup: ["info", "setup"],
+} as const satisfies Record<string, readonly [LogLevel, LogSource | undefined]>;
+
+type DevDBLogTag = keyof typeof DEV_DB_LOG_TAGS;
 
 /**
  * Reports that the server exited without being asked to, and why.
@@ -162,42 +181,53 @@ export type DevDBLifecycleState =
 
 /**
  * Console-based logger implementation for LocalDevDBServer
+ *
+ * A sink, so it renders and nothing above it does. Which lines it keeps is
+ * decided by `source`: PostgreSQL's own output is `source: "pg"` and startup
+ * chatter is `source: "setup"`, so the two verbosity flags are source filters
+ * rather than cases in a tag switch. The server's own lines carry no source
+ * and are never filtered.
+ *
  * @param pgVerbose Whether to log verbose PostgreSQL messages
  * @param setupVerbose Whether to log verbose setup messages
  */
 export const createDevDBConsoleLogger = (
   pgVerbose: boolean = true,
   setupVerbose: boolean = true,
-): DevDBLoggerFunction => {
-  return (type, message) => {
-    switch (type) {
-      case "info":
-        // eslint-disable-next-line no-console
-        console.log(message);
-        break;
-      case "error":
-        // eslint-disable-next-line no-console
-        console.error(message);
-        break;
-      case "warn":
-        // eslint-disable-next-line no-console
-        console.warn(message);
-        break;
-      case "pg":
-        if (pgVerbose) {
-          // eslint-disable-next-line no-console
-          console.log(`[PG] ${message}`);
-        }
-        break;
-      case "setup":
-        if (setupVerbose) {
-          // eslint-disable-next-line no-console
-          console.log(`[SETUP] ${message}`);
-        }
-        break;
+): Logger => new DevDBConsoleLogger(pgVerbose, setupVerbose);
+
+class DevDBConsoleLogger extends BaseLogger {
+  private readonly console = new ConsoleLogger();
+  private readonly show: Record<string, boolean>;
+
+  constructor(pgVerbose: boolean, setupVerbose: boolean) {
+    super();
+    this.show = { pg: pgVerbose, setup: setupVerbose };
+  }
+
+  info(data: LogDataInput): void {
+    this.write("info", data);
+  }
+
+  warn(data: LogDataInput): void {
+    this.write("warn", data);
+  }
+
+  error(data: LogDataInput): void {
+    this.write("error", data);
+  }
+
+  private write(level: LogLevel, data: LogDataInput): void {
+    // A source this logger was told to quieten. An unknown source is shown:
+    // a host logging through this with a source of its own asked for that
+    // line, and silence it never requested is the worse failure.
+    if (data.source !== undefined && this.show[data.source] === false) {
+      return;
     }
-  };
-};
+
+    this.console[level](data);
+  }
+}
 
 /**
  * Helper function to check if a file exists (async equivalent of existsSync)
@@ -293,7 +323,7 @@ export interface LocalDevDBServerConfig {
   database: string;
   dataDir: string;
   pidFile: string;
-  logger?: DevDBLoggerFunction;
+  logger?: Logger;
   onExit?: DevDBExitHandler;
   logConnections?: boolean;
 }
@@ -311,7 +341,7 @@ export class LocalDevDBServer {
   private pgDb: string;
   private pgDataDir: string;
   private pidFile: string;
-  private logger?: DevDBLoggerFunction;
+  private logger?: Logger;
   private onExit?: DevDBExitHandler;
   private logConnections: boolean;
   private currentUser: string;
@@ -422,8 +452,8 @@ export class LocalDevDBServer {
     this.pgDataDir = resolve(config.dataDir);
     this.pidFile = config.pidFile;
     // Wrapped on the way in, so nothing below has to remember to guard it and
-    // a failure degrades instead of ending the process. See makeSafeTaggedLogger.
-    this.logger = config.logger && makeSafeTaggedLogger(config.logger, "error");
+    // a failure degrades instead of ending the process. See makeSafeLogger.
+    this.logger = config.logger && makeSafeLogger(config.logger);
     this.onExit = config.onExit;
     this.logConnections = config.logConnections ?? false;
     this.currentUser = getCurrentUser();
@@ -453,13 +483,16 @@ export class LocalDevDBServer {
    * @param type Message type
    * @param message Message content
    */
-  private log(
-    type: "info" | "error" | "warn" | "pg" | "setup",
-    message: string,
-  ): void {
+  private log(type: DevDBLogTag, message: string): void {
+    if (!this.logger) {
+      return;
+    }
+
+    const [level, source] = DEV_DB_LOG_TAGS[type];
+
     // Guarded once when it was stored rather than here, so every call is
-    // covered by construction. See makeSafeTaggedLogger.
-    this.logger?.(type, message);
+    // covered by construction. See makeSafeLogger.
+    this.logger[level](source ? { source, message } : { message });
   }
 
   /**

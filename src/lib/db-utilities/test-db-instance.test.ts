@@ -212,9 +212,11 @@ describe("TestDatabaseInstance", () => {
 });
 
 describe("createTestDBConsoleLogger", () => {
-  it("should create a logger function", () => {
+  it("should create a logger", () => {
     const logger = createTestDBConsoleLogger();
-    expect(typeof logger).toBe("function");
+    expect(typeof logger.info).toBe("function");
+    expect(typeof logger.warn).toBe("function");
+    expect(typeof logger.error).toBe("function");
   });
 
   it("should handle different log types with console output captured", () => {
@@ -236,13 +238,22 @@ describe("createTestDBConsoleLogger", () => {
       const logger = createTestDBConsoleLogger(false, false); // Silent mode for pg and migrate
 
       // Test all log types
-      logger("info", "Test info message");
-      logger("error", "Test error message");
-      logger("warn", "Test warning message");
-      logger("pg", "Test PostgreSQL message");
-      logger("migrate-info", "Test migration info message");
-      logger("migrate-error", "Test migration error message");
-      logger("migrate-warn", "Test migration warning message");
+      logger.info({ message: "Test info message" });
+      logger.error({ message: "Test error message" });
+      logger.warn({ message: "Test warning message" });
+      logger.info({ source: "pg", message: "Test PostgreSQL message" });
+      logger.info({
+        source: "migration",
+        message: "Test migration info message",
+      });
+      logger.error({
+        source: "migration",
+        message: "Test migration error message",
+      });
+      logger.warn({
+        source: "migration",
+        message: "Test migration warning message",
+      });
 
       // Verify the console methods were called appropriately
       expect(logCalls).toContain("Test info message");
@@ -250,15 +261,13 @@ describe("createTestDBConsoleLogger", () => {
       expect(warnCalls).toContain("Test warning message");
       // pg and migrate messages should not be logged in silent mode
       expect(logCalls).not.toContain("[PG] Test PostgreSQL message");
-      expect(logCalls).not.toContain(
-        "[MIGRATE-INFO] Test migration info message",
-      );
-      expect(logCalls).not.toContain(
-        "[MIGRATE-ERROR] Test migration error message",
-      );
-      expect(logCalls).not.toContain(
-        "[MIGRATE-WARN] Test migration warning message",
-      );
+      expect(logCalls).not.toContain("[MIGRATION] Test migration info message");
+      // A migration WARNING and ERROR are not routine chatter, so quietening
+      // the source does not hide them. They also no longer land on
+      // console.log: the level is the method now, so they go where their
+      // severity says.
+      expect(errorCalls).toContain("[MIGRATION] Test migration error message");
+      expect(warnCalls).toContain("[MIGRATION] Test migration warning message");
     } finally {
       // Restore original console methods
       console.log = originalLog;
@@ -276,13 +285,13 @@ describe("createTestDBConsoleLogger", () => {
     try {
       const logger = createTestDBConsoleLogger(true, false); // pg verbose, migrate silent
 
-      logger("pg", "Test PostgreSQL message");
-      logger("migrate-info", "Test migration message");
+      logger.info({ source: "pg", message: "Test PostgreSQL message" });
+      logger.info({ source: "migration", message: "Test migration message" });
 
       // pg message should be logged with prefix
       expect(logCalls).toContain("[PG] Test PostgreSQL message");
       // migrate message should not be logged
-      expect(logCalls).not.toContain("[MIGRATE-INFO] Test migration message");
+      expect(logCalls).not.toContain("[MIGRATION] Test migration message");
     } finally {
       console.log = originalLog;
     }
@@ -297,13 +306,13 @@ describe("createTestDBConsoleLogger", () => {
     try {
       const logger = createTestDBConsoleLogger(false, true); // pg silent, migrate verbose
 
-      logger("pg", "Test PostgreSQL message");
-      logger("migrate-info", "Test migration message");
+      logger.info({ source: "pg", message: "Test PostgreSQL message" });
+      logger.info({ source: "migration", message: "Test migration message" });
 
       // pg message should not be logged
       expect(logCalls).not.toContain("[PG] Test PostgreSQL message");
       // migrate message should be logged with prefix
-      expect(logCalls).toContain("[MIGRATE-INFO] Test migration message");
+      expect(logCalls).toContain("[MIGRATION] Test migration message");
     } finally {
       console.log = originalLog;
     }
@@ -318,12 +327,12 @@ describe("createTestDBConsoleLogger", () => {
     try {
       const logger = createTestDBConsoleLogger(true, true); // both verbose
 
-      logger("pg", "Test PostgreSQL message");
-      logger("migrate-info", "Test migration message");
+      logger.info({ source: "pg", message: "Test PostgreSQL message" });
+      logger.info({ source: "migration", message: "Test migration message" });
 
       // Both messages should be logged with prefixes
       expect(logCalls).toContain("[PG] Test PostgreSQL message");
-      expect(logCalls).toContain("[MIGRATE-INFO] Test migration message");
+      expect(logCalls).toContain("[MIGRATION] Test migration message");
     } finally {
       console.log = originalLog;
     }
@@ -338,12 +347,12 @@ describe("createTestDBConsoleLogger", () => {
     try {
       const logger = createTestDBConsoleLogger(); // defaults: pgVerbose=false, migrateVerbose=true
 
-      logger("pg", "Test PostgreSQL message");
-      logger("migrate-info", "Test migration message");
+      logger.info({ source: "pg", message: "Test PostgreSQL message" });
+      logger.info({ source: "migration", message: "Test migration message" });
 
       // pg should not be logged (default false), migrate should be logged (default true)
       expect(logCalls).not.toContain("[PG] Test PostgreSQL message");
-      expect(logCalls).toContain("[MIGRATE-INFO] Test migration message");
+      expect(logCalls).toContain("[MIGRATION] Test migration message");
     } finally {
       console.log = originalLog;
     }

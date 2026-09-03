@@ -1,10 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, mock } from "bun:test";
 import { Pool } from "pg";
-import {
-  RunStratalineCLI,
-  createCLIConsoleLogger,
-  CLILoggerFunction,
-} from "./built-in-cli";
+import { RunStratalineCLI, createCLIConsoleLogger } from "./built-in-cli";
+import type { LogDataInput, LogLevel, Logger } from "./logger";
 import { TestDatabaseInstance } from "./db-utilities/test-db-instance";
 import { Migration } from "./migration-system";
 
@@ -12,9 +9,11 @@ import { Migration } from "./migration-system";
 const CLI_TESTS_VERBOSE_LOGGING = false; // Set to true to see logs during test execution
 
 describe("createCLIConsoleLogger", () => {
-  it("should create a logger function", () => {
+  it("should create a logger", () => {
     const logger = createCLIConsoleLogger();
-    expect(typeof logger).toBe("function");
+    expect(typeof logger.info).toBe("function");
+    expect(typeof logger.warn).toBe("function");
+    expect(typeof logger.error).toBe("function");
   });
 
   it("should log different message types correctly", () => {
@@ -35,34 +34,32 @@ describe("createCLIConsoleLogger", () => {
       const logger = createCLIConsoleLogger(true);
 
       // Test regular log types
-      logger("info", "Test info message");
-      logger("error", "Test error message");
-      logger("warn", "Test warning message");
+      logger.info({ message: "Test info message" });
+      logger.error({ message: "Test error message" });
+      logger.warn({ message: "Test warning message" });
 
       // Test migration log types
-      logger("migrate-info", "Test migration info");
-      logger("migrate-error", "Test migration error");
-      logger("migrate-warn", "Test migration warning");
+      logger.info({ source: "migration", message: "Test migration info" });
+      logger.error({ source: "migration", message: "Test migration error" });
+      logger.warn({ source: "migration", message: "Test migration warning" });
 
       // Verify console.log calls
       expect(mockLog).toHaveBeenCalledTimes(2);
       expect(mockLog).toHaveBeenCalledWith("Test info message");
-      expect(mockLog).toHaveBeenCalledWith(
-        "[MIGRATE-INFO] Test migration info",
-      );
+      expect(mockLog).toHaveBeenCalledWith("[MIGRATION] Test migration info");
 
       // Verify console.error calls
       expect(mockError).toHaveBeenCalledTimes(2);
       expect(mockError).toHaveBeenCalledWith("Test error message");
       expect(mockError).toHaveBeenCalledWith(
-        "[MIGRATE-ERROR] Test migration error",
+        "[MIGRATION] Test migration error",
       );
 
       // Verify console.warn calls
       expect(mockWarn).toHaveBeenCalledTimes(2);
       expect(mockWarn).toHaveBeenCalledWith("Test warning message");
       expect(mockWarn).toHaveBeenCalledWith(
-        "[MIGRATE-WARN] Test migration warning",
+        "[MIGRATION] Test migration warning",
       );
     } finally {
       // Restore original console methods
@@ -83,15 +80,15 @@ describe("createCLIConsoleLogger", () => {
       const logger = createCLIConsoleLogger(false);
 
       // Regular info should still be logged
-      logger("info", "Regular info");
+      logger.info({ message: "Regular info" });
 
       // Migration info should be suppressed
-      logger("migrate-info", "Migration info");
+      logger.info({ source: "migration", message: "Migration info" });
 
       // Verify console.log was only called once for regular info
       expect(mockLog).toHaveBeenCalledTimes(1);
       expect(mockLog).toHaveBeenCalledWith("Regular info");
-      expect(mockLog).not.toHaveBeenCalledWith("[MIGRATE-INFO] Migration info");
+      expect(mockLog).not.toHaveBeenCalledWith("[MIGRATION] Migration info");
     } finally {
       // Restore original console.log
       console.log = originalLog;
@@ -114,18 +111,20 @@ describe("RunStratalineCLI", () => {
     },
   ];
 
-  // Mock logger to capture logs
-  type LogType =
-    | "info"
-    | "error"
-    | "warn"
-    | "pg"
-    | "migrate-info"
-    | "migrate-error"
-    | "migrate-warn";
-  type LogEntry = { type: LogType; message: string; error?: any };
+  // Mock logger to capture logs. Two axes now: the level is the method that
+  // was called, the source is a field, and `type` is the pair spelled the way
+  // the old tags were so the assertions below still read the same.
+  type LogEntry = {
+    type: string;
+    level: LogLevel;
+    source?: string;
+    task?: string;
+    stage?: string;
+    message: string;
+    error?: any;
+  };
   let logEntries: LogEntry[];
-  let mockLogger: (type: LogType, message: string, error?: any) => void;
+  let mockLogger: Logger;
 
   // Test database instance
   let testDb: TestDatabaseInstance;
@@ -133,21 +132,28 @@ describe("RunStratalineCLI", () => {
   beforeEach(async () => {
     // Reset log entries
     logEntries = [];
-    mockLogger = (type, message, error) => {
-      logEntries.push({ type, message, error });
+    const record = (level: LogLevel) => (data: LogDataInput) => {
+      logEntries.push({
+        type: data.source ? `${data.source}-${level}` : level,
+        level,
+        source: data.source,
+        task: data.task,
+        stage: data.stage,
+        message: data.message,
+        error: data.error,
+      });
 
       if (CLI_TESTS_VERBOSE_LOGGING) {
-        // Use the actual CLI logger to print to console, respecting its formatting.
-        // Pass `true` for migrateVerbose to ensure all details are shown if verbose logging is on.
-        const consoleCliLogger = createCLIConsoleLogger(true);
-
-        if (type === "pg") {
-          // Add "PG: " prefix to postgres logs
-          consoleCliLogger("info", `PG: ${message}`);
-        } else {
-          consoleCliLogger(type, message);
-        }
+        // Use the actual CLI logger to print to console, respecting its
+        // formatting. Pass `true` for migrateVerbose so everything shows.
+        createCLIConsoleLogger(true)[level](data);
       }
+    };
+
+    mockLogger = {
+      info: record("info"),
+      warn: record("warn"),
+      error: record("error"),
     };
 
     // Create a test database instance
@@ -375,43 +381,49 @@ describe("RunStratalineCLI", () => {
           argv: ["node", "script.js", "run"],
         });
 
-        // ctx.logger is tagged with both the migration id (task) and the
-        // "dataMigration" phase (stage), so output is `[id] [dataMigration] ...`.
-        const expectedInfoMessage = `[${migrationId}] [dataMigration] ${logMessage}`;
-        const expectedWarnMessage = `[${migrationId}] [dataMigration] ${warnMessage}`;
-        const expectedErrorMessage = `[${migrationId}] [dataMigration] ${errorMessage}: ${errorObject.message}`;
+        // ctx.logger stamps the migration id as `task` and the phase as
+        // `stage`, and they arrive as FIELDS. They used to reach here baked
+        // into the message, because the adapter in between rendered them into
+        // a string on the way past; now nothing renders until a sink does, so
+        // a caller can group by migration without parsing anything.
+        const inThisPhase = (entry: LogEntry, level: LogLevel) =>
+          entry.type === `migration-${level}` &&
+          entry.task === migrationId &&
+          entry.stage === "dataMigration";
 
         const infoLog = logEntries.find(
-          (entry) =>
-            entry.type === "migrate-info" &&
-            entry.message === expectedInfoMessage,
+          (entry) => inThisPhase(entry, "info") && entry.message === logMessage,
         );
         expect(infoLog).toBeDefined();
-        expect(infoLog?.message).toBe(expectedInfoMessage);
 
         const warnLog = logEntries.find(
           (entry) =>
-            entry.type === "migrate-warn" &&
-            entry.message === expectedWarnMessage,
+            inThisPhase(entry, "warn") && entry.message === warnMessage,
         );
         expect(warnLog).toBeDefined();
-        expect(warnLog?.message).toBe(expectedWarnMessage);
 
         const errorLog = logEntries.find(
           (entry) =>
-            entry.type === "migrate-error" &&
-            entry.message === expectedErrorMessage,
+            inThisPhase(entry, "error") && entry.message === errorMessage,
         );
         expect(errorLog).toBeDefined();
-        expect(errorLog?.message).toBe(expectedErrorMessage);
-        expect(errorLog?.error).toBeUndefined(); // CLIStratalineLogger incorporates error.message into the string, but doesn't pass the object
 
-        // Check for successful data migration phase log from MigrationManager
+        // The error object itself, not its message spliced into the string.
+        // The old adapter could only hand over text, so this was asserted to be
+        // undefined; keeping the object is what the structured shape buys.
+        expect(errorLog?.error).toBe(errorObject);
+
+        // MigrationManager's own bookkeeping line, which deliberately does
+        // NOT carry `stage`: it uses the task-only logger and names the phase
+        // in the message itself, so that a line about the phase is not
+        // prefixed with the phase as well. See runDataMigrationPhase.
         const migrationManagerSuccessLog = logEntries.find(
           (entry) =>
-            entry.type === "migrate-info" &&
+            entry.type === "migration-info" &&
+            entry.task === migrationId &&
+            entry.stage === undefined &&
             entry.message ===
-              `[${migrationId}] [dataMigration] Data migration marked as complete via callback.`,
+              "[dataMigration] Data migration marked as complete via callback.",
         );
         expect(migrationManagerSuccessLog).toBeDefined();
       } finally {
@@ -538,29 +550,29 @@ describe("RunStratalineCLI", () => {
       const logger = createCLIConsoleLogger(true);
 
       // Test migration error logging
-      logger(
-        "migrate-error",
-        "[beforeSchema] Failed to create table: error details",
-      );
-      logger(
-        "migrate-error",
-        "[dataMigration] Failed to insert data: error details",
-      );
-      logger(
-        "migrate-error",
-        "[afterSchema] Failed to create index: error details",
-      );
+      logger.error({
+        source: "migration",
+        message: "[beforeSchema] Failed to create table: error details",
+      });
+      logger.error({
+        source: "migration",
+        message: "[dataMigration] Failed to insert data: error details",
+      });
+      logger.error({
+        source: "migration",
+        message: "[afterSchema] Failed to create index: error details",
+      });
 
       // Verify console.error calls with proper prefixes
       expect(mockError).toHaveBeenCalledTimes(3);
       expect(mockError).toHaveBeenCalledWith(
-        "[MIGRATE-ERROR] [beforeSchema] Failed to create table: error details",
+        "[MIGRATION] [beforeSchema] Failed to create table: error details",
       );
       expect(mockError).toHaveBeenCalledWith(
-        "[MIGRATE-ERROR] [dataMigration] Failed to insert data: error details",
+        "[MIGRATION] [dataMigration] Failed to insert data: error details",
       );
       expect(mockError).toHaveBeenCalledWith(
-        "[MIGRATE-ERROR] [afterSchema] Failed to create index: error details",
+        "[MIGRATION] [afterSchema] Failed to create index: error details",
       );
     } finally {
       // Restore original console methods
@@ -584,19 +596,28 @@ describe("RunStratalineCLI", () => {
       const afterSchemaError = new Error("Error in afterSchema phase");
 
       // Log errors with phase prefixes
-      logger("migrate-error", `[beforeSchema] ${beforeSchemaError.message}`);
-      logger("migrate-error", `[dataMigration] ${dataMigrationError.message}`);
-      logger("migrate-error", `[afterSchema] ${afterSchemaError.message}`);
+      logger.error({
+        source: "migration",
+        message: `[beforeSchema] ${beforeSchemaError.message}`,
+      });
+      logger.error({
+        source: "migration",
+        message: `[dataMigration] ${dataMigrationError.message}`,
+      });
+      logger.error({
+        source: "migration",
+        message: `[afterSchema] ${afterSchemaError.message}`,
+      });
 
       // Verify error messages are logged with correct prefixes
       expect(mockError).toHaveBeenCalledWith(
-        "[MIGRATE-ERROR] [beforeSchema] Error in beforeSchema phase",
+        "[MIGRATION] [beforeSchema] Error in beforeSchema phase",
       );
       expect(mockError).toHaveBeenCalledWith(
-        "[MIGRATE-ERROR] [dataMigration] Error in dataMigration phase",
+        "[MIGRATION] [dataMigration] Error in dataMigration phase",
       );
       expect(mockError).toHaveBeenCalledWith(
-        "[MIGRATE-ERROR] [afterSchema] Error in afterSchema phase",
+        "[MIGRATION] [afterSchema] Error in afterSchema phase",
       );
     } finally {
       // Restore original console methods
@@ -615,19 +636,28 @@ describe("RunStratalineCLI", () => {
       const logger = createCLIConsoleLogger(true);
 
       // Test migration errors with different phase prefixes
-      logger("migrate-error", "[beforeSchema] Error in schema creation");
-      logger("migrate-error", "[dataMigration] Error in data migration");
-      logger("migrate-error", "[afterSchema] Error in post-schema operations");
+      logger.error({
+        source: "migration",
+        message: "[beforeSchema] Error in schema creation",
+      });
+      logger.error({
+        source: "migration",
+        message: "[dataMigration] Error in data migration",
+      });
+      logger.error({
+        source: "migration",
+        message: "[afterSchema] Error in post-schema operations",
+      });
 
       // Verify console.error calls preserve the phase prefixes
       expect(mockError).toHaveBeenCalledWith(
-        "[MIGRATE-ERROR] [beforeSchema] Error in schema creation",
+        "[MIGRATION] [beforeSchema] Error in schema creation",
       );
       expect(mockError).toHaveBeenCalledWith(
-        "[MIGRATE-ERROR] [dataMigration] Error in data migration",
+        "[MIGRATION] [dataMigration] Error in data migration",
       );
       expect(mockError).toHaveBeenCalledWith(
-        "[MIGRATE-ERROR] [afterSchema] Error in post-schema operations",
+        "[MIGRATION] [afterSchema] Error in post-schema operations",
       );
     } finally {
       // Restore original console methods
@@ -637,18 +667,31 @@ describe("RunStratalineCLI", () => {
 
   // Test with actual migration errors - separate tests for each phase
   describe("should handle real migration errors correctly", () => {
-    // Create a test logger function
+    // Create a test logger
     const createTestLogger = (verbose = CLI_TESTS_VERBOSE_LOGGING) => {
       const capturedErrors: string[] = [];
-      const testLogger: CLILoggerFunction = (type, message) => {
-        if (verbose) {
-          console.log(`Logger: [${type}] ${message}`);
-        }
+      const say =
+        (level: LogLevel) =>
+        (data: LogDataInput): void => {
+          if (verbose) {
+            console.log(
+              `Logger: [${data.source ? `${data.source}-` : ""}${level}] ${data.message}`,
+            );
+          }
 
-        if (type === "error" || type === "migrate-error") {
-          capturedErrors.push(message);
-        }
+          // Every error, whichever source it came from. That is both halves of
+          // what "error" and "migrate-error" used to name between them.
+          if (level === "error") {
+            capturedErrors.push(data.message);
+          }
+        };
+
+      const testLogger: Logger = {
+        info: say("info"),
+        warn: say("warn"),
+        error: say("error"),
       };
+
       return { testLogger, capturedErrors };
     };
 

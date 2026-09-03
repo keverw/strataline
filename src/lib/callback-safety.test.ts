@@ -1,10 +1,5 @@
 import { describe, it, expect, afterEach } from "bun:test";
-import {
-  callHost,
-  logSafely,
-  makeSafeLogger,
-  makeSafeTaggedLogger,
-} from "./callback-safety";
+import { callHost, logSafely, makeSafeLogger } from "./callback-safety";
 import {
   BaseLogger,
   createPrefixedLogger,
@@ -657,63 +652,6 @@ describe("reportLoggerFailure, through logSafely's last rung", () => {
       expect(lines).toHaveLength(1);
       expect("reportError" in scope).toBe(false);
       expect("dispatchEvent" in scope).toBe(false);
-    } finally {
-      restore();
-    }
-  });
-});
-
-describe("makeSafeTaggedLogger", () => {
-  it("passes calls through unchanged", () => {
-    const seen: Array<[string, string]> = [];
-    const safe = makeSafeTaggedLogger<"info" | "error" | "setup">(
-      (type, message) => seen.push([type, message]),
-      "error",
-    );
-
-    safe("setup", "hello");
-
-    expect(seen).toEqual([["setup", "hello"]]);
-  });
-
-  it("re-reports a failed level through the error tag", () => {
-    const seen: Array<[string, string]> = [];
-    const safe = makeSafeTaggedLogger<"info" | "error" | "setup">(
-      (type, message) => {
-        if (type === "setup") {
-          throw new Error("setup sink down");
-        }
-
-        seen.push([type, message]);
-      },
-      "error",
-    );
-
-    safe("setup", "hello");
-
-    expect(seen).toHaveLength(1);
-    expect(seen[0][0]).toBe("error");
-    expect(seen[0][1]).toContain("setup sink down");
-  });
-
-  it("does not re-report a failed error tag through itself", async () => {
-    // Otherwise every broken logger makes the same failing call twice.
-    const { reported, restore } = stubReportError();
-
-    let calls = 0;
-
-    try {
-      const safe = makeSafeTaggedLogger<"info" | "error">(() => {
-        calls++;
-        throw new Error("everything is down");
-      }, "error");
-
-      safe("error", "hello");
-
-      await settle();
-
-      expect(calls).toBe(1);
-      expect(reported).toHaveLength(1);
     } finally {
       restore();
     }

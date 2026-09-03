@@ -34,6 +34,24 @@ import {
 import { spawn, execFileSync } from "child_process";
 import { createServer } from "net";
 import { findFreePort } from "./free-port";
+import type { LogDataInput, LogLevel, Logger } from "../logger";
+
+/**
+ * Records lines as "tag:message", the shape the assertions here were written
+ * against when the logger took a tag. The tag is rebuilt from the two axes it
+ * used to be: the source where there is one, the level otherwise.
+ */
+function captureLogger(logs: string[]): Logger {
+  const record = (level: LogLevel) => (data: LogDataInput) => {
+    logs.push(`${data.source ?? level}:${data.message}`);
+  };
+
+  return {
+    info: record("info"),
+    warn: record("warn"),
+    error: record("error"),
+  };
+}
 
 /** One SysV shared memory segment, as `ipcs` reports it. */
 interface ShmSegment {
@@ -397,7 +415,7 @@ describe("LocalDevDBServer", () => {
       database: "orphan_database",
       dataDir: join(tempDir.name, "orphan-pgdata"),
       pidFile: join(tempDir.name, ".orphan_pg_pid"),
-      logger: (type, message) => logs.push(`${type}:${message}`),
+      logger: captureLogger(logs),
     });
 
     await orphaned.start();
@@ -471,7 +489,7 @@ describe("LocalDevDBServer", () => {
         database: `${slug}_database`,
         dataDir: join(tempDir.name, `${slug}-pgdata`),
         pidFile: join(tempDir.name, `.${slug}_pg_pid`),
-        logger: (type, message) => logs.push(`${type}:${message}`),
+        logger: captureLogger(logs),
         onExit,
       });
 
@@ -1088,10 +1106,12 @@ describe("LocalDevDBServer", () => {
       dataDir: join(tempDir.name, "noisy-pgdata"),
       pidFile: join(tempDir.name, ".noisy_pg_pid"),
       onExit: () => {},
-      logger: (type) => {
-        if (type === "error") {
+      logger: {
+        info: () => {},
+        warn: () => {},
+        error: () => {
           throw new Error("logger blew up");
-        }
+        },
       },
     });
 
@@ -3909,9 +3929,11 @@ describe("LocalDevDBServer", () => {
       expect(process.listenerCount(event)).toBe(before.get(event) ?? 0);
     }
   });
-  it("should create a logger function", () => {
+  it("should create a logger", () => {
     const logger = createDevDBConsoleLogger();
-    expect(typeof logger).toBe("function");
+    expect(typeof logger.info).toBe("function");
+    expect(typeof logger.warn).toBe("function");
+    expect(typeof logger.error).toBe("function");
   });
 
   it("should handle different log types", () => {
@@ -3933,11 +3955,11 @@ describe("LocalDevDBServer", () => {
       const logger = createDevDBConsoleLogger(false, false); // Silent mode
 
       // These should not throw errors
-      logger("info", "Test info message");
-      logger("error", "Test error message");
-      logger("warn", "Test warning message");
-      logger("pg", "Test PostgreSQL message");
-      logger("setup", "Test setup message");
+      logger.info({ message: "Test info message" });
+      logger.error({ message: "Test error message" });
+      logger.warn({ message: "Test warning message" });
+      logger.info({ source: "pg", message: "Test PostgreSQL message" });
+      logger.info({ source: "setup", message: "Test setup message" });
 
       // Verify the console methods were called appropriately
       expect(logCalls).toContain("Test info message");

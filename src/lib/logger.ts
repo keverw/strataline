@@ -4,9 +4,31 @@
 export type LogLevel = "info" | "warn" | "error";
 
 /**
+ * Where a line came from, as opposed to how bad it is.
+ *
+ * The second of the two axes a log line has, and for a long time this library
+ * had only one name for both. A "tag" was `info | warn | error | pg | setup` on
+ * the dev server and `info | warn | error | migrate-info | migrate-warn |
+ * migrate-error` on the CLI: severity and origin crossed into a single enum,
+ * spelled out by hand, differently per surface. It went wrong in the ways
+ * crossing two axes does. `pg` and `setup` had no severity at all, so a
+ * PostgreSQL FATAL and a routine startup line were both an ordinary log; and
+ * `migrate-` was a namespace built out of string prefixes, so the three tag
+ * sets shared no type and adding a level meant editing each of them.
+ *
+ * Severity is the method you call. This is the other axis, and it is a field.
+ *
+ * Open rather than a union, because a host embedding this library has its own
+ * sources and nothing here should have to know them.
+ */
+export type LogSource = "server" | "pg" | "setup" | "migration" | (string & {});
+
+/**
  * Log data input structure (without level, which is determined by the method called)
  */
 export interface LogDataInput {
+  /** Where the line came from. See {@link LogSource}. */
+  source?: LogSource;
   task?: string;
   stage?: string;
   message: string;
@@ -59,6 +81,14 @@ export function getErrorMessage(error: unknown): string {
 export function buildLogPrefix(data: LogData): string {
   const parts: string[] = [];
 
+  // Source first, and upper-cased, which is where the surfaces that used to
+  // render their own tags put it: "[PG]", "[SETUP]", "[MIGRATE-INFO]". Only
+  // the origin survives that move, since the level half of those tags is the
+  // method being called now.
+  if (data.source) {
+    parts.push(`[${data.source.toUpperCase()}]`);
+  }
+
   if (data.task) {
     parts.push(`[${data.task}]`);
   }
@@ -93,7 +123,11 @@ export abstract class BaseLogger implements Logger {
   /**
    * Create a prefixed logger that includes task and stage information
    */
-  createPrefixed(prefix: { task?: string; stage?: string }): Logger {
+  createPrefixed(prefix: {
+    source?: LogSource;
+    task?: string;
+    stage?: string;
+  }): Logger {
     return new PrefixedLogger(this, prefix);
   }
 }
@@ -212,8 +246,20 @@ export class ConsoleLogger extends BaseLogger {
   error(data: LogDataInput): void {
     const logData: LogData = { ...data, level: "error" };
     const prefix = buildLogPrefix(logData);
+    const line = `${prefix}${logData.message}`;
+
+    // Only when there IS one. `console.error(line, undefined)` prints the word
+    // "undefined" after the message, which is every error line that carries no
+    // error object — most of them, since a message often says the whole thing.
+    if (logData.error === undefined) {
+      // eslint-disable-next-line no-console
+      console.error(line);
+
+      return;
+    }
+
     // eslint-disable-next-line no-console
-    console.error(`${prefix}${logData.message}`, logData.error);
+    console.error(line, logData.error);
   }
 
   /**
@@ -288,12 +334,15 @@ export class MutableLogger extends ForwardingLogger {
  * @internal This class is intended for internal use only
  */
 export class PrefixedLogger extends ForwardingLogger {
-  private prefix: { task?: string; stage?: string };
+  private prefix: { source?: LogSource; task?: string; stage?: string };
 
   /**
    * Create a new prefixed logger
    */
-  constructor(baseLogger: Logger, prefix: { task?: string; stage?: string }) {
+  constructor(
+    baseLogger: Logger,
+    prefix: { source?: LogSource; task?: string; stage?: string },
+  ) {
     super(baseLogger);
     this.prefix = prefix;
   }
@@ -301,6 +350,7 @@ export class PrefixedLogger extends ForwardingLogger {
   protected override transform(data: LogDataInput): LogDataInput {
     return {
       ...data,
+      source: data.source || this.prefix.source,
       task: data.task || this.prefix.task,
       stage: data.stage || this.prefix.stage,
     };
@@ -318,7 +368,7 @@ export const consoleLogger: Logger = new ConsoleLogger();
  */
 export function createPrefixedLogger(
   baseLogger: Logger,
-  prefix: { task?: string; stage?: string },
+  prefix: { source?: LogSource; task?: string; stage?: string },
 ): Logger {
   // Asked for by the method rather than by the class. A logger that can prefix
   // itself should be the one to do it, and whether it happens to descend from

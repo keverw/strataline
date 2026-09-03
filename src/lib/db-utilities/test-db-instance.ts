@@ -1,10 +1,15 @@
 import { Pool } from "pg";
 import { MigrationManager, Migration } from "../migration-system";
+import { makeSafeLogger } from "../callback-safety";
 import {
-  makeSafeTaggedLogger,
-  taggedLoggerAsLogger,
-  type TaggedLoggerFunction,
-} from "../callback-safety";
+  BaseLogger,
+  ConsoleLogger,
+  createPrefixedLogger,
+  type LogDataInput,
+  type LogLevel,
+  type LogSource,
+  type Logger,
+} from "../logger";
 import EmbeddedPostgres from "embedded-postgres";
 import * as tmp from "tmp";
 import { findFreePort } from "./free-port";
@@ -18,62 +23,87 @@ const DEFAULT_DB_NAME = "test_database";
 /**
  * Logger function type for TestDatabaseInstance
  */
-export type TestDBLoggerFunction = TaggedLoggerFunction<
-  | "info"
-  | "error"
-  | "warn"
-  | "pg"
-  | "migrate-info"
-  | "migrate-error"
-  | "migrate-warn"
->;
+/**
+ * The vocabulary this class logs in, and the two axes each word maps to.
+ *
+ * Internal shorthand, the same way LocalDevDBServer keeps one. The `migrate-`
+ * words were a source and a level crossed into a string; here they come apart
+ * into `source: "migration"` and the level they always meant.
+ */
+const TEST_DB_LOG_TAGS = {
+  info: ["info", undefined],
+  warn: ["warn", undefined],
+  error: ["error", undefined],
+  pg: ["info", "pg"],
+  "migrate-info": ["info", "migration"],
+  "migrate-warn": ["warn", "migration"],
+  "migrate-error": ["error", "migration"],
+} as const satisfies Record<string, readonly [LogLevel, LogSource | undefined]>;
+
+type TestDBLogTag = keyof typeof TEST_DB_LOG_TAGS;
+
+/** Somewhere for lines to go when no logger was supplied. */
+const noOpLogger: Logger = {
+  info: () => {},
+  warn: () => {},
+  error: () => {},
+};
 
 /**
  * Console-based logger implementation for TestDatabase
+ *
+ * A sink. Its two verbosity flags are source filters: PostgreSQL's own output
+ * is `source: "pg"` and the migration system's is `source: "migration"`.
+ *
  * @param pgVerbose Whether to log verbose PostgreSQL messages
  * @param migrateVerbose Whether to log verbose migration messages
  */
 export const createTestDBConsoleLogger = (
   pgVerbose: boolean = false,
   migrateVerbose: boolean = true,
-): TestDBLoggerFunction => {
-  return (type, message) => {
-    switch (type) {
-      case "info":
-        // eslint-disable-next-line no-console
-        console.log(message);
-        break;
-      case "error":
-        // eslint-disable-next-line no-console
-        console.error(message);
-        break;
-      case "warn":
-        // eslint-disable-next-line no-console
-        console.warn(message);
-        break;
-      case "pg":
-        if (pgVerbose) {
-          // eslint-disable-next-line no-console
-          console.log(`[PG] ${message}`);
-        }
-        break;
-      case "migrate-info":
-        if (migrateVerbose) {
-          // eslint-disable-next-line no-console
-          console.log(`[MIGRATE-INFO] ${message}`);
-        }
-        break;
-      case "migrate-error":
-        // eslint-disable-next-line no-console
-        console.error(`[MIGRATE-ERROR] ${message}`);
-        break;
-      case "migrate-warn":
-        // eslint-disable-next-line no-console
-        console.warn(`[MIGRATE-WARN] ${message}`);
-        break;
+): Logger => new TestDBConsoleLogger(pgVerbose, migrateVerbose);
+
+class TestDBConsoleLogger extends BaseLogger {
+  private readonly console = new ConsoleLogger();
+  private readonly pgVerbose: boolean;
+  private readonly migrateVerbose: boolean;
+
+  constructor(pgVerbose: boolean, migrateVerbose: boolean) {
+    super();
+    this.pgVerbose = pgVerbose;
+    this.migrateVerbose = migrateVerbose;
+  }
+
+  info(data: LogDataInput): void {
+    this.write("info", data);
+  }
+
+  warn(data: LogDataInput): void {
+    this.write("warn", data);
+  }
+
+  error(data: LogDataInput): void {
+    this.write("error", data);
+  }
+
+  private write(level: LogLevel, data: LogDataInput): void {
+    if (!this.pgVerbose && data.source === "pg") {
+      return;
     }
-  };
-};
+
+    // Only the migration system's routine chatter, as in the CLI: a warning or
+    // an error from a migration is not something a verbosity flag should hide.
+    if (
+      !this.migrateVerbose &&
+      level === "info" &&
+      data.source === "migration"
+    ) {
+      return;
+    }
+
+    this.console[level](data);
+  }
+}
 
 /**
  * Configuration options for {@link TestDatabaseInstance}. All fields are
@@ -82,7 +112,7 @@ export const createTestDBConsoleLogger = (
  */
 export interface TestDatabaseOptions {
   port?: number;
-  logger?: TestDBLoggerFunction;
+  logger?: Logger;
   user?: string;
   password?: string;
   databaseName?: string;
@@ -113,7 +143,7 @@ export class TestDatabaseInstance {
   private migrationsApplied: boolean = false;
   private tempDir?: string;
   private port: number;
-  private logger?: TestDBLoggerFunction;
+  private logger?: Logger;
   private user: string;
   private password: string;
   private databaseName: string;
@@ -129,8 +159,7 @@ export class TestDatabaseInstance {
     // Wrapped on the way in, so no call site below has to guard it and a
     // logger that throws loses its line rather than the process. The other two
     // entry points do the same; this one was simply missed.
-    this.logger =
-      options.logger && makeSafeTaggedLogger(options.logger, "error");
+    this.logger = options.logger && makeSafeLogger(options.logger);
     this.user = options.user || DEFAULT_DB_USER;
     this.password = options.password || DEFAULT_DB_PASSWORD;
     this.databaseName = options.databaseName || DEFAULT_DB_NAME;
@@ -142,20 +171,14 @@ export class TestDatabaseInstance {
    * @param type Message type
    * @param message Message content
    */
-  private log(
-    type:
-      | "info"
-      | "error"
-      | "warn"
-      | "pg"
-      | "migrate-info"
-      | "migrate-error"
-      | "migrate-warn",
-    message: string,
-  ): void {
-    if (this.logger) {
-      this.logger(type, message);
+  private log(type: TestDBLogTag, message: string): void {
+    if (!this.logger) {
+      return;
     }
+
+    const [level, source] = TEST_DB_LOG_TAGS[type];
+
+    this.logger[level](source ? { source, message } : { message });
   }
 
   /**
@@ -359,10 +382,8 @@ export class TestDatabaseInstance {
     // Create a strataline logger adapter using our logger (if any)
     // Marked as the migration system's lines rather than the test database's
     // own, which is what the `migrate-` half of the tag set is for.
-    const stratalineLogger = taggedLoggerAsLogger(this.logger, {
-      info: "migrate-info",
-      warn: "migrate-warn",
-      error: "migrate-error",
+    const stratalineLogger = createPrefixedLogger(this.logger ?? noOpLogger, {
+      source: "migration",
     });
     const migrationManager = new MigrationManager(this.pool, stratalineLogger);
 

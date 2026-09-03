@@ -356,7 +356,7 @@ import { RunStratalineCLI, createCLIConsoleLogger } from "strataline/cli";
 import { migrations } from "../path/to/your/migrations";
 
 // Use the built-in CLI console logger. The single argument is `migrateVerbose`
-// (default `true`): it gates only the verbose per-migration `[MIGRATE-INFO]`
+// (default `true`): it gates only the verbose per-migration `[MIGRATION]` info
 // lines. Migration errors/warnings and the CLI's own info always print, so
 // passing `false` quiets the chatter without hiding problems. You can customize
 // this or implement your own logger if needed.
@@ -480,7 +480,7 @@ interface StratalineCLIResult {
 
 > **`status` and `reason` are populated only for the `run` command.** The `status`/`help` commands resolve with just `{ command, exitCode: 0 }`, so `result.status` and `result.reason` are `undefined` for them. Branch on `result.command` (or check for `undefined`) before reading `status`.
 
-The CLI logger type is exported as `CLILoggerFunction` (the signature of the `logger` you pass to `RunStratalineCLI`, and what `createCLIConsoleLogger` returns).
+The `logger` you pass to `RunStratalineCLI`, and what `createCLIConsoleLogger` returns, is the `Logger` interface exported from `strataline/migration`. The CLI's own lines carry no `source`, and the migration system's carry `source: "migration"`.
 
 #### Graceful Shutdown
 
@@ -1299,39 +1299,36 @@ const testDb = new TestDatabaseInstance({
 });
 
 // Or implement your own logger
-const customLogger = (
-  type:
-    | "info"
-    | "error"
-    | "warn"
-    | "pg"
-    | "migrate-info"
-    | "migrate-error"
-    | "migrate-warn",
-  message: string,
-) => {
-  // Types: info/error/warn (general), pg (PostgreSQL server), migrate-info/migrate-error/migrate-warn (Strataline migrations)
-  console.log(`[${type.toUpperCase()}] ${message}`);
+const customLogger: Logger = {
+  info: (data) => console.log(render(data)),
+  warn: (data) => console.warn(render(data)),
+  error: (data) => console.error(render(data), data.error ?? ""),
 };
+
+// Severity is the method that was called. `source` says which part of the
+// system is talking: "pg" is the PostgreSQL server, "migration" is Strataline's
+// migration system, and no source at all is the test database's own voice.
+function render(data: LogDataInput) {
+  const from = data.source ? `[${data.source.toUpperCase()}] ` : "";
+
+  return `${from}${data.message}`;
+}
 ```
 
-This logger signature is exported as `TestDBLoggerFunction` if you prefer to annotate your logger with the named type instead of writing the shape inline. The constructor's options object is likewise exported as `TestDatabaseOptions`.
+The logger is the `Logger` interface exported from `strataline/migration`, and the data it receives is `LogDataInput`. The constructor's options object is exported as `TestDatabaseOptions`.
 
 ##### Migration Logging
 
 The TestDatabaseInstance automatically creates a Strataline-compatible logger adapter that works with or without a provided logger:
 
-- If you provide a logger, migration logs will be sent through your logger with the appropriate type:
-  - `migrate-info`: For informational migration logs
-  - `migrate-error`: For migration errors
-  - `migrate-warn`: For migration warnings
+- If you provide a logger, migration logs reach it with `source: "migration"`, at whichever level the migration system used
 - If you don't provide a logger, migrations will run silently with no logs
 
 When you provide a logger to TestDatabaseInstance, it will:
 
-1. Use that logger for its own operation logs (info, error, warn)
-2. Use that logger for PostgreSQL logs (pg)
-3. Automatically create an adapter to send Strataline migration logs through the same logger (migrate-info, migrate-error, migrate-warn)
+1. Use that logger for its own operation logs, which carry no `source`
+2. Use that logger for PostgreSQL logs, which carry `source: "pg"`
+3. Send Strataline migration logs through the same logger with `source: "migration"`
 
 This ensures all logs flow through a single logging interface, making it easy to direct logs to your preferred destination.
 
@@ -1591,18 +1588,25 @@ const logger = createDevDBConsoleLogger(
 );
 
 // Or implement your own logger
-const customLogger = (
-  type: "info" | "error" | "warn" | "pg" | "setup",
-  message: string,
-) => {
-  // Types: info/error/warn (general), pg (PostgreSQL server), setup (initialization)
-  console.log(`[${type.toUpperCase()}] ${message}`);
+const customLogger: Logger = {
+  info: (data) => console.log(render(data)),
+  warn: (data) => console.warn(render(data)),
+  error: (data) => console.error(render(data), data.error ?? ""),
 };
+
+// Severity is the method that was called. `source` says which part of the
+// system is talking: "pg" is the PostgreSQL server, "setup" is initialization,
+// and no source at all is the dev server's own voice.
+function render(data: LogDataInput) {
+  const from = data.source ? `[${data.source.toUpperCase()}] ` : "";
+
+  return `${from}${data.message}`;
+}
 ```
 
 > **If your process _is_ the server, you own every way it can end.** This library never exits your process, so a script whose whole job is to run the dev server has two things to wire: a signal handler that stops the server and exits, and an `onExit` that exits when PostgreSQL dies on its own. Omit the second and ordinary flow control takes over. With nothing left pending the script exits by itself, but with code `0`, reporting a crashed database as a clean run. Callers that legitimately carry on afterwards, such as tests or a provisioning step that stops the server and moves on, are exactly the ones that should not exit from there.
 
-This logger signature is exported as `DevDBLoggerFunction`, and the `onExit` callback type as `DevDBExitHandler` (`(exitCode: number) => void`), if you prefer the named types over writing the shapes inline. The constructor's configuration object is exported as `LocalDevDBServerConfig`, and `getLifecycleState()`'s return type as `DevDBLifecycleState`.
+The logger is the `Logger` interface exported from `strataline/migration`, and the `onExit` callback type is exported as `DevDBExitHandler` (`(exitCode: number) => void`), if you prefer the named types over writing the shapes inline. The constructor's configuration object is exported as `LocalDevDBServerConfig`, and `getLifecycleState()`'s return type as `DevDBLifecycleState`.
 
 #### Data Persistence
 
