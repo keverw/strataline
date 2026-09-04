@@ -18,7 +18,7 @@ import {
   sameDataDir,
 } from "./local-dev-db-server";
 import { EventEmitter } from "events";
-import { Pool } from "pg";
+import { Client, Pool } from "pg";
 import * as tmp from "tmp";
 import { join } from "path";
 import {
@@ -5121,4 +5121,66 @@ proc.emit("close", 3);
       scratch.removeCallback();
     }
   }, 30000);
+});
+
+describe("quoting the names setup DDL cannot parameterize", () => {
+  it("starts against a user, password, and database holding quote characters", async () => {
+    // A role name, a database name, and a password are none of them bindable
+    // as parameters in DDL, so all three are interpolated and all three have
+    // to be quoted properly. The hand-rolled quoting this replaced doubled a
+    // `'` in the password and did nothing at all to the identifiers, so a `"`
+    // in either name closed the quoting and the start failed with a syntax
+    // error against a cluster it had just created.
+    //
+    // Not an injection worry: these are the values this caller wrote into its
+    // own config. It is a start that looked correctly configured and did not
+    // work, and the fix is to use the escapers pg already ships rather than to
+    // reason about the rules again. TestDatabaseInstance has always used them
+    // for the one identifier it interpolates.
+    const scratch = tmp.dirSync({ unsafeCleanup: true, prefix: "pg-quoting-" });
+    const awkward = new LocalDevDBServer({
+      port: await findFreePort(),
+      user: 'dev"user',
+      password: "p'a\"ss\\word",
+      database: 'dev"db',
+      dataDir: join(scratch.name, "pgdata"),
+      pidFile: join(scratch.name, "dev-db.pid"),
+    });
+
+    try {
+      // Starting at all is most of the assertion: every one of the three
+      // statements runs during setup, so a quoting mistake in any of them
+      // rejects the start.
+      await awkward.start();
+
+      expect(awkward.getLifecycleState()).toBe("running");
+
+      // And the names landed as written rather than as escaped text, which a
+      // quoting bug that happened not to be a syntax error would produce.
+      const client = new Client({
+        host: "127.0.0.1",
+        port: (awkward as unknown as { pgPort: number }).pgPort,
+        user: 'dev"user',
+        password: "p'a\"ss\\word",
+        database: 'dev"db',
+      });
+
+      await client.connect();
+
+      try {
+        const { rows } = await client.query<{
+          me: string;
+          db: string;
+        }>("SELECT current_user AS me, current_database() AS db");
+
+        expect(rows[0].me).toBe('dev"user');
+        expect(rows[0].db).toBe('dev"db');
+      } finally {
+        await client.end();
+      }
+    } finally {
+      await awkward.stop().catch(() => {});
+      scratch.removeCallback();
+    }
+  }, 60000);
 });

@@ -23,6 +23,9 @@ import { callHost, makeSafeLogger } from "../callback-safety";
 // are filesystem plumbing rather than anything a consumer of a dev server
 // needs. See ./file-presence.
 import { fileExists, getFilePresence } from "./file-presence";
+// Type-only, so nothing is added to what this module pulls in at runtime. See
+// ./lifecycle-state for why the union is not declared here.
+import { type LifecycleState } from "./lifecycle-state";
 import { readOsUsername } from "../os-user";
 import { type LogLevel, type LogSource, type Logger } from "../logger";
 import { PostgresBinaries, getBinaries } from "./pg-bin-helper";
@@ -223,21 +226,20 @@ export type DevDBExitHandler = (exitCode: number) => void;
 /**
  * Which lifecycle a {@link LocalDevDBServer} instance is in.
  *
- * About this instance, not about the machine: a server left behind by a
- * previous run reads as `stopped` here, because this object has never held it.
- * See {@link LocalDevDBServer.getLifecycleState}.
+ * The shared {@link LifecycleState}, which `TestDatabaseInstance` answers with
+ * too, under the name this entry point has always published. An alias rather
+ * than a second union, so the two surfaces cannot drift apart in what they can
+ * say about themselves. See {@link LocalDevDBServer.getLifecycleState}, and
+ * ./lifecycle-state for what each state means and why the type lives there.
+ *
+ * `unstoppable` reaches this surface by its own route: a failed `start()` left
+ * a child that outlived even SIGKILL, and this instance is still holding it.
  */
-export type DevDBLifecycleState =
-  | "stopped"
-  | "starting"
-  | "running"
-  | "stopping"
-  /**
-   * A failed `start()` left a child that outlived even SIGKILL, and this
-   * instance is still holding it. Not permanent: once that child does die and
-   * its cleanup runs, the instance reads `stopped` again and can be started.
-   */
-  | "unstoppable";
+export type DevDBLifecycleState = LifecycleState;
+
+// Published alongside the alias above, so a host driving both database
+// surfaces can name one type rather than two spellings of it.
+export { type LifecycleState } from "./lifecycle-state";
 
 /**
  * Everything in a postmaster.pid except the status PostgreSQL rewrites.
@@ -3670,11 +3672,24 @@ export class LocalDevDBServer {
 
       if (appUserResult.rows.length === 0) {
         this.log("setup", `Creating user ${this.pgUser}...`);
-        // Note: User names and passwords cannot be parameterized in DDL statements
-        // We need to escape the password value manually
-        const escapedPassword = this.pgPass.replace(/'/g, "''"); // Escape single quotes
+        // Neither a role name nor a password can be a bound parameter in DDL,
+        // so both are quoted rather than passed. Through pg's own escapers,
+        // which is what TestDatabaseInstance already uses for the one
+        // identifier it interpolates.
+        //
+        // Not a threat model so much as one job done one way. These values
+        // come from the config this caller wrote, so there is no attacker
+        // here — but the hand-rolled quoting this replaced doubled `'` in the
+        // password and did nothing at all to the identifiers, so a `"` in
+        // `user` or `database` closed the quoting and produced a syntax error
+        // against a cluster it had just created, on a start that looked
+        // correctly configured. escapeIdentifier and escapeLiteral know the
+        // rules for both, including the backslashes and the
+        // standard_conforming_strings question the manual replace ignored.
         await client.query(
-          `CREATE USER "${this.pgUser}" WITH PASSWORD '${escapedPassword}'`,
+          `CREATE USER ${client.escapeIdentifier(this.pgUser)} WITH PASSWORD ${client.escapeLiteral(
+            this.pgPass,
+          )}`,
         );
       } else {
         this.log("setup", `User ${this.pgUser} already exists.`);
@@ -3684,7 +3699,9 @@ export class LocalDevDBServer {
       // superuser. Without this grant the server cannot identify itself over a
       // connection, which is what settles an otherwise undecidable PID.
       try {
-        await client.query(`GRANT pg_read_all_settings TO "${this.pgUser}"`);
+        await client.query(
+          `GRANT pg_read_all_settings TO ${client.escapeIdentifier(this.pgUser)}`,
+        );
       } catch (e) {
         // Not fatal: identification simply falls back to the PID checks.
         this.log(
@@ -3705,9 +3722,12 @@ export class LocalDevDBServer {
           `Creating database ${this.pgDb} owned by ${this.pgUser}...`,
         );
 
-        // Note: Database and user names cannot be parameterized
+        // Identifiers cannot be parameterized either. Same escaper, same
+        // reason as the role above.
         await client.query(
-          `CREATE DATABASE "${this.pgDb}" OWNER "${this.pgUser}"`,
+          `CREATE DATABASE ${client.escapeIdentifier(
+            this.pgDb,
+          )} OWNER ${client.escapeIdentifier(this.pgUser)}`,
         );
       } else {
         this.log("setup", `Database ${this.pgDb} already exists.`);

@@ -53,12 +53,34 @@ function isIpcId(value: string | undefined): value is string {
   return value !== undefined && /^\d+$/.test(value);
 }
 
-function isAlive(pid: number): boolean {
+/**
+ * Whether something holds this PID, erring toward yes.
+ *
+ * The reading `isProcessAlive` in ../src/lib/db-utilities/pid-file already
+ * makes, and here for a sharper reason: this answer is what licenses `ipcrm`.
+ * Signal 0 performs the existence and permission checks without signaling, and
+ * it fails two ways that mean opposite things. ESRCH is nothing there. EPERM is
+ * something there that this process may not signal — a segment's creator PID
+ * recycled to another user's process, or one the kernel declines to let us
+ * touch — and catching every error alike read that as "gone", which removes a
+ * segment whose creator is running. That is the one thing this pass promises
+ * not to do, and it is stated as the invariant in AGENTS.md.
+ *
+ * So only ESRCH is absence. Anything else counts as alive, for the reason the
+ * semaphore pass counts an unreadable `ps` as a live server: absence of
+ * evidence is not evidence of absence, and only positive disproof licenses
+ * destruction.
+ *
+ * @internal Exported so the EPERM reading can be checked. The injected probes
+ * the passes are tested through stand in for this, so it is the one decision
+ * in the file no fixture covers.
+ */
+export function isAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException)?.code !== "ESRCH";
   }
 }
 

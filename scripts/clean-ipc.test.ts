@@ -3,6 +3,7 @@ import { readOsUsername } from "../src/lib/os-user";
 import {
   cleanSemaphores,
   cleanSharedMemory,
+  isAlive,
   type SemaphoreProbes,
   type SharedMemoryProbes,
 } from "./clean-ipc";
@@ -336,5 +337,71 @@ describe.skipIf(OS_USER === null)("cleanSharedMemory", () => {
     } finally {
       process.exitCode = previousExitCode ?? 0;
     }
+  });
+});
+
+/**
+ * The liveness read the shared memory pass removes segments on the strength
+ * of, which every test above stands in for with a fixture.
+ *
+ * Driven through a stubbed `process.kill` rather than a real PID, because the
+ * branch under test is which errno counts as absence and no PID names one of
+ * them on demand. Aiming at PID 1 gets EPERM only for an unprivileged user: as
+ * root the call simply succeeds, so the pre-fix implementation returned true
+ * as well and the test passed without the fix it exists for. A container
+ * running as root is an ordinary place for this suite to run, and a regression
+ * test that is only a regression test on some machines is not one.
+ */
+describe("isAlive", () => {
+  /** Runs `work` with `process.kill` replaced, restoring it either way. */
+  function withKill(fake: typeof process.kill, work: () => void): void {
+    const real = process.kill;
+
+    process.kill = fake;
+
+    try {
+      work();
+    } finally {
+      process.kill = real;
+    }
+  }
+
+  /** A `process.kill` that always fails with `code`. */
+  function failingWith(code: string): typeof process.kill {
+    return (() => {
+      throw Object.assign(new Error(`kill: ${code}`), { code });
+    }) as unknown as typeof process.kill;
+  }
+
+  it("reports ESRCH as gone", () => {
+    // Nothing holds the number, which is the one answer that licenses ipcrm.
+    withKill(failingWith("ESRCH"), () => {
+      expect(isAlive(4242)).toBe(false);
+    });
+  });
+
+  it("reports EPERM as alive", () => {
+    // Something IS there and this process may not signal it — a segment's
+    // creator PID recycled to another user's process, say. Catching every
+    // error alike read that as gone, and this pass deletes on that answer.
+    withKill(failingWith("EPERM"), () => {
+      expect(isAlive(4242)).toBe(true);
+    });
+  });
+
+  it("reports an unrecognized failure as alive", () => {
+    // Absence of evidence is not evidence of absence, and only positive
+    // disproof licenses destruction. An errno this does not know about is not
+    // ESRCH, so it is not an absence.
+    withKill(failingWith("EINVAL"), () => {
+      expect(isAlive(4242)).toBe(true);
+    });
+  });
+
+  it("reports a PID it can signal as alive", () => {
+    // The real call, once, so the stubs above are checked against something
+    // that actually behaves the way they pretend to. This process can always
+    // signal itself, on every platform and at any privilege level.
+    expect(isAlive(process.pid)).toBe(true);
   });
 });

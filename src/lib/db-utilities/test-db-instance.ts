@@ -12,6 +12,9 @@ import EmbeddedPostgres from "embedded-postgres";
 import * as tmp from "tmp";
 import { findFreePort } from "./free-port";
 import { getFilePresence } from "./file-presence";
+// Type-only, and shared with LocalDevDBServer so both surfaces answer
+// getLifecycleState() in one vocabulary. See ./lifecycle-state.
+import { type LifecycleState } from "./lifecycle-state";
 import { isProcessAlive, readPostmasterPidFile } from "./pid-file";
 import {
   ipcExhaustionHint,
@@ -40,6 +43,8 @@ const DEFAULT_DB_NAME = "test_database";
  */
 const LOOPBACK_HOST = "127.0.0.1";
 
+export { type LifecycleState } from "./lifecycle-state";
+
 /**
  * Logger function type for TestDatabaseInstance
  */
@@ -49,12 +54,23 @@ const LOOPBACK_HOST = "127.0.0.1";
  * Internal shorthand, the same way LocalDevDBServer keeps one. The `migrate-`
  * words were a source and a level crossed into a string; here they come apart
  * into `source: "migration"` and the level they always meant.
+ *
+ * `setup` names the same thing it names on the dev server: the steps of
+ * bringing a cluster up, as opposed to the surface's own voice. It has to,
+ * because a source is what `createConsoleLogger` quiets by name, and a word
+ * that meant startup chatter on one surface and nothing at all on the other
+ * would make `{ setup: false }` a setting whose effect depended on which
+ * database you handed the logger to. Every line here that says what the
+ * startup is doing carries it, and what stays sourceless is what this class
+ * says in its own voice: that it is starting, that it started, that it is
+ * stopping, and why something went wrong.
  */
 const TEST_DB_LOG_TAGS = {
   info: ["info", undefined],
   warn: ["warn", undefined],
   error: ["error", undefined],
   pg: ["info", "pg"],
+  setup: ["info", "setup"],
   "migrate-info": ["info", "migration"],
   "migrate-warn": ["warn", "migration"],
   "migrate-error": ["error", "migration"],
@@ -248,7 +264,71 @@ export class TestDatabaseInstance {
   }
 
   /**
+   * Which lifecycle this instance is in, decided the same way {@link start}
+   * and {@link stop} decide whether to refuse.
+   *
+   * There to be asked BEFORE either of them, since both refuse an overlap by
+   * throwing and neither is a way to find out. A suite with more than one
+   * route into a teardown — an `afterAll` and its own error handling, say —
+   * has no other way to tell "a stop is already running", which joins, from "a
+   * start is, and this call is about to throw".
+   *
+   * The counterpart of `LocalDevDBServer.getLifecycleState`, answering with
+   * the same {@link LifecycleState} so a host driving both surfaces reads one
+   * vocabulary rather than two. Read entirely from this class's own fields,
+   * which is why the surface that mostly wraps somebody else's library can
+   * answer it at all: what it reports is which lifecycle call this object is
+   * in the middle of, and this object is the thing making them.
+   *
+   * A snapshot, and only this instance's own view — see ./lifecycle-state.
+   *
+   * {@link isReady} is the narrower question and stays: this says which
+   * lifecycle the instance is in, that says whether there is a pool to query
+   * right now. `running` is the only state `isReady` reports true for, and the
+   * two cannot disagree, being read from the same two fields.
+   */
+  public getLifecycleState(): LifecycleState {
+    // Ordered as the guards in start() are, so the answer and the refusal
+    // cannot disagree. A teardown clears `pool` before it waits on the server,
+    // so reading the pool first would call an instance being torn down
+    // `stopped` and promise a start() that in fact throws.
+    if (this.startInFlight) {
+      return "starting";
+    }
+
+    // Ahead of the teardown check, which cannot tell the two apart: a stop
+    // that gave up has finished, so nothing is in flight by then, and the
+    // retained server is the only thing saying the instance still holds one.
+    if (this.unstoppedServer) {
+      return "unstoppable";
+    }
+
+    if (this.cleanupInFlight) {
+      return "stopping";
+    }
+
+    return this.isRunning && this.pool ? "running" : "stopped";
+  }
+
+  /**
    * Check if the database is running
+   *
+   * Whether a start finished and a stop has not, which is what a test suite
+   * wants to know. Not a health check: nothing here watches the postmaster, so
+   * a cluster killed out from under a running instance still reads ready.
+   * Confirmed rather than assumed, by SIGKILLing one and looking: the process
+   * survives it, the next query fails at once with `ECONNREFUSED`, and
+   * `stop()` still completes, so what the stale reading costs is a slightly
+   * vaguer error and nothing else.
+   *
+   * Watching for it would mean the child handle, and embedded-postgres keeps
+   * that one `private` rather than `protected` — TypeScript-private, so a
+   * subclass can reach it through a cast, but the compiler then checks
+   * nothing and an upstream rename would leave the listener silently never
+   * firing. That is the trap {@link RetargetablePostgres} documents about
+   * `options.port`, for a smaller payoff. `LocalDevDBServer` answers this from
+   * Node's own report on a child it spawned itself and has no such problem.
+   *
    * @returns true if the database is running and ready for queries
    */
   public isReady(): boolean {
@@ -734,15 +814,51 @@ export class TestDatabaseInstance {
   }
 
   /**
+   * The start in progress, so a second one is refused rather than run beside
+   * it.
+   *
+   * The same memo `LocalDevDBServer` keeps under the same name, and refused
+   * for the reason it gives: the already-started guard below reads `pool`,
+   * which nothing sets until the very end of a start, so without this two
+   * overlapping calls both find the instance idle and both build a cluster.
+   * The second's `db` and `tempDir` overwrite the first's, and the first
+   * postmaster is then reachable by nothing — `performCleanup` stops and
+   * deletes whatever the fields hold at teardown, and `serverStillRunning`
+   * asks about the wrong data directory — so it outlives the run holding a
+   * port and a temporary directory with nothing recording it. Which is the
+   * outcome the retained-server handling exists to prevent, arrived at from
+   * inside rather than from a stop that gave up.
+   *
+   * Refused rather than joined, as {@link cleanupInFlight} is joined rather
+   * than refused, and the asymmetry is the same one LocalDevDBServer draws: a
+   * start that refuses leaves no database, which is visible and costs a retry,
+   * while a teardown that refused would leave a server running.
+   */
+  private startInFlight: Promise<void> | null = null;
+
+  /**
    * Start the embedded PostgreSQL server and apply migration
+   *
+   * A second call while one is already starting is refused. Await the first.
    */
   public async start(): Promise<void> {
-    // Ahead of everything, including the already-started guard below, which
-    // cannot see this: a stop that gave up leaves no pool. Building here would
-    // overwrite `db` and `tempDir` with a fresh cluster's and leave the live
-    // one holding its port and its files with nothing recording it, which is
-    // the outcome retaining them exists to prevent. LocalDevDBServer refuses
-    // its own `unstoppable` state for the same reason.
+    // Ahead of the other two, because a start that is still running owns them
+    // both: its own failure path calls cleanup(), and that cleanup is what
+    // sets `unstoppedServer`. Reporting either of those to an overlapping
+    // caller would describe the first start's state rather than the mistake
+    // this call actually made.
+    if (this.startInFlight) {
+      throw new Error(
+        "Cannot start the test database: it is already starting. Await the first start() call.",
+      );
+    }
+
+    // Ahead of the already-started guard below, which cannot see this: a stop
+    // that gave up leaves no pool. Building here would overwrite `db` and
+    // `tempDir` with a fresh cluster's and leave the live one holding its port
+    // and its files with nothing recording it, which is the outcome retaining
+    // them exists to prevent. LocalDevDBServer refuses its own `unstoppable`
+    // state for the same reason.
     if (this.unstoppedServer) {
       throw new Error(
         "A previous test database could not be stopped and its PostgreSQL may still be running. " +
@@ -768,10 +884,32 @@ export class TestDatabaseInstance {
       );
     }
 
+    // Already up, so this is a no-op rather than a refusal, which is the one
+    // overlap neither surface treats as a mistake: the caller asked for a
+    // running database and there is one. Said out loud all the same, the way
+    // LocalDevDBServer says it, because it is the only one of these paths that
+    // returns as though it had done the work. A caller who has lost track of
+    // its own lifecycle otherwise gets no signal at all.
     if (this.pool) {
+      this.log(
+        "warn",
+        "The test database is already started, skipping start()",
+      );
+
       return;
     }
 
+    // Cleared before the promise callers hold settles, so the next start()
+    // sees no memo. `finally` rather than a two-armed `then`, since a failed
+    // start has to clear it too or every retry would be refused.
+    this.startInFlight = this.performStart().finally(() => {
+      this.startInFlight = null;
+    });
+
+    return this.startInFlight;
+  }
+
+  private async performStart(): Promise<void> {
     // Use a separate try-catch for initial setup errors vs cleanup errors
     try {
       // If no port was specified or port is 0, find an available port.
@@ -818,26 +956,26 @@ export class TestDatabaseInstance {
         );
       });
 
-      this.log("info", `Created temporary directory: ${this.tempDir}`);
+      this.log("setup", `Created temporary directory: ${this.tempDir}`);
 
       // Create and start an embedded PostgreSQL server
       this.db = this.buildEmbeddedPostgres(this.port);
 
-      this.log("info", "Initializing embedded PostgreSQL...");
+      this.log("setup", "Initializing embedded PostgreSQL...");
 
       try {
         // Initialize and start the PostgreSQL server. initdb writes no port
         // anywhere, so the cluster it produces belongs to no port in
         // particular and a retry below can reuse it as it stands.
         await this.db.initialise();
-        this.log("info", "PostgreSQL initialized successfully");
+        this.log("setup", "PostgreSQL initialized successfully");
 
         await this.startWithPortRetry();
-        this.log("info", "PostgreSQL server started successfully");
+        this.log("setup", "PostgreSQL server started successfully");
 
         // Create the test database
         await this.createTestDatabase(this.db);
-        this.log("info", `Created test database: ${this.databaseName}`);
+        this.log("setup", `Created test database: ${this.databaseName}`);
       } catch (error) {
         this.log(
           "error",
@@ -864,7 +1002,7 @@ export class TestDatabaseInstance {
       try {
         const result = await this.pool.query("SELECT 1 as test_value");
         this.log(
-          "info",
+          "setup",
           `Database connection test successful: ${JSON.stringify(result.rows[0])}`,
         );
         this.log(
@@ -1231,10 +1369,25 @@ export class TestDatabaseInstance {
    * data directory, so a later call asks the cluster afresh and completes once
    * the postmaster has gone.
    *
-   * @throws When the stop gave up without confirming the cluster was gone, or
-   * when the teardown fails for any other reason.
+   * Refused only against a start, which is the one overlap a teardown cannot
+   * wait out: `performCleanup` would end the pool and stop the server while
+   * the start is still spawning one, and a start that fails tears its own
+   * attempt down anyway. The same refusal `LocalDevDBServer.stop()` makes, and
+   * the only one either of them makes — a second stop joins the first rather
+   * than throwing, since a teardown that refused would leave a server running.
+   * Await `start()` first.
+   *
+   * @throws When the stop gave up without confirming the cluster was gone,
+   * when a start is in flight, or when the teardown fails for any other
+   * reason.
    */
   public async stop(): Promise<void> {
+    if (this.startInFlight) {
+      throw new Error(
+        "Cannot stop the test database: it is currently starting. Await start() first.",
+      );
+    }
+
     this.log("info", "Stopping test database...");
 
     try {

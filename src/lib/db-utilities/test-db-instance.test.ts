@@ -1,6 +1,11 @@
 import { describe, it, test, expect, beforeEach, afterEach } from "bun:test";
 import { createConsoleLogger } from "../logger";
-import { TestDatabaseInstance, isBindFailure } from "./test-db-instance";
+import {
+  TestDatabaseInstance,
+  isBindFailure,
+  type LifecycleState,
+} from "./test-db-instance";
+import { LocalDevDBServer } from "./local-dev-db-server";
 import { Migration } from "../migration-system";
 import * as tmp from "tmp";
 import {
@@ -822,4 +827,317 @@ describe("stopping past the bound", () => {
       } as unknown as tmp.DirResult);
     }
   }, 60_000);
+});
+
+/**
+ * The two refusals `start()` and `stop()` make against each other.
+ *
+ * Driven through the `findPort` seam rather than a real cluster, because what
+ * is under test is the guard and not the startup: the whole point is that the
+ * second call arrives while the first is provably still inside `performStart`,
+ * and a real start gives nothing to aim at. Nothing is spawned, so the failing
+ * start unwinds through a `cleanup()` with no pool, server, or directory to
+ * release.
+ */
+describe("overlapping lifecycle calls", () => {
+  /** A promise and the handle to settle it, as separate fields. */
+  function deferred(): { promise: Promise<void>; resolve: () => void } {
+    let resolve!: () => void;
+    const promise = new Promise<void>((settle) => {
+      resolve = settle;
+    });
+
+    return { promise, resolve };
+  }
+
+  /**
+   * What a lifecycle call did, as a string, and never a wait without an end.
+   *
+   * Raced against a timer rather than simply awaited, because the failure this
+   * guards is a call that does not settle at all: without the refusal the
+   * overlapping call runs on into the gate below and stays there, so a plain
+   * `await` would hang the whole file until the runner gave up on it and
+   * report nothing about which guard was missing. Naming the non-settlement
+   * makes it an assertion failure like any other.
+   */
+  async function outcomeOf(work: Promise<unknown>): Promise<string> {
+    return Promise.race([
+      work.then(
+        () => "resolved",
+        (error: unknown) => `rejected: ${(error as Error)?.message}`,
+      ),
+      new Promise<string>((settle) => {
+        setTimeout(() => settle("did not settle"), 1000);
+      }),
+    ]);
+  }
+
+  /**
+   * A start that stops at the first await and stays there until told.
+   *
+   * Field initializers only, deliberately: a `private resolve!: () => void`
+   * assigned from inside another field's initializer is declared AFTER it, so
+   * class-field semantics would define it back to undefined on the way past.
+   */
+  class GatedStart extends TestDatabaseInstance {
+    readonly entered = deferred();
+    readonly gate = deferred();
+
+    protected override async findPort(): Promise<number> {
+      this.entered.resolve();
+
+      await this.gate.promise;
+
+      // Rejecting rather than returning a port, so the start unwinds without
+      // an initdb. What the guards do is the subject; what the start would
+      // have gone on to do is not.
+      throw new Error("start held open by the test");
+    }
+  }
+
+  it("refuses a second start while the first is still starting", async () => {
+    const db = new GatedStart();
+    const first = db.start();
+
+    // The first call is inside performStart, which is the state the guard
+    // exists for and the one `pool` cannot report: nothing sets it until the
+    // very end of a start, so without the memo both calls would find the
+    // instance idle and both build a cluster — the second overwriting `db`
+    // and `tempDir` and leaving the first postmaster reachable by nothing.
+    await db.entered.promise;
+
+    expect(await outcomeOf(db.start())).toMatch(/already starting/);
+
+    db.gate.resolve();
+
+    expect(await outcomeOf(first)).toMatch(/held open by the test/);
+
+    // And the memo is cleared by a failure as well as by a success, or a
+    // start that failed once would refuse every retry after it. Reaching the
+    // seam again is what proves it: a memo left behind would refuse here with
+    // "already starting" instead.
+    expect(await outcomeOf(db.start())).toMatch(/held open by the test/);
+  });
+
+  it("refuses a stop while a start is in flight", async () => {
+    const db = new GatedStart();
+    const first = db.start();
+
+    await db.entered.promise;
+
+    // The one overlap a teardown cannot wait out: performCleanup would end the
+    // pool and stop the server while the start is still bringing one up.
+    expect(await outcomeOf(db.stop())).toMatch(/currently starting/);
+
+    db.gate.resolve();
+
+    expect(await outcomeOf(first)).toMatch(/held open by the test/);
+
+    // Once the start has settled the teardown is allowed again, and finds
+    // nothing to do rather than refusing.
+    expect(await outcomeOf(db.stop())).toBe("resolved");
+  });
+});
+
+/**
+ * The two questions an instance answers about itself, and the vocabulary they
+ * are answered in.
+ *
+ * Driven through the same gated seam as the refusals above, because the states
+ * worth checking are exactly the ones a caller cannot otherwise observe: both
+ * `start()` and `stop()` refuse an overlap by throwing, so without this the
+ * only way to discover which lifecycle you are in is to make a call that fails.
+ */
+describe("getLifecycleState", () => {
+  function deferred(): { promise: Promise<void>; resolve: () => void } {
+    let resolve!: () => void;
+    const promise = new Promise<void>((settle) => {
+      resolve = settle;
+    });
+
+    return { promise, resolve };
+  }
+
+  class GatedStart extends TestDatabaseInstance {
+    readonly entered = deferred();
+    readonly gate = deferred();
+
+    protected override async findPort(): Promise<number> {
+      this.entered.resolve();
+
+      await this.gate.promise;
+
+      throw new Error("start held open by the test");
+    }
+  }
+
+  it("reports stopped before anything has been started", () => {
+    expect(new TestDatabaseInstance().getLifecycleState()).toBe("stopped");
+  });
+
+  it("reports starting while a start is in flight, and stopped after it fails", async () => {
+    const db = new GatedStart();
+    const start = db.start();
+
+    await db.entered.promise;
+
+    // The state the refusals are about, and the one `isReady` cannot express:
+    // there is no pool yet, so it reports false in exactly the same way it
+    // does for an instance that was never started.
+    expect(db.getLifecycleState()).toBe("starting");
+    expect(db.isReady()).toBe(false);
+
+    db.gate.resolve();
+
+    await start.catch(() => {});
+
+    // Back to a state a start is allowed from, since the failed one released
+    // everything it had taken.
+    expect(db.getLifecycleState()).toBe("stopped");
+  });
+
+  it("reports unstoppable while a server a stop gave up on is retained", () => {
+    const db = new TestDatabaseInstance();
+    const internals = db as unknown as {
+      unstoppedServer: unknown;
+    };
+
+    // What performCleanup leaves when it could not confirm the postmaster
+    // gone. Set directly rather than provoked, since provoking it needs a
+    // PostgreSQL that will not stop, and what is under test is the reading.
+    internals.unstoppedServer = {};
+
+    expect(db.getLifecycleState()).toBe("unstoppable");
+    expect(db.isReady()).toBe(false);
+  });
+
+  it("reports running only while there is a pool to query", async () => {
+    const db = new TestDatabaseInstance();
+
+    try {
+      await db.start();
+
+      // The one state isReady() reports true for. Both read the same two
+      // fields, so they cannot disagree.
+      expect(db.getLifecycleState()).toBe("running");
+      expect(db.isReady()).toBe(true);
+    } finally {
+      await db.stop();
+    }
+
+    expect(db.getLifecycleState()).toBe("stopped");
+    expect(db.isReady()).toBe(false);
+  }, 120_000);
+});
+
+/**
+ * The source every startup line carries, so `{ setup: false }` means the same
+ * thing on this surface as it does on the dev server.
+ *
+ * Asserted on the lines rather than on rendered output, because what a filter
+ * acts on is the field. A line that reads like startup chatter and carries no
+ * source is invisible to the option that exists to quiet it, and nothing about
+ * the message text would show that.
+ */
+describe("setup source", () => {
+  it("tags what the startup is doing, and leaves the instance's own voice alone", async () => {
+    const lines: { level: string; source?: string; message: string }[] = [];
+    const record =
+      (level: string) =>
+      (data: { source?: string; message: string }): void => {
+        lines.push({ level, ...data });
+      };
+
+    const db = new TestDatabaseInstance({
+      logger: {
+        info: record("info"),
+        warn: record("warn"),
+        error: record("error"),
+      },
+    });
+
+    try {
+      await db.start();
+    } finally {
+      await db.stop();
+    }
+
+    // Asserts the line is there before reporting its source, because
+    // `find(...)?.source` is `undefined` both for a sourceless line and for a
+    // line that is not in the list at all. Without this the `toBeUndefined`
+    // checks below would keep passing if a message were ever reworded, which
+    // is a test that has quietly stopped testing anything.
+    const sourceOf = (fragment: string): string | undefined => {
+      const line = lines.find((entry) => entry.message.includes(fragment));
+
+      if (line === undefined) {
+        throw new Error(
+          `no logged line contains ${JSON.stringify(fragment)}. ` +
+            "Either the message was reworded or the startup no longer logs it.",
+        );
+      }
+
+      return line.source;
+    };
+
+    // Startup steps. Each is the counterpart of a line LocalDevDBServer has
+    // always tagged `setup`, and each used to go out sourceless, so a caller
+    // asking for a quiet test run got no quiet at all.
+    expect(sourceOf("Created temporary directory")).toBe("setup");
+    expect(sourceOf("Initializing embedded PostgreSQL")).toBe("setup");
+    expect(sourceOf("PostgreSQL initialized successfully")).toBe("setup");
+    expect(sourceOf("PostgreSQL server started successfully")).toBe("setup");
+    expect(sourceOf("Created test database")).toBe("setup");
+
+    // The instance's own voice keeps no source, so it survives the filter.
+    // Silence nobody asked for is the worse failure of the two.
+    expect(sourceOf("Starting embedded PostgreSQL for tests")).toBeUndefined();
+    expect(sourceOf("started successfully on port")).toBeUndefined();
+    expect(sourceOf("Stopping test database")).toBeUndefined();
+    expect(sourceOf("Test database stopped")).toBeUndefined();
+
+    // And the server's own output still says which server it came from.
+    expect(lines.some((line) => line.source === "pg")).toBe(true);
+  }, 120_000);
+});
+
+/**
+ * That the two database surfaces answer `getLifecycleState()` the same way,
+ * checked by the compiler rather than by eye.
+ *
+ * Type-only, so it costs nothing at runtime and `bun run type-check` is what
+ * runs it. The point is the drift: the states are one shared union in
+ * ./lifecycle-state precisely so a state added to one surface is a state the
+ * other can return too, and a signature that moved on either side stops
+ * assigning to `LifecycleSurface` here. A comment saying "keep these in sync"
+ * would be the alternative, and comments do not fail builds.
+ */
+describe("one lifecycle interface across both surfaces", () => {
+  interface LifecycleSurface {
+    getLifecycleState(): LifecycleState;
+    start(): Promise<void>;
+    stop(): Promise<void>;
+  }
+
+  it("has both classes satisfying it", () => {
+    const surfaces: LifecycleSurface[] = [
+      new TestDatabaseInstance(),
+      new LocalDevDBServer({
+        port: 5432,
+        user: "u",
+        password: "p",
+        database: "d",
+        dataDir: "/tmp/never-started",
+        pidFile: "/tmp/never-started.pid",
+      }),
+    ];
+
+    // Constructed and never started, so this asserts the shape rather than any
+    // behavior: neither constructor touches the filesystem or installs a
+    // process listener, which is itself a property worth holding them to.
+    expect(surfaces.map((s) => s.getLifecycleState())).toEqual([
+      "stopped",
+      "stopped",
+    ]);
+  });
 });
