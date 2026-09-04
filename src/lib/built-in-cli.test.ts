@@ -528,6 +528,218 @@ describe("RunStratalineCLI", () => {
     });
   });
 
+  describe("configuration that is rejected before anything is opened", () => {
+    /**
+     * A complete env, so each test below can spoil exactly one value.
+     *
+     * Every assertion here runs without a database on purpose. Validation
+     * happens before `new Pool` is reached, so a bad number is refused rather
+     * than carried into a connection attempt that fails later and blames the
+     * network for a typo in a config file.
+     */
+    const validEnv = (): Record<string, string | undefined> => ({
+      POSTGRES_USER: "u",
+      POSTGRES_PASSWORD: "p",
+      POSTGRES_DATABASE: "d",
+      POSTGRES_HOST: "127.0.0.1",
+      POSTGRES_PORT: "5432",
+    });
+
+    const run = (env: Record<string, string | undefined>) =>
+      RunStratalineCLI({
+        migrations: [],
+        loadFrom: "env",
+        logger: mockLogger,
+        argv: ["node", "script.js", "help"],
+        env,
+      });
+
+    it("refuses a port that is not a number, and says which variable", () => {
+      // The name is in the message because the prefix means the variable a
+      // person has to go and fix is not the one named in the docs.
+      return expect(
+        run({ ...validEnv(), POSTGRES_PORT: "abc" }),
+      ).rejects.toThrow("Invalid POSTGRES_PORT");
+    });
+
+    it("refuses a port outside the range a port can take", () => {
+      // parseInt is happy with both of these, which is the whole reason the
+      // range is checked separately from the parse.
+      return Promise.all([
+        expect(run({ ...validEnv(), POSTGRES_PORT: "0" })).rejects.toThrow(
+          "must be a valid port number (1-65535)",
+        ),
+        expect(run({ ...validEnv(), POSTGRES_PORT: "70000" })).rejects.toThrow(
+          "must be a valid port number (1-65535)",
+        ),
+      ]);
+    });
+
+    it("names the prefixed variable when a prefix is in use", () => {
+      return expect(
+        RunStratalineCLI({
+          migrations: [],
+          loadFrom: "env",
+          envPrefix: "API_",
+          logger: mockLogger,
+          argv: ["node", "script.js", "help"],
+          env: {
+            API_POSTGRES_USER: "u",
+            API_POSTGRES_PASSWORD: "p",
+            API_POSTGRES_DATABASE: "d",
+            API_POSTGRES_HOST: "127.0.0.1",
+            API_POSTGRES_PORT: "not-a-port",
+          },
+        }),
+      ).rejects.toThrow("Invalid API_POSTGRES_PORT");
+    });
+
+    it("refuses a pool size that is not a positive number", () => {
+      return Promise.all([
+        expect(
+          run({ ...validEnv(), POSTGRES_MAX_CONNECTIONS: "0" }),
+        ).rejects.toThrow(
+          "POSTGRES_MAX_CONNECTIONS: must be a positive number",
+        ),
+        expect(
+          run({ ...validEnv(), POSTGRES_MAX_CONNECTIONS: "lots" }),
+        ).rejects.toThrow(
+          "POSTGRES_MAX_CONNECTIONS: must be a positive number",
+        ),
+      ]);
+    });
+
+    it("refuses negative timeouts but allows zero", () => {
+      // Zero is a real setting for both of these rather than a missing value,
+      // which is why they are checked for negativity and the pool size is
+      // checked for positivity.
+      return Promise.all([
+        expect(
+          run({ ...validEnv(), POSTGRES_IDLE_TIMEOUT: "-1" }),
+        ).rejects.toThrow("POSTGRES_IDLE_TIMEOUT: must be a non-negative"),
+        expect(
+          run({ ...validEnv(), POSTGRES_CONNECTION_TIMEOUT: "-1" }),
+        ).rejects.toThrow(
+          "POSTGRES_CONNECTION_TIMEOUT: must be a non-negative",
+        ),
+      ]);
+    });
+
+    it("refuses a pool mode with no pool", () => {
+      return expect(
+        RunStratalineCLI({
+          migrations: [],
+          loadFrom: "pool",
+          logger: mockLogger,
+          argv: ["node", "script.js", "help"],
+        }),
+      ).rejects.toThrow("Must provide pool when loadFrom='pool'");
+    });
+
+    it("refuses an envPrefix alongside a pool, without ending that pool", async () => {
+      const pool = testDb.getPool();
+
+      if (!pool) {
+        throw new Error("Failed to get test database pool");
+      }
+
+      // The refusal has to come before the pool is adopted. Once it is, the
+      // try/finally below owns it and calls end() on the way out -- on the
+      // CALLER's pool, which they are still using.
+      await expect(
+        RunStratalineCLI({
+          migrations: [],
+          loadFrom: "pool",
+          pool: pool as Pool,
+          envPrefix: "API_",
+          logger: mockLogger,
+          argv: ["node", "script.js", "help"],
+        }),
+      ).rejects.toThrow("Cannot provide envPrefix when loadFrom='pool'");
+
+      // Still usable, which is the half of that rule a message cannot assert.
+      const alive = await (pool as Pool).query("SELECT 1 AS ok");
+
+      expect(alive.rows[0].ok).toBe(1);
+    });
+  });
+
+  describe("a database that will not answer", () => {
+    /**
+     * A port nothing is listening on, so the connect is refused at once.
+     *
+     * The failure itself is not the point. What is being checked is that the
+     * CLI says which settings it tried, because "connection refused" against
+     * an unnamed host is the least actionable thing a person can be handed,
+     * and the two modes have to say different things: an env-mode failure is
+     * usually a typo in a variable, a pool-mode one is the caller's own
+     * configuration and naming variables would send them to the wrong file.
+     */
+    const deadEnd = { host: "127.0.0.1", port: 1 };
+
+    it("names the environment variables it tried", async () => {
+      const env: Record<string, string | undefined> = {
+        POSTGRES_USER: "nobody",
+        POSTGRES_PASSWORD: "nothing",
+        POSTGRES_DATABASE: "nowhere",
+        POSTGRES_HOST: deadEnd.host,
+        POSTGRES_PORT: String(deadEnd.port),
+      };
+
+      await expect(
+        RunStratalineCLI({
+          migrations: [],
+          loadFrom: "env",
+          logger: mockLogger,
+          argv: ["node", "script.js", "help"],
+          env,
+        }),
+      ).rejects.toThrow("Database connection failure");
+
+      const reported = logEntries
+        .filter((entry) => entry.type === "error")
+        .map((entry) => entry.message)
+        .join("\n");
+
+      expect(reported).toContain("Error connecting to database");
+      // The values, so the reader can see which one is wrong.
+      expect(reported).toContain("nowhere");
+      expect(reported).toContain(String(deadEnd.port));
+      expect(reported).toContain("nobody");
+    });
+
+    it("points at the supplied pool rather than at variables", async () => {
+      const pool = new Pool({
+        host: deadEnd.host,
+        port: deadEnd.port,
+        user: "nobody",
+        password: "nothing",
+        database: "nowhere",
+        connectionTimeoutMillis: 2000,
+      });
+
+      await expect(
+        RunStratalineCLI({
+          migrations: [],
+          loadFrom: "pool",
+          pool,
+          logger: mockLogger,
+          argv: ["node", "script.js", "help"],
+        }),
+      ).rejects.toThrow("Database connection failure");
+
+      const reported = logEntries
+        .filter((entry) => entry.type === "error")
+        .map((entry) => entry.message)
+        .join("\n");
+
+      expect(reported).toContain("provided database pool");
+      // Naming variables here would send the reader to a file that has
+      // nothing to do with how this pool was built.
+      expect(reported).not.toContain("POSTGRES_HOST");
+    });
+  });
+
   it("should throw error when both pool and loadFrom='env' are provided", async () => {
     const pool = testDb.getPool();
     expect(pool).not.toBeNull();
