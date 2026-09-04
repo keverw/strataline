@@ -1343,6 +1343,77 @@ describe("LocalDevDBServer", () => {
     }
   }, 120000);
 
+  it("keeps a start disposed mid-flight registered for the exit hook", async () => {
+    // dispose() is documented as safe to call at any moment, and it takes this
+    // instance out of the set the shared `exit` hook serves. Most of a cold
+    // start has no child yet — resolving the binaries, stopping a previous
+    // server, initdb — so dispose()'s own already-running warning does not
+    // fire and nothing says the protection has gone. The start then spawned a
+    // postmaster the hook no longer knew about, and an ordinary host exit
+    // leaves it holding the port and the data directory: the orphan this
+    // module exists to prevent, produced by a call documented as safe.
+    const port = await findFreePort();
+    // Awaited before the count is captured, so nothing registers a listener
+    // between the two readings.
+    const before = process.listenerCount("exit");
+
+    let disposedDuringStart = false;
+    // Recorded rather than asserted in the callback, which runs inside the
+    // guarded logger: a throw from an expect() there is absorbed as a failed
+    // log line and the test would pass regardless.
+    //
+    // A number the count can never be, rather than null. TypeScript does not
+    // reset a `let`'s narrowing for an assignment made inside a closure, so a
+    // `number | null` initialized to null reads as `null` at the assertion
+    // below and the comparison will not compile.
+    let hookAfterDispose = -1;
+
+    const disposing = new LocalDevDBServer({
+      port,
+      user: "disposed_user",
+      password: "disposed_password",
+      database: "disposed_database",
+      dataDir: join(tempDir.name, "disposed-pgdata"),
+      pidFile: join(tempDir.name, ".disposed_pg_pid"),
+      onExit: () => {},
+      logger: {
+        info: (data) => {
+          // The first line start() logs once the binaries resolve, and well
+          // ahead of the spawn: cleanupExistingProcess and initdb both still
+          // have to run.
+          if (
+            !disposedDuringStart &&
+            data.message.includes("Using PostgreSQL binaries")
+          ) {
+            disposedDuringStart = true;
+            disposing.dispose();
+            hookAfterDispose = process.listenerCount("exit");
+          }
+        },
+        warn: () => {},
+        error: () => {},
+      },
+    });
+
+    try {
+      await disposing.start();
+
+      // The disposal really did land, and really did take the hook off. Both
+      // halves matter: without them the assertion below would pass for an
+      // instance that was never disposed at all.
+      expect(disposedDuringStart).toBe(true);
+      expect(hookAfterDispose).toBe(before);
+
+      // Armed again beside the spawn, so the child this start created is still
+      // force-killed if the host exits.
+      expect(process.listenerCount("exit")).toBe(before + 1);
+    } finally {
+      await disposing.stop();
+    }
+
+    expect(process.listenerCount("exit")).toBe(before);
+  }, 120000);
+
   it("does not let a throwing logger keep the listeners on", async () => {
     // The logger belongs to the caller, so calling it runs somebody else's
     // code. start()'s catch logs before cleanupFailedStart, which is the only

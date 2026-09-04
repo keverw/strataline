@@ -16,8 +16,12 @@ import {
 import { dirname, isAbsolute, join, resolve } from "path";
 import { Client } from "pg";
 import { callHost, makeSafeLogger } from "../callback-safety";
-// Imported rather than re-exported: this module does `export * from
-// "./pid-file"` below, so a name exported here becomes public API.
+// Imported rather than re-exported. This module IS the
+// `strataline/local-dev-db-server` entry point, so anything exported from here
+// is public with nothing else to decide it — unlike ./pid-file below, whose
+// names reach the entry point only through the list this file draws. These two
+// are filesystem plumbing rather than anything a consumer of a dev server
+// needs. See ./file-presence.
 import { fileExists, getFilePresence } from "./file-presence";
 import { readOsUsername } from "../os-user";
 import { type LogLevel, type LogSource, type Logger } from "../logger";
@@ -43,7 +47,50 @@ import {
 
 // Re-exported so consumers can probe for a running server without reaching
 // into internal paths. See ./pid-file for the verification rules.
-export * from "./pid-file";
+//
+// Named rather than `export *`, which cannot draw the line this needs to. That
+// module has two kinds of export in it: the status and PID API a caller is
+// meant to use, and a handful of pure functions exported ONLY so a parse or a
+// memo can be tested from a platform that cannot produce the real input --
+// `createRetryingMemo` and `parseWindowsProcessInfo`, both of which say so in
+// their own doc comments. A wildcard publishes the second kind alongside the
+// first, and `@internal` does not stop it: declaration generation emits those
+// entries into the `.d.ts` like any other, so the tag is a note to a reader
+// rather than anything the build enforces. Published is published, and a
+// consumer who imports one has every right to expect it to keep working.
+//
+// So the list is the boundary, and adding a name to it is the decision to
+// support that name. Anything not here is still reachable from ./pid-file for
+// this package's own tests, which is where those two are imported from.
+export {
+  buildDevDBPidRecord,
+  dataDirFromCommand,
+  getLocalDevDBServerStatus,
+  getProcessCommand,
+  getProcessStartTime,
+  getProcessUid,
+  getSystemBootTime,
+  identifyViaConnection,
+  isProcessAlive,
+  parseDevDBPidRecord,
+  readDevDBPidFile,
+  readPostmasterPidFile,
+  sameDataDir,
+  serializeDevDBPidRecord,
+  systemProbes,
+  verifyPid,
+  type DevDBConnectionProbe,
+  type DevDBConnectionResult,
+  type DevDBPidRecord,
+  type DevDBServerStatus,
+  type DevDBStaleKind,
+  type DevDBStatusOptions,
+  type DevDBStatusSource,
+  type PostmasterPidRecord,
+  type ProcessProbes,
+  type VerifyPidOptions,
+  type VerifyPidResult,
+} from "./pid-file";
 
 // Re-exported from where it moved to, so this stays the path it has always
 // been imported from. TestDatabaseInstance reads the same severities, and
@@ -761,6 +808,21 @@ export class LocalDevDBServer {
         "warn",
         `dispose() was called while PostgreSQL (PID ${this.pgProcess.pid}) is still running. ` +
           "It will no longer be stopped when this process exits. Call stop() first.",
+      );
+    } else if (this.startInFlight || this.startingUp) {
+      // The window where there is a start but not yet a child, which is most
+      // of a cold one: resolving the binaries, stopping a previous server,
+      // running initdb. The branch above cannot see it, so disposing here used
+      // to remove the protection silently and say nothing. It no longer
+      // removes it for good — startPostgresServer arms again beside the spawn
+      // — and that is exactly why it is worth a line: the call did less than
+      // it looks like it did, and a caller relying on it would find the
+      // instance managed again with nothing having said so.
+      this.log(
+        "warn",
+        "dispose() was called while a start is in flight, so it did not stick: that start registers " +
+          "itself again when it spawns, and the server it creates will still be stopped when this " +
+          "process exits. Call dispose() again once start() has settled if that is not what you want.",
       );
     }
 
@@ -2899,6 +2961,21 @@ export class LocalDevDBServer {
         detached: false, // Keep as child process so it dies when parent dies
       },
     );
+
+    // Armed again here, beside the spawn, rather than trusting the arm
+    // performStart made on its way in. Everything between the two is awaited —
+    // resolving the binaries, stopping a previous server, initdb — and there
+    // is no child during any of it, so a dispose() landing in that window took
+    // this instance out of the set the shared `exit` hook serves without its
+    // own already-running warning firing. The start then spawned a postmaster
+    // the hook no longer knew about, and an ordinary host exit left it holding
+    // the port and the data directory: the orphan this module exists to
+    // prevent, produced by a call documented as safe to make.
+    //
+    // Arming where the child is created makes that structural rather than a
+    // matter of what happened while the start was working. Idempotent, since
+    // the population is a Set and the listener installs once.
+    this.armProcessHandlers();
 
     // Without a listener a failed spawn throws out of the event loop rather
     // than failing start() — see runPgCommand. Recording it instead lets

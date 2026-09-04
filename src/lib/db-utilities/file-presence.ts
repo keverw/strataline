@@ -23,10 +23,13 @@ export type FilePresence = "present" | "absent" | "inaccessible";
  * that as "nothing is there" is how an unreadable record becomes a deleted one.
  *
  * Its own module rather than a helper on either caller. Both ./pid-file and
- * ./local-dev-db-server need it, and ./local-dev-db-server re-exports
- * ./pid-file wholesale onto the `strataline/local-dev-db-server` entry point,
- * so exporting it from there would publish a plumbing detail as public API and
- * commit the package to supporting it. Nothing re-exports this file.
+ * ./local-dev-db-server need it, so one of them would otherwise be importing
+ * filesystem plumbing from the other's public surface — and ./pid-file is the
+ * module whose exports ./local-dev-db-server re-exports by name onto the
+ * `strataline/local-dev-db-server` entry point. That list is the boundary now,
+ * so living there would not publish this by itself; what it would do is put a
+ * plumbing detail among the names that list is drawn from. Nothing re-exports
+ * this file.
  *
  * @internal Not part of the published API.
  */

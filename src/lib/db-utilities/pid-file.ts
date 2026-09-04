@@ -3,8 +3,12 @@ import { readFileSync, realpathSync, statSync } from "fs";
 import { readFile } from "fs/promises";
 import { isAbsolute, join, resolve } from "path";
 import { Client } from "pg";
-// Imported rather than re-exported: ./local-dev-db-server does `export * from
-// "./pid-file"`, so a name exported here becomes public API.
+// Imported rather than re-exported. ./local-dev-db-server names what it
+// re-exports from here, so an export added to this file is not public by
+// itself — but it is one line away from being, and a name that reads as part
+// of this module's API is the likeliest thing for that list to grow by. These
+// two are filesystem plumbing rather than PID identification, and they have
+// their own module for that reason. See ./file-presence.
 import { fileExists, getFilePresence } from "./file-presence";
 
 /**
