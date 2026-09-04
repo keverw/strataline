@@ -570,7 +570,9 @@ describe("stopping past the bound", () => {
     internals.tempDir = dataDir;
     internals.db = stallingDb;
 
-    await expect(instance.stop()).rejects.toThrow(/could not be confirmed gone/);
+    await expect(instance.stop()).rejects.toThrow(
+      /could not be confirmed gone/,
+    );
 
     expect(existsSync(dataDir)).toBe(true);
   }, 30_000);
@@ -583,7 +585,9 @@ describe("stopping past the bound", () => {
     internals.tempDir = dataDir;
     internals.db = stallingDb;
 
-    await expect(instance.stop()).rejects.toThrow(/could not be confirmed gone/);
+    await expect(instance.stop()).rejects.toThrow(
+      /could not be confirmed gone/,
+    );
 
     // The regression this encodes against: the timeout alone was read as "it
     // had already exited", and these files went out from under a server that
@@ -680,7 +684,9 @@ describe("stopping past the bound", () => {
 
     // Raised rather than logged, so a caller that supplied no logger is told
     // too, and so a teardown cannot quietly pass over a live PostgreSQL.
-    await expect(instance.stop()).rejects.toThrow(/could not be confirmed gone/);
+    await expect(instance.stop()).rejects.toThrow(
+      /could not be confirmed gone/,
+    );
 
     // Dropping these was the regression: `stop()` reported success, and the
     // only handle to the live server and the only record of its directory went
@@ -698,7 +704,9 @@ describe("stopping past the bound", () => {
     internals.tempDir = cluster(process.pid);
     internals.db = stallingDb;
 
-    await expect(instance.stop()).rejects.toThrow(/could not be confirmed gone/);
+    await expect(instance.stop()).rejects.toThrow(
+      /could not be confirmed gone/,
+    );
 
     // A stop that gave up leaves no pool, so the already-started guard cannot
     // see this. Starting here would build a second cluster over the top of the
@@ -715,7 +723,9 @@ describe("stopping past the bound", () => {
     internals.tempDir = dataDir;
     internals.db = stallingDb;
 
-    await expect(instance.stop()).rejects.toThrow(/could not be confirmed gone/);
+    await expect(instance.stop()).rejects.toThrow(
+      /could not be confirmed gone/,
+    );
     expect(existsSync(dataDir)).toBe(true);
 
     // The server has since shut down cleanly, which is what removing its own
@@ -804,10 +814,11 @@ describe("stopping past the bound", () => {
     if (internals.tempDir) {
       dirs.push({
         name: internals.tempDir,
-        removeCallback: () => rmSync(internals.tempDir as string, {
-          recursive: true,
-          force: true,
-        }),
+        removeCallback: () =>
+          rmSync(internals.tempDir as string, {
+            recursive: true,
+            force: true,
+          }),
       } as unknown as tmp.DirResult);
     }
   }, 60_000);
