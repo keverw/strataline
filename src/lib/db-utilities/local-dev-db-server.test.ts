@@ -385,11 +385,10 @@ describe("LocalDevDBServer", () => {
   afterEach(async () => {
     // Clean up the server
     if (server) {
+      // Nothing to release afterwards. One shared `exit` hook serves every
+      // instance and the shutdown takes it off with the last child, so a
+      // stopped server holds no process listener of its own.
       await server.stop();
-      // A fresh instance per test, and each one registers five `process`
-      // listeners. Without this the suite runs past Node's ten-listener
-      // warning threshold and every stale instance goes on answering signals.
-      server.dispose();
     }
 
     // Clean up PID file if it exists
@@ -906,7 +905,6 @@ describe("LocalDevDBServer", () => {
       expect(lstatSync(linkedDataDir).isSymbolicLink()).toBe(true);
     } finally {
       await linkedServer.stop();
-      linkedServer.dispose();
     }
   }, 180000);
 
@@ -1343,21 +1341,32 @@ describe("LocalDevDBServer", () => {
     }
   }, 120000);
 
-  it("keeps a start disposed mid-flight registered for the exit hook", async () => {
-    // dispose() is documented as safe to call at any moment, and it takes this
-    // instance out of the set the shared `exit` hook serves. Most of a cold
-    // start has no child yet — resolving the binaries, stopping a previous
-    // server, initdb — so dispose()'s own already-running warning does not
-    // fire and nothing says the protection has gone. The start then spawned a
-    // postmaster the hook no longer knew about, and an ordinary host exit
-    // leaves it holding the port and the data directory: the orphan this
-    // module exists to prevent, produced by a call documented as safe.
+  it("re-registers for the exit hook at the spawn, not only on the way in", async () => {
+    // performStart arms on the way in, and everything from there to the spawn
+    // is awaited: resolving the binaries, stopping a previous server, initdb.
+    // The registration is a shared Set that other paths take an instance out
+    // of, finalize() among them, so an arm that happens only before all that
+    // is an arm that something else can undo before there is a child.
+    //
+    // A child spawned while this instance is out of the set is one the `exit`
+    // hook does not know about, and an ordinary host exit then leaves a
+    // postmaster holding the port and the data directory. So the arm beside
+    // the spawn is what makes the child's protection structural rather than a
+    // property of whatever ran during the start.
+    //
+    // Driven through the private release, which is the same seam
+    // "keeps the listeners until the last server lets go" uses to arm without
+    // the cost of a real server. Nothing public drops the registration
+    // mid-start today, so this asserts the guarantee rather than reproducing a
+    // caller's mistake.
+    type Internals = { releaseProcessHandlers(): void };
+
     const port = await findFreePort();
     // Awaited before the count is captured, so nothing registers a listener
     // between the two readings.
     const before = process.listenerCount("exit");
 
-    let disposedDuringStart = false;
+    let releasedDuringStart = false;
     // Recorded rather than asserted in the callback, which runs inside the
     // guarded logger: a throw from an expect() there is absorbed as a failed
     // log line and the test would pass regardless.
@@ -1366,15 +1375,15 @@ describe("LocalDevDBServer", () => {
     // reset a `let`'s narrowing for an assignment made inside a closure, so a
     // `number | null` initialized to null reads as `null` at the assertion
     // below and the comparison will not compile.
-    let hookAfterDispose = -1;
+    let hookAfterRelease = -1;
 
-    const disposing = new LocalDevDBServer({
+    const starting = new LocalDevDBServer({
       port,
-      user: "disposed_user",
-      password: "disposed_password",
-      database: "disposed_database",
-      dataDir: join(tempDir.name, "disposed-pgdata"),
-      pidFile: join(tempDir.name, ".disposed_pg_pid"),
+      user: "rearm_user",
+      password: "rearm_password",
+      database: "rearm_database",
+      dataDir: join(tempDir.name, "rearm-pgdata"),
+      pidFile: join(tempDir.name, ".rearm_pg_pid"),
       onExit: () => {},
       logger: {
         info: (data) => {
@@ -1382,12 +1391,12 @@ describe("LocalDevDBServer", () => {
           // ahead of the spawn: cleanupExistingProcess and initdb both still
           // have to run.
           if (
-            !disposedDuringStart &&
+            !releasedDuringStart &&
             data.message.includes("Using PostgreSQL binaries")
           ) {
-            disposedDuringStart = true;
-            disposing.dispose();
-            hookAfterDispose = process.listenerCount("exit");
+            releasedDuringStart = true;
+            (starting as unknown as Internals).releaseProcessHandlers();
+            hookAfterRelease = process.listenerCount("exit");
           }
         },
         warn: () => {},
@@ -1396,19 +1405,19 @@ describe("LocalDevDBServer", () => {
     });
 
     try {
-      await disposing.start();
+      await starting.start();
 
-      // The disposal really did land, and really did take the hook off. Both
+      // The release really did land, and really did take the hook off. Both
       // halves matter: without them the assertion below would pass for an
-      // instance that was never disposed at all.
-      expect(disposedDuringStart).toBe(true);
-      expect(hookAfterDispose).toBe(before);
+      // instance that was never released at all.
+      expect(releasedDuringStart).toBe(true);
+      expect(hookAfterRelease).toBe(before);
 
       // Armed again beside the spawn, so the child this start created is still
       // force-killed if the host exits.
       expect(process.listenerCount("exit")).toBe(before + 1);
     } finally {
-      await disposing.stop();
+      await starting.stop();
     }
 
     expect(process.listenerCount("exit")).toBe(before);
@@ -1418,9 +1427,9 @@ describe("LocalDevDBServer", () => {
     // The logger belongs to the caller, so calling it runs somebody else's
     // code. start()'s catch logs before cleanupFailedStart, which is the only
     // thing that takes this instance's process listeners back off on a
-    // refusal, so a throw from that one line leaked all five — the same leak
-    // as resolving the binaries outside the try. It also replaced the reason
-    // the start refused with the logger's own error.
+    // refusal, so a throw from that one line leaked the shared `exit` hook —
+    // the same leak as resolving the binaries outside the try. It also
+    // replaced the reason the start refused with the logger's own error.
     const events = [
       "SIGINT",
       "SIGTERM",
@@ -4396,10 +4405,15 @@ describe("LocalDevDBServer", () => {
   it("keeps the listeners until the last server lets go", async () => {
     // One set of listeners serves every server, so arming a second adds
     // nothing and releasing one must not take them off under the other. They
-    // come off when the last server leaves, and not before — the lifecycle
-    // does that by itself, so what dispose() is for is releasing an instance
-    // ahead of it, one whose server could not be stopped.
-    type Internals = { armProcessHandlers(): void };
+    // come off when the last server leaves, and not before.
+    //
+    // Both halves are driven through the private pair rather than through a
+    // real start and stop, which is the whole point of the seam: the sharing
+    // is what is under test, not the lifecycle that happens to call them.
+    type Internals = {
+      armProcessHandlers(): void;
+      releaseProcessHandlers(): void;
+    };
 
     const events = ["exit"] as const;
 
@@ -4421,8 +4435,8 @@ describe("LocalDevDBServer", () => {
       events.map((event) => [event, process.listenerCount(event)]),
     );
 
-    const one = new LocalDevDBServer(config("dispose_one"));
-    const two = new LocalDevDBServer(config("dispose_two"));
+    const one = new LocalDevDBServer(config("shared_hook_one"));
+    const two = new LocalDevDBServer(config("shared_hook_two"));
 
     // Armed the way start() arms them, without the cost of a real server.
     (one as unknown as Internals).armProcessHandlers();
@@ -4443,13 +4457,13 @@ describe("LocalDevDBServer", () => {
     }
 
     // Still needed by `two`, so releasing `one` leaves them alone.
-    one.dispose();
+    (one as unknown as Internals).releaseProcessHandlers();
 
     for (const event of events) {
       expect(process.listenerCount(event)).toBe(armed.get(event) ?? 0);
     }
 
-    two.dispose();
+    (two as unknown as Internals).releaseProcessHandlers();
 
     // Back to whatever this test found, which is none of its own.
     for (const event of events) {
@@ -4457,7 +4471,7 @@ describe("LocalDevDBServer", () => {
     }
 
     // Idempotent, and an instance stays reusable afterwards.
-    two.dispose();
+    (two as unknown as Internals).releaseProcessHandlers();
 
     for (const event of events) {
       expect(process.listenerCount(event)).toBe(before.get(event) ?? 0);
@@ -5008,7 +5022,6 @@ describe("letting go of a child that exited unasked", () => {
       expect(internals.pgProcess).toBeNull();
       expect(reported).toBe(3);
     } finally {
-      server.dispose();
       scratch.removeCallback();
     }
   }, 30000);

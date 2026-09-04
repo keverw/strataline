@@ -783,62 +783,6 @@ export class LocalDevDBServer {
   }
 
   /**
-   * Removes the `process` listeners this instance registered, ahead of the
-   * point in the lifecycle where they would have come off by themselves.
-   *
-   * Rarely needed now that the handlers are scoped to a running server:
-   * {@link start} puts them on and the shutdown takes them off, so an
-   * instance sitting idle between cycles already holds none, and a program
-   * that builds servers over its lifetime no longer accumulates them. What is
-   * left for this is releasing an instance whose server could not be stopped,
-   * and belt-and-braces teardown in a test suite.
-   *
-   * Safe to call more than once, and a disposed instance can still be reused
-   * because `start()` registers again.
-   *
-   * Call {@link stop} first. Disposing an instance that still holds a child
-   * removes that child from the shared `exit` hook, so it can outlive the
-   * process that started it. It is allowed, since an instance being torn down
-   * for some other reason should not be made to throw, but it is not a tidy
-   * thing to do and it says so in the log.
-   */
-  public dispose(): void {
-    if (this.pgProcess) {
-      this.log(
-        "warn",
-        `dispose() was called while PostgreSQL (PID ${this.pgProcess.pid}) is still running. ` +
-          "It will no longer be stopped when this process exits. Call stop() first.",
-      );
-    } else if (this.startInFlight || this.startingUp) {
-      // The window where there is a start but not yet a child, which is most
-      // of a cold one: resolving the binaries, stopping a previous server,
-      // running initdb. The branch above cannot see it, so disposing here used
-      // to remove the protection silently and say nothing. It no longer
-      // removes it for good — startPostgresServer arms again beside the spawn
-      // — and that is exactly why it is worth a line: the call may do less
-      // than it looks like it did, and a caller relying on it would find the
-      // instance managed again with nothing having said so.
-      //
-      // "May", because which of the two happens is not known yet and this line
-      // is written now. A start that goes on to spawn re-registers and undoes
-      // this; one that fails first never spawns, and cleanupFailedStart
-      // releases the handlers on its own, so the disposal stands by a
-      // different route. Both end correctly. Saying flatly that it did not
-      // stick would be wrong in the second case, and a message that overstates
-      // is how a reader stops believing the ones that do not.
-      this.log(
-        "warn",
-        "dispose() was called while a start is in flight, so it may not stick: if that start gets as " +
-          "far as spawning a server, it registers this instance again, and that server will still be " +
-          "stopped when this process exits. Call dispose() again once start() has settled if that is " +
-          "not what you want.",
-      );
-    }
-
-    this.releaseProcessHandlers();
-  }
-
-  /**
    * Checks if a process is running by PID.
    *
    * @param pid Process ID to check
@@ -2973,17 +2917,21 @@ export class LocalDevDBServer {
 
     // Armed again here, beside the spawn, rather than trusting the arm
     // performStart made on its way in. Everything between the two is awaited —
-    // resolving the binaries, stopping a previous server, initdb — and there
-    // is no child during any of it, so a dispose() landing in that window took
-    // this instance out of the set the shared `exit` hook serves without its
-    // own already-running warning firing. The start then spawned a postmaster
-    // the hook no longer knew about, and an ordinary host exit left it holding
-    // the port and the data directory: the orphan this module exists to
-    // prevent, produced by a call documented as safe to make.
+    // resolving the binaries, stopping a previous server, initdb — and the
+    // registration is a shared Set that other paths take this instance out of:
+    // finalize() drops it when the last child is released, which the reuse
+    // block in performStart provokes deliberately and then arms again. Nothing
+    // reachable today drops it between that block and this line, so this is
+    // insurance rather than a fix for a live path, and it is stated as such.
     //
-    // Arming where the child is created makes that structural rather than a
-    // matter of what happened while the start was working. Idempotent, since
-    // the population is a Set and the listener installs once.
+    // Insurance worth carrying, because what it protects against is silent and
+    // expensive. A child spawned while this instance is out of the set is one
+    // the `exit` hook does not know about, and an ordinary host exit then
+    // leaves a postmaster holding the port and the data directory, which is
+    // the orphan this module exists to prevent. Arming where the child is
+    // created makes that structural rather than a property of whatever ran
+    // during the start. Idempotent, since the population is a Set and the
+    // listener installs once.
     this.armProcessHandlers();
 
     // Without a listener a failed spawn throws out of the event loop rather
@@ -3812,9 +3760,9 @@ export class LocalDevDBServer {
     // child created during startup. Shutdown removes it once no child remains.
     //
     // Ahead of the already-running guard below rather than after it, and ahead
-    // of the work this method does, on two counts. An instance disposed while
-    // it still held a child rejoins on the start() that then finds nothing to
-    // do, rather than staying permanently unmanaged.
+    // of the work this method does, so an instance that reaches start() is in
+    // the set before anything can spawn, including on the path where the guard
+    // finds a server already running and returns.
     //
     // A start() that then fails leaves the set again from cleanupFailedStart,
     // which every failure path runs, so a refusal leaves nothing armed.

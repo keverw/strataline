@@ -1889,23 +1889,9 @@ One `process` listener is installed for `exit`, and it force-kills a surviving p
 
 Supply nothing and nothing happens. The process stays up with no database behind it, which is logged as an error precisely because it is otherwise silent. Deciding that a dead database should take the program with it is the program's call. A test harness, a provisioning step, or anything that wanted a database for a while may have somewhere to carry on to.
 
-`dispose()` takes off the `exit` hook once no server needs it, and nothing else:
+The one `process` listener this library installs is a shared synchronous `exit` hook that force-kills any surviving child, and it manages itself. `start()` puts it on and the shutdown takes it off with the last child, so an instance sitting idle between cycles holds nothing and a program that builds servers over its lifetime accumulates nothing. One hook serves every server in the process, so several running at once still install exactly one, and it comes off when the last of them lets go.
 
-```ts
-const server = new LocalDevDBServer(config);
-
-try {
-  await server.start();
-  // ...
-} finally {
-  await server.stop();
-  server.dispose();
-}
-```
-
-Because the lifecycle already does this, `dispose()` is rarely needed: `start()` puts the hook on and the shutdown takes it off, so an instance sitting idle between cycles holds nothing. What is left for it is releasing an instance whose server could not be stopped, and belt-and-braces teardown. It is idempotent, and `start()` registers again, including on the path where it finds the server already running, so a disposed instance can still be reused. Where several servers are running, disposing one leaves the hook in place for the others.
-
-Stop the server before disposing it, as the example does. Disposing one that still holds a child takes it out of the set the `exit` hook protects, so that server can outlive the program that started it. It is allowed rather than an error, since an instance being torn down for some other reason should not be made to throw, and it warns to the logger.
+Note what it does not cover, because that gap is the whole reason the signal handler above exists. Node runs an `exit` hook on a normal exit, on `process.exit()`, and after an uncaught exception, but not when a signal terminates the process with nothing trapping it. `SIGINT` from Ctrl+C, `SIGTERM` from a supervisor or a plain `kill`, and `SIGHUP` when the terminal closes each end the process without the hook running at all, which leaves the postmaster holding the port and the data directory. The example above traps those three and calls `shutdown(signal)`, which is what closes the gap, and it is why wiring one is not optional for a program that is meant to be stopped. `SIGKILL` can be trapped by nothing, so nothing closes that one, and the hook cannot help there either.
 
 Keep your own handler's shutdown to a single `await`. Calling `process.exit()` on `SIGINT` while `shutdown()` is still escalating cuts it off part-way through, which can leave a data directory needing recovery. Exit from the `.then`, as the example does, not alongside it.
 

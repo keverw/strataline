@@ -48,7 +48,7 @@ This release hardens the local development database server around process identi
 
 - **Breaking:** the library traps no `SIGINT`, `SIGTERM`, or `SIGHUP`. Hosts that want graceful signal shutdown must call `shutdown(signal)` and decide when to exit. The development script now demonstrates that wiring.
 - **Breaking:** `onExit` reports only a server that dies without being asked. A script whose whole purpose is the dev server should exit from that callback, and should exit non-zero rather than forwarding PostgreSQL's own code, because a shutdown asked for from outside the process, a `pg_ctl stop` for instance, arrives there with code `0` and would report a vanished database as a clean run. Embedders can recover or carry on instead.
-- The only installed `process` listener is a shared synchronous `exit` hook that force-kills surviving child processes. It is installed while at least one server owns a child, does not accumulate across instances, and can be released explicitly with `dispose()`.
+- The only installed `process` listener is a shared synchronous `exit` hook that force-kills surviving child processes. It is installed while at least one server owns a child, and does not accumulate across instances: one hook serves every server in the process, and it comes off when the last of them lets go. `start()` puts it on and the shutdown takes it off, so there is nothing to release by hand.
 
 **Test Databases**
 
