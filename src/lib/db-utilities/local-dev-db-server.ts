@@ -1,7 +1,6 @@
 import { spawn } from "child_process";
 import { randomUUID } from "crypto";
 import {
-  access,
   writeFile,
   readFile,
   open,
@@ -14,10 +13,12 @@ import {
   rmdir,
   realpath,
 } from "fs/promises";
-import { constants } from "fs";
 import { dirname, isAbsolute, join, resolve } from "path";
 import { Client } from "pg";
 import { callHost, makeSafeLogger } from "../callback-safety";
+// Imported rather than re-exported: this module does `export * from
+// "./pid-file"` below, so a name exported here becomes public API.
+import { fileExists, getFilePresence } from "./file-presence";
 import { readOsUsername } from "../os-user";
 import { type LogLevel, type LogSource, type Logger } from "../logger";
 import { PostgresBinaries, getBinaries } from "./pg-bin-helper";
@@ -192,9 +193,6 @@ export type DevDBLifecycleState =
   | "unstoppable";
 
 /**
- * Helper function to check if a file exists (async equivalent of existsSync)
- */
-/**
  * Everything in a postmaster.pid except the status PostgreSQL rewrites.
  *
  * Line 8 is PostgreSQL's own status, and it flips from "ready" to "stopping"
@@ -208,15 +206,6 @@ export type DevDBLifecycleState =
  */
 function postmasterRecordIdentity(raw: string): string {
   return raw.split("\n").slice(0, 7).join("\n");
-}
-
-async function fileExists(path: string): Promise<boolean> {
-  try {
-    await access(path, constants.F_OK);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /**
@@ -393,14 +382,24 @@ export class LocalDevDBServer {
   // drops this alongside the rest of what that child owned.
   private unstoppableChild: ReturnType<typeof spawn> | null = null;
 
-  // The child whose exit this instance currently speaks for, replaced only by
-  // the next attachExitHandler and never cleared.
+  // Which attachment this instance currently speaks for. Bumped by every
+  // attachExitHandler, and each handler closes over the number it was given,
+  // so a handler can ask whether it is still the current one.
   //
   // Deliberately not pgProcess or pgProcessLifecycle, which a completed
   // lifecycle sets to null: those cannot tell "this child's cleanup has
   // finished" apart from "a later child has taken over", and a lifecycle handler
   // has to know which of the two it is before touching anything shared.
-  private attachedChild: ReturnType<typeof spawn> | null = null;
+  //
+  // A counter rather than the child itself, which is what this held before.
+  // The comparison only ever asked whether the current attachment is still
+  // this one, and a number answers that — while holding the handle kept a dead
+  // child, and the stdio stream objects hanging off it, reachable from the
+  // instance for as long as no later start replaced it. That is bounded rather
+  // than a growing leak, but it also made finalize()'s release of
+  // unstoppableChild do nothing, since this field still pointed at the same
+  // child. Nothing else ever read it, so there is nothing else to change.
+  private attachedGeneration = 0;
 
   /**
    * Creates a new PostgresDevServer instance.
@@ -1199,27 +1198,12 @@ export class LocalDevDBServer {
   }
 
   /**
-   * Reads a PID file's exact bytes, or null when there is nothing to read.
-   *
-   * The bytes rather than a parse, because this recognizes one particular
-   * record again rather than trying to understand it.
-   */
-  private async readPidFileBytes(path: string): Promise<string | null> {
-    try {
-      return await readFile(path, "utf8");
-    } catch {
-      // Absent, or not readable by us. Neither is a record we accounted for.
-      return null;
-    }
-  }
-
-  /**
    * Reads a record this call has already claimed, keeping a failure to read
    * it apart from a record that turns out to be somebody else's.
    *
-   * The two are the same `null` to {@link readPidFileBytes}, and here they
-   * must not be. A record that does not match is positive evidence that the
-   * name changed hands. Bytes that could not be read are no evidence about
+   * A plain read collapses the two into one `null`, and here they must not
+   * be. A record that does not match is positive evidence that the name
+   * changed hands. Bytes that could not be read are no evidence about
    * anything, and reporting them as the first has a start refuse with a
    * message about another server having taken the data directory — over a
    * record that may never have changed.
@@ -1248,12 +1232,13 @@ export class LocalDevDBServer {
   /**
    * Reads bytes that startup will use to account for a PID record.
    *
-   * Unlike {@link readPidFileBytes}, this distinguishes absence from an
-   * unreadable path. The tolerant reader is useful after this invocation has
-   * claimed a record and is trying to put somebody else's back. Startup's
-   * accounting has a different job: `null` licenses treating a path as empty,
-   * so only genuine absence may produce it. An access failure must refuse the
-   * start rather than let a later rename overwrite an unknown record.
+   * Distinguishes absence from an unreadable path, which is what separates
+   * this from {@link readClaimedRecord}: that one is tolerant, because it runs
+   * after this invocation has claimed a record and is trying to put somebody
+   * else's back. Startup's accounting has a different job: `null` licenses
+   * treating a path as empty, so only genuine absence may produce it. An
+   * access failure must refuse the start rather than let a later rename
+   * overwrite an unknown record.
    */
   private async readAccountedPidFileBytes(
     path: string,
@@ -1414,11 +1399,39 @@ export class LocalDevDBServer {
       // start proceed against a data directory something else has, which is
       // the one mistake this whole protocol exists to prevent.
       if ((e as NodeJS.ErrnoException)?.code === "ENOENT") {
-        if (await fileExists(path)) {
+        // Three answers rather than two, because only a CONFIRMED absence may
+        // report a free data directory here and only a CONFIRMED presence may
+        // say who took it. A plain existence check folds EACCES on a directory
+        // this user may no longer traverse, and EIO on a failing disk, into
+        // the same `false` a missing file gives, which is the
+        // absent-versus-unreadable conflation the rest of this module is built
+        // to avoid.
+        const presence = await getFilePresence(path);
+
+        if (presence === "absent") {
+          return { outcome: "absent" };
+        }
+
+        if (presence === "present") {
           return { outcome: "discarded", displaced: held };
         }
 
-        return { outcome: "absent" };
+        // Held by something, or not — this could not look. `discarded` would
+        // be safe, since both outcomes refuse, but it is not TRUE: its callers
+        // state as fact that another server replaced the record, and the
+        // paragraph above earns that wording from EEXIST, where a third record
+        // demonstrably holds the name. Nothing here demonstrates anything, and
+        // sending a person to hunt a second postmaster over what is really a
+        // permission or a failing disk is the wrong end of the machine. So
+        // report the outcome whose remedy fits: something is in the way and
+        // this start could not get hold of it.
+        return {
+          outcome: "unclaimable",
+          error: new Error(
+            `the record was claimed for removal and could not be put back, and ${path} could not be inspected to see whether anything now holds it`,
+            { cause: e },
+          ),
+        };
       }
 
       return { outcome: "stranded", heldAt: claimed, displaced: held };
@@ -3076,9 +3089,9 @@ export class LocalDevDBServer {
       this.stoppingProc = null;
     }
 
-    // From here on this child is the one this instance answers for, and any
-    // handler still attached to an earlier one is answering for history.
-    this.attachedChild = proc;
+    // From here on this attachment is the one this instance answers for, and
+    // any handler from an earlier one is answering for history.
+    const generation = ++this.attachedGeneration;
 
     let resolveClosed: () => void = () => {};
     const closed = new Promise<void>((resolve) => {
@@ -3188,7 +3201,7 @@ export class LocalDevDBServer {
       // pgProcess null, which nothing but finalize() and cleanupFailedStart()
       // makes it. Both release this child's PID record first, so anything
       // arriving here has already been cleaned up.
-      if (this.attachedChild !== proc) {
+      if (this.attachedGeneration !== generation) {
         this.log(
           "setup",
           `A superseded PostgreSQL server process (PID ${proc.pid}) reported exit code ${code}. ` +

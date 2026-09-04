@@ -11,6 +11,7 @@ import {
 import EmbeddedPostgres from "embedded-postgres";
 import * as tmp from "tmp";
 import { findFreePort } from "./free-port";
+import { getFilePresence } from "./file-presence";
 import { isProcessAlive, readPostmasterPidFile } from "./pid-file";
 import {
   ipcExhaustionHint,
@@ -20,6 +21,7 @@ import {
   type PostgresOutputRead,
 } from "./postgres-output";
 import * as fs from "fs";
+import { join } from "path";
 
 // Default configuration for test database
 const DEFAULT_DB_USER = "test_user";
@@ -184,9 +186,12 @@ export class TestDatabaseInstance {
    * something to try again with, and so {@link start} can refuse rather than
    * build a second cluster over the top of a live one.
    *
-   * Only set where the cluster was CONFIRMED still there — see
-   * {@link stopServerWithinBound}. A stop that merely ran out of patience on a
-   * postmaster that had already gone releases normally.
+   * Set wherever the cluster was not CONFIRMED GONE — see
+   * {@link stopServerWithinBound} and {@link serverStillRunning}. That is a
+   * live postmaster, and equally a `postmaster.pid` this could not read, since
+   * an answer it could not get must not license deleting a data directory.
+   * Only a file confirmed absent, which is what a clean exit leaves, releases
+   * normally.
    */
   private unstoppedServer: RetargetablePostgres | null = null;
   private pool?: Pool;
@@ -349,9 +354,10 @@ export class TestDatabaseInstance {
         this.log(
           "warn",
           "Stopping embedded PostgreSQL did not return within " +
-            `${TestDatabaseInstance.STOP_TIMEOUT_MS}ms and its postmaster is still running. ` +
-            "It is most likely still writing its shutdown checkpoint. Leaving its data directory in place " +
-            "rather than removing it out from under a live server.",
+            `${TestDatabaseInstance.STOP_TIMEOUT_MS}ms, and its postmaster could not be confirmed gone. ` +
+            "It is most likely still writing its shutdown checkpoint, though a postmaster.pid this could not " +
+            "read reaches here the same way. Leaving its data directory in place rather than removing it out " +
+            "from under what may be a live server.",
         );
 
         return "still-running";
@@ -379,16 +385,38 @@ export class TestDatabaseInstance {
    *
    * Unknown counts as running. This gates deleting a data directory, so an
    * answer it could not get must not license that.
+   *
+   * Which takes the file's PRESENCE as well as its contents, because
+   * `readPostmasterPidFile` cannot tell the two apart on its own: it answers
+   * null for a file that is not there, for one this process may not read, and
+   * for one whose contents are not a record, and those mean opposite things
+   * here. A postmaster removes its own file on a clean exit, so a confirmed
+   * absence is a server that finished. Anything else is a question that could
+   * not be answered, and the caller acts on the answer by deleting the data
+   * directory — so a torn write, an EACCES, or a failing disk has to read as
+   * still running rather than as gone.
+   *
+   * Not fixed in `readPostmasterPidFile` itself, deliberately. That one is
+   * public through `strataline/local-dev-db-server` and callers depend on what
+   * its null means, so the presence check layers on here instead of changing a
+   * published contract.
    */
   private async serverStillRunning(): Promise<boolean> {
     if (!this.tempDir) {
       return false;
     }
 
+    const pidFile = join(this.tempDir, "postmaster.pid");
+
     try {
       const record = await readPostmasterPidFile(this.tempDir);
 
-      return record !== null && isProcessAlive(record.pid);
+      if (record !== null) {
+        return isProcessAlive(record.pid);
+      }
+
+      // No record came back. Only a confirmed absence is a server that exited.
+      return (await getFilePresence(pidFile)) !== "absent";
     } catch {
       return true;
     }
@@ -1110,9 +1138,9 @@ export class TestDatabaseInstance {
       this.log(
         "warn",
         `Leaving the temporary directory in place: ${this.tempDir}. ` +
-          "PostgreSQL was still running there when the stop gave up, so removing it now would " +
+          "PostgreSQL could not be confirmed gone there when the stop gave up, so removing it now might " +
           "delete a live cluster's files. Call stop() again once it has finished shutting down, " +
-          "or delete the directory by hand once that server is gone.",
+          "or delete the directory by hand once you have checked that nothing is using it.",
       );
 
       // The path is KEPT rather than cleared, which is what lets a later
@@ -1178,7 +1206,7 @@ export class TestDatabaseInstance {
    * data directory, so a later call asks the cluster afresh and completes once
    * the postmaster has gone.
    *
-   * @throws When the stop gave up on a cluster confirmed still running, or
+   * @throws When the stop gave up without confirming the cluster was gone, or
    * when the teardown fails for any other reason.
    */
   public async stop(): Promise<void> {
@@ -1200,7 +1228,7 @@ export class TestDatabaseInstance {
 
     if (this.unstoppedServer) {
       throw new Error(
-        "Test database was not stopped: PostgreSQL was still running when the stop gave up, " +
+        "Test database was not stopped: PostgreSQL could not be confirmed gone when the stop gave up, " +
           `so the server and its data directory have been kept${
             this.tempDir ? ` (${this.tempDir})` : ""
           }. ` +

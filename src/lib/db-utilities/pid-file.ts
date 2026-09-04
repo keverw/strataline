@@ -1,8 +1,11 @@
 import { execFileSync } from "child_process";
-import { readFileSync, realpathSync, statSync, constants } from "fs";
-import { readFile, access } from "fs/promises";
+import { readFileSync, realpathSync, statSync } from "fs";
+import { readFile } from "fs/promises";
 import { isAbsolute, join, resolve } from "path";
 import { Client } from "pg";
+// Imported rather than re-exported: ./local-dev-db-server does `export * from
+// "./pid-file"`, so a name exported here becomes public API.
+import { fileExists, getFilePresence } from "./file-presence";
 
 /**
  * Identifying the process behind a PID record.
@@ -221,28 +224,6 @@ export interface DevDBStatusOptions {
   connectionProbe?: (
     connection: DevDBConnectionProbe,
   ) => Promise<DevDBConnectionResult>;
-}
-
-type FilePresence = "present" | "absent" | "inaccessible";
-
-/**
- * Distinguishes genuine absence from an inability to inspect a path. The
- * difference is safety-critical for PID records: EACCES and filesystem errors
- * are unknown evidence, not proof that no server is running.
- */
-async function getFilePresence(path: string): Promise<FilePresence> {
-  try {
-    await access(path, constants.F_OK);
-    return "present";
-  } catch (e) {
-    const code = (e as NodeJS.ErrnoException)?.code;
-
-    return code === "ENOENT" || code === "ENOTDIR" ? "absent" : "inaccessible";
-  }
-}
-
-async function fileExists(path: string): Promise<boolean> {
-  return (await getFilePresence(path)) === "present";
 }
 
 /** A memo that remembers settled answers and retries unsettled ones. */

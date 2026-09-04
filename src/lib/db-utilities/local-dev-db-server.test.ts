@@ -4049,7 +4049,6 @@ describe("LocalDevDBServer", () => {
       ): Promise<string | null>;
       cleanupExistingProcess(): Promise<void>;
       readAccountedPidFileBytes(path: string): Promise<string | null>;
-      readPidFileBytes(path: string): Promise<string | null>;
     };
 
     const identity = (raw: string): string => raw;

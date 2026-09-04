@@ -522,6 +522,53 @@ describe("stopping past the bound", () => {
     expect(await internals.serverStillRunning()).toBe(true);
   });
 
+  it("counts a postmaster.pid it cannot read as a server still running", async () => {
+    const instance = new TestDatabaseInstance();
+    const internals = instance as unknown as Internals;
+
+    // Present, and not a record. `readPostmasterPidFile` answers null for
+    // this exactly as it does for a file that is not there, and here the two
+    // mean opposite things: absent is a postmaster that removed its own file
+    // on the way out, while unreadable is a question this could not answer.
+    // Only the first licenses deleting the data directory, so the second has
+    // to read as still running.
+    internals.tempDir = cluster();
+
+    writeFileSync(
+      join(internals.tempDir, "postmaster.pid"),
+      "not a pid record\n",
+    );
+
+    expect(await internals.serverStillRunning()).toBe(true);
+
+    // The same for a record whose first line is not a PID at all, which is
+    // what a torn write leaves.
+    internals.tempDir = cluster();
+
+    writeFileSync(join(internals.tempDir, "postmaster.pid"), "");
+
+    expect(await internals.serverStillRunning()).toBe(true);
+  });
+
+  it("keeps the data directory when the stop gives up and the record is unreadable", async () => {
+    const instance = new TestDatabaseInstance();
+    const internals = instance as unknown as Internals;
+    const dataDir = cluster();
+
+    // The dangerous combination, and the reason the unit test above is not
+    // the whole of it: a stop that times out, and a postmaster.pid that says
+    // nothing. Read as an absence, the timeout settles as "already exited"
+    // and these files go out from under whatever wrote them.
+    writeFileSync(join(dataDir, "postmaster.pid"), "not a pid record\n");
+
+    internals.tempDir = dataDir;
+    internals.db = stallingDb;
+
+    await expect(instance.stop()).rejects.toThrow(/could not be confirmed gone/);
+
+    expect(existsSync(dataDir)).toBe(true);
+  }, 30_000);
+
   it("leaves the data directory alone when the stop gives up on a live postmaster", async () => {
     const instance = new TestDatabaseInstance();
     const internals = instance as unknown as Internals;
@@ -530,7 +577,7 @@ describe("stopping past the bound", () => {
     internals.tempDir = dataDir;
     internals.db = stallingDb;
 
-    await expect(instance.stop()).rejects.toThrow(/still running/);
+    await expect(instance.stop()).rejects.toThrow(/could not be confirmed gone/);
 
     // The regression this encodes against: the timeout alone was read as "it
     // had already exited", and these files went out from under a server that
@@ -627,7 +674,7 @@ describe("stopping past the bound", () => {
 
     // Raised rather than logged, so a caller that supplied no logger is told
     // too, and so a teardown cannot quietly pass over a live PostgreSQL.
-    await expect(instance.stop()).rejects.toThrow(/still running/);
+    await expect(instance.stop()).rejects.toThrow(/could not be confirmed gone/);
 
     // Dropping these was the regression: `stop()` reported success, and the
     // only handle to the live server and the only record of its directory went
@@ -645,7 +692,7 @@ describe("stopping past the bound", () => {
     internals.tempDir = cluster(process.pid);
     internals.db = stallingDb;
 
-    await expect(instance.stop()).rejects.toThrow(/still running/);
+    await expect(instance.stop()).rejects.toThrow(/could not be confirmed gone/);
 
     // A stop that gave up leaves no pool, so the already-started guard cannot
     // see this. Starting here would build a second cluster over the top of the
@@ -662,7 +709,7 @@ describe("stopping past the bound", () => {
     internals.tempDir = dataDir;
     internals.db = stallingDb;
 
-    await expect(instance.stop()).rejects.toThrow(/still running/);
+    await expect(instance.stop()).rejects.toThrow(/could not be confirmed gone/);
     expect(existsSync(dataDir)).toBe(true);
 
     // The server has since shut down cleanly, which is what removing its own
