@@ -3056,19 +3056,36 @@ export class LocalDevDBServer {
    * PostgreSQL's backends inherit those pipes and can outlive the postmaster
    * holding them open. So this waits for the guarantee where it is coming and
    * gives up where it is not, rather than making a diagnosis depend on it.
+   *
+   * `hasClosed` is how it knows the guarantee has ALREADY arrived, and it is
+   * not a shortcut. `close` fires once and Node does not replay it, so waiting
+   * on it after the fact waits forever — and this is called from the exit
+   * handler AFTER an `await finalize()` that does real filesystem work, which
+   * is ample time for the pipes to EOF and the event to fire. That left the
+   * rest of the handler unreachable: no flush, and no reportServerExit, so a
+   * crashed server was never announced to `onExit` and a host with nothing
+   * else pending exited 0 reporting a clean run. The flag is set by a listener
+   * attached beside the exit handler, since neither `destroyed` nor `closed`
+   * on the streams answers this question on both runtimes: under Bun both are
+   * already true when `exit` fires, so reading them would skip the drain on
+   * the startup path, which is the path it exists for.
+   *
+   * The timer is deliberately NOT unref'd. It is what settles this where
+   * `close` is not coming, so a process with nothing else pending must stay up
+   * for it rather than exit through the gap — the same failure by the other
+   * route. It costs at most {@link OUTPUT_DRAIN_MS} at the end of a teardown
+   * that is already reporting a dead server.
    */
   private async drainServerOutput(
     proc: ReturnType<typeof spawn>,
+    hasClosed: () => boolean,
   ): Promise<void> {
-    if (proc.stdout === null && proc.stderr === null) {
+    if (hasClosed() || (proc.stdout === null && proc.stderr === null)) {
       return;
     }
 
     await new Promise<void>((settle) => {
-      const timer = setTimeout(
-        settle,
-        LocalDevDBServer.OUTPUT_DRAIN_MS,
-      ).unref();
+      const timer = setTimeout(settle, LocalDevDBServer.OUTPUT_DRAIN_MS);
 
       proc.once("close", () => {
         clearTimeout(timer);
@@ -3092,6 +3109,18 @@ export class LocalDevDBServer {
     // From here on this attachment is the one this instance answers for, and
     // any handler from an earlier one is answering for history.
     const generation = ++this.attachedGeneration;
+
+    // Whether the child's stdio has already closed, recorded rather than
+    // asked for later. `close` fires once and is not replayed, so the only
+    // way to know it has happened is to have been listening when it did —
+    // which is why this goes on here, synchronously, beside the exit handler
+    // and before anything can await. See drainServerOutput, which waits on
+    // that event and would otherwise wait for one that had already gone.
+    let stdioClosed = false;
+
+    proc.once("close", () => {
+      stdioClosed = true;
+    });
 
     let resolveClosed: () => void = () => {};
     const closed = new Promise<void>((resolve) => {
@@ -3234,7 +3263,7 @@ export class LocalDevDBServer {
       // Only on the startup path. Nothing else reads the captured output, and
       // an ordinary stop should not pay for this.
       if (startOwnsThisExit) {
-        await this.drainServerOutput(proc);
+        await this.drainServerOutput(proc, () => stdioClosed);
 
         // Nothing more is coming: either `close` arrived, which means both
         // pipes are done, or the bound expired and waiting longer would only
@@ -3305,7 +3334,7 @@ export class LocalDevDBServer {
         const unrequested = !startOwnsThisExit && !deliberate;
 
         if (unrequested) {
-          await this.drainServerOutput(proc);
+          await this.drainServerOutput(proc, () => stdioClosed);
           this.flushServerOutput();
         }
 

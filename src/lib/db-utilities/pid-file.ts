@@ -2161,14 +2161,21 @@ async function probeStatusFromFiles(
      * one branch set the field empty while the reason named the failures, and
      * others did the reverse, so a caller branching on the field and a person
      * reading the message saw different machines.
+     *
+     * It takes no argument for the same reason, having briefly taken one. The
+     * live check's failures were passed on the `ruled-out` return alone, so
+     * every other return dropped them — including the undecidable one, which
+     * is the single place they matter most: that answer is a refusal a person
+     * has to act on, and "`ps` could not run" is exactly what tells them the
+     * refusal is a five-minute fix rather than the design. A branch cannot
+     * forget what it does not have to remember, so the reading is merged here
+     * and the null it holds where the check never ran contributes nothing.
      */
-    const postmasterProbeFailures = (
-      live: { probeFailures: string[] } | null = null,
-    ): string[] =>
+    const postmasterProbeFailures = (): string[] =>
       mergeProbeFailures(
         bootProbeFailures,
         verification.probeFailures,
-        live?.probeFailures ?? [],
+        postmasterLiveCheck?.probeFailures ?? [],
       );
 
     // A start time predating this boot otherwise proves the record survived a
@@ -2206,13 +2213,13 @@ async function probeStatusFromFiles(
           port: postmaster.port || null,
           source: "postmaster",
           observedStartTime: null,
-          probeFailures: postmasterProbeFailures(postmasterLiveCheck),
+          probeFailures: postmasterProbeFailures(),
           stale: true,
           staleKind: "recycled",
           indeterminate: false,
           reason:
             `stale postmaster.pid: it records a server started before the current boot, so PID ${postmaster.pid} now belongs to a different process` +
-            describeProbeFailures(postmasterProbeFailures(postmasterLiveCheck)),
+            describeProbeFailures(postmasterProbeFailures()),
         },
         pidFile,
         dataDir,

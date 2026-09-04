@@ -899,6 +899,31 @@ export class TestDatabaseInstance {
           `Non-fatal error during cleanup after failed start: ${(cleanupError as Error).message}`,
         );
       }
+
+      // The teardown gave up on a postmaster it could not confirm gone, which
+      // `performCleanup` reports by RETURNING with the server retained rather
+      // than by throwing — so the catch above sees nothing and the original
+      // failure would have gone back on its own. That failure is real and
+      // stays the cause, but on its own it describes a start that tidied up
+      // after itself, and this one did not: a PostgreSQL is holding a port and
+      // a data directory, and the only account of it was a log line a caller
+      // with no logger never sees. Said in the error instead, which is the
+      // same bar `LocalDevDBServer.start()` holds its own unstoppable child
+      // to, and for the same reason: the next start() refuses on this state,
+      // so a caller told only about the first failure retries and is refused
+      // for what reads as an unrelated reason.
+      if (this.unstoppedServer) {
+        throw new Error(
+          `The test database failed to start, and the PostgreSQL it had started could not be stopped. ` +
+            `It may still be holding port ${this.port}${
+              this.tempDir ? ` and its data directory (${this.tempDir})` : ""
+            }. ` +
+            "Call stop() once it has shut down, or stop it manually. " +
+            `Cause: ${getErrorMessage(error)}`,
+          { cause: error },
+        );
+      }
+
       throw error;
     }
   }

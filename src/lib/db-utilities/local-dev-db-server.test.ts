@@ -35,6 +35,7 @@ import {
 } from "fs";
 import { spawn, execFileSync } from "child_process";
 import { createServer, type Socket } from "net";
+import { pathToFileURL } from "url";
 import { findFreePort } from "./free-port";
 import {
   PostgresLineAssembler,
@@ -4237,6 +4238,10 @@ describe("LocalDevDBServer", () => {
       exitCode: null,
       signalCode: null,
       on: () => {},
+      // A real ChildProcess has both, and attachExitHandler records the
+      // stdio close through this one. Nothing here emits it: this test is
+      // about the two finalizers, and the exit handler never runs.
+      once: () => {},
     };
 
     internals.pgProcess = proc;
@@ -4933,6 +4938,102 @@ describe("letting go of a child that exited unasked", () => {
       expect(reported).toBe(3);
     } finally {
       server.dispose();
+      scratch.removeCallback();
+    }
+  }, 30000);
+});
+
+describe("reporting an unasked-for exit whose stdio has already closed", () => {
+  /**
+   * Run in a child process, which is the whole of the assertion.
+   *
+   * The failure this covers is a process that ENDS early, so nothing inside
+   * this suite can see it: a test runner always has a live event loop, so the
+   * drain's fallback timer fires there whether or not anything is waiting on
+   * it, and the report arrives late rather than never. Only a process with
+   * nothing else pending — a dev-server script, which is the documented way to
+   * use `onExit` — reaches the gap, so the scenario gets a process of its own
+   * and the assertion is on what it printed before exiting.
+   *
+   * The ordering is the point and is arranged rather than hoped for. `close`
+   * is emitted immediately after `exit`, by which time the handler is
+   * suspended at its first `await` — which is where a real one sits while
+   * `finalize()` does filesystem work, and ample time for two pipes to reach
+   * EOF. `close` fires once and Node does not replay it, so a drain that
+   * starts listening afterwards waits for an event that has already gone,
+   * and the flush, the pipe drop, and the `onExit` call after it never run.
+   */
+  it("reports the exit rather than exiting silently", () => {
+    const scratch = tmp.dirSync({ unsafeCleanup: true, prefix: "pg-drain-" });
+
+    try {
+      const moduleUrl = pathToFileURL(
+        join(import.meta.dir, "local-dev-db-server.ts"),
+      ).href;
+      const script = join(scratch.name, "unasked-exit.ts");
+
+      writeFileSync(
+        script,
+        `
+import { LocalDevDBServer } from ${JSON.stringify(moduleUrl)};
+import { EventEmitter } from "events";
+
+const pipe = () => ({
+  destroyed: false,
+  destroy() {
+    this.destroyed = true;
+  },
+});
+
+const proc: any = new EventEmitter();
+
+proc.pid = 424242;
+proc.exitCode = null;
+proc.signalCode = null;
+proc.stdout = pipe();
+proc.stderr = pipe();
+proc.stdin = pipe();
+
+const server: any = new LocalDevDBServer({
+  port: 1,
+  user: "u",
+  password: "p",
+  database: "d",
+  dataDir: ${JSON.stringify(join(scratch.name, "pgdata"))},
+  pidFile: ${JSON.stringify(join(scratch.name, "dev-db.pid"))},
+  onExit: (code: number) => {
+    console.log("REPORTED " + code);
+  },
+});
+
+// The way a real spawn wires one up, so the handler treats what follows as
+// its own child's exit rather than a superseded one's.
+server.pgProcess = proc;
+server.attachExitHandler(proc);
+
+// Nobody asked for this: no stop() in flight and no start() owning it.
+proc.exitCode = 3;
+proc.emit("exit", 3);
+
+// Synchronously after, which puts it inside the handler's first await —
+// where the pipes really do reach EOF while finalize() is working.
+proc.emit("close", 3);
+
+// Deliberately nothing else pending. A dev-server script has nothing either
+// once its database is gone, and that is what makes the gap reachable.
+`,
+      );
+
+      const out = execFileSync(process.execPath, [script], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+
+      // Not merely eventually: this process had nothing to keep it alive, so
+      // a report that depends on a timer nobody is holding never arrives at
+      // all and a crashed database reads as a clean run.
+      expect(out).toContain("REPORTED 3");
+    } finally {
       scratch.removeCallback();
     }
   }, 30000);

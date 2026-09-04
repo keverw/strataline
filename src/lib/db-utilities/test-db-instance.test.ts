@@ -3,7 +3,13 @@ import { createConsoleLogger } from "../logger";
 import { TestDatabaseInstance, isBindFailure } from "./test-db-instance";
 import { Migration } from "../migration-system";
 import * as tmp from "tmp";
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from "fs";
+import {
+  existsSync,
+  readFileSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "fs";
 import { join } from "path";
 import type EmbeddedPostgres from "embedded-postgres";
 
@@ -738,4 +744,71 @@ describe("stopping past the bound", () => {
     // every abandoned stop into a temporary directory nobody removes.
     expect(existsSync(dataDir)).toBe(false);
   }, 30_000);
+
+  it("says so when a failed start could not stop what it had started", async () => {
+    // performCleanup reports a server it could not confirm gone by RETURNING
+    // with it retained rather than by throwing, so start()'s catch sees
+    // nothing and used to rethrow the original failure alone. That failure is
+    // real and stays the cause, but on its own it describes a start that
+    // tidied up after itself -- and this one left a PostgreSQL holding a port
+    // and a data directory, with a log line a caller who supplied no logger
+    // never sees as its only account. It also decides the next call: start()
+    // refuses on this state, so a caller told only about the first failure
+    // retries and is refused for what reads as an unrelated reason.
+    class StallingStart extends TestDatabaseInstance {
+      protected override buildEmbeddedPostgres(): ReturnType<
+        TestDatabaseInstance["buildEmbeddedPostgres"]
+      > {
+        const dir = (this as unknown as Internals).tempDir as string;
+
+        // A live postmaster for this cluster, so the stop below cannot
+        // confirm it gone and the directory is kept rather than deleted.
+        writeFileSync(
+          join(dir, "postmaster.pid"),
+          `${process.pid}\n${dir}\n${Math.floor(Date.now() / 1000)}\n5432\n`,
+        );
+
+        return {
+          initialise: async () => {
+            throw new Error("initdb refused");
+          },
+          stop: () => new Promise<void>(() => {}),
+        } as unknown as ReturnType<
+          TestDatabaseInstance["buildEmbeddedPostgres"]
+        >;
+      }
+    }
+
+    const instance = new StallingStart({});
+    const internals = instance as unknown as Internals;
+
+    let raised: unknown;
+
+    try {
+      await instance.start();
+    } catch (error) {
+      raised = error;
+    }
+
+    // Both halves. The cause is what actually went wrong, and the message is
+    // the part that was missing: something is still running.
+    expect(raised).toBeInstanceOf(Error);
+    expect((raised as Error).message).toMatch(/could not be stopped/);
+    expect((raised as Error).message).toMatch(/initdb refused/);
+    expect((raised as Error).cause).toBeInstanceOf(Error);
+    expect(((raised as Error).cause as Error).message).toBe("initdb refused");
+
+    // And it is telling the truth about the state it is describing.
+    expect(internals.unstoppedServer).not.toBeNull();
+
+    if (internals.tempDir) {
+      dirs.push({
+        name: internals.tempDir,
+        removeCallback: () => rmSync(internals.tempDir as string, {
+          recursive: true,
+          force: true,
+        }),
+      } as unknown as tmp.DirResult);
+    }
+  }, 60_000);
 });

@@ -3225,4 +3225,64 @@ describe("probe failure reporting, regressions", () => {
       );
     }
   });
+
+  test("carries what the boot-corroborating check could not probe", async () => {
+    // A postmaster.pid whose start time predates the boot reading is not
+    // decisive on its own -- a clock corrected since it was written produces
+    // the same disagreement for a server that is running right now -- so a
+    // second check asks the live process what it says about itself. When THAT
+    // one cannot decide either, the status is a refusal a person has to act
+    // on, and whether `ps` could not run is the difference between a design
+    // limit and a five-minute fix.
+    //
+    // Its failures were passed on the `ruled-out` return alone, so every other
+    // return dropped them, the undecidable one included. Two distinct codes
+    // here because the failures merge by text: the same probe failing twice is
+    // one fact, so only a reading unique to the second pass shows it arrived.
+    let commandReads = 0;
+
+    const command = (): string | null => {
+      commandReads++;
+
+      throw Object.assign(new Error("gone"), {
+        code: commandReads === 1 ? "ENOENT" : "EACCES",
+      });
+    };
+
+    const bootTime = Date.now();
+
+    // An hour before the boot reading, which is what sends the boot shortcut
+    // looking for corroboration in the first place.
+    writeFileSync(
+      join(dataDir, "postmaster.pid"),
+      `4321\n${dataDir}\n${Math.floor((bootTime - 3_600_000) / 1000)}\n5599\n`,
+    );
+
+    const status = await getLocalDevDBServerStatus({
+      pidFile,
+      dataDir,
+      probes: {
+        isAlive: () => true,
+        command,
+        // Null rather than a reading, so nothing is decided by a clock and the
+        // live check is left undecided -- the branch that used to drop this.
+        startTime: () => null,
+        bootTime: () => bootTime,
+        uid: () => null,
+      },
+    });
+
+    expect(status.indeterminate).toBe(true);
+    expect(commandReads).toBeGreaterThan(1);
+
+    // The first pass's reading was always reported. The second's is the one
+    // that went missing.
+    expect(status.probeFailures.join(" ")).toContain("ENOENT");
+    expect(status.probeFailures.join(" ")).toContain("EACCES");
+
+    // And the field is still what the reason says, per the test above.
+    for (const failure of status.probeFailures) {
+      expect(status.reason).toContain(failure);
+    }
+  });
 });
