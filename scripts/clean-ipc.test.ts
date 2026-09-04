@@ -310,7 +310,16 @@ describe.skipIf(OS_USER === null)("cleanSharedMemory", () => {
 
   it("reports a listing it could not read rather than removing nothing quietly", () => {
     const removed: string[] = [];
-    // Restored, because leaving it set would fail the whole run.
+    // Restored, because leaving it set fails the whole run: `bun test` exits
+    // with whatever process.exitCode holds at the end, however many tests
+    // passed. That is how this arrived in CI as a red build reporting
+    // "485 pass, 0 fail".
+    //
+    // `?? 0` rather than the value as read, because `process.exitCode` starts
+    // as undefined and Bun does not treat assigning undefined as a reset: it
+    // leaves the 1 in place, so restoring the original value was a no-op and
+    // the code leaked out of the test anyway. A number is preserved as it is,
+    // so a genuinely non-zero code set elsewhere still survives.
     const previousExitCode = process.exitCode;
 
     try {
@@ -325,7 +334,7 @@ describe.skipIf(OS_USER === null)("cleanSharedMemory", () => {
       expect(removed).toEqual([]);
       expect(process.exitCode).toBe(1);
     } finally {
-      process.exitCode = previousExitCode;
+      process.exitCode = previousExitCode ?? 0;
     }
   });
 });
