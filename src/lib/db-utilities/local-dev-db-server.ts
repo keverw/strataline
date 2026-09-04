@@ -486,7 +486,7 @@ export class LocalDevDBServer {
       return;
     }
 
-    // Somebody else's code, called from an `async` close listener, which is
+    // Somebody else's code, called from an `async` exit listener, which is
     // what makes absorbing it necessary rather than tidy. A throw from a
     // synchronous listener would surface as an uncaughtException the host can
     // trap; from this one it rejects a promise nothing holds, and Node ends
@@ -2684,13 +2684,27 @@ export class LocalDevDBServer {
     // than failing start() — see runPgCommand. Recording it instead lets
     // waitForServerReady stop waiting for a server that will never appear.
     this.startupFailure = null;
+    // Ahead of the clear, and unconditional, because the paths that flush do
+    // not cover every way a child is let go. A server that died without being
+    // asked takes the reportServerExit branch, which does not flush, and
+    // finalize() then nulls pgProcess so the next start() skips the reuse
+    // block that would have — while the `end` that would have flushed for
+    // itself may never arrive, since PostgreSQL's backends inherit those pipes
+    // and can hold them open indefinitely. What is left held is a partial line
+    // and a carried severity belonging to a dead server, and the assembler
+    // would splice both onto the first thing this one writes. So flush here
+    // too: the previous child is gone by now, so anything still held is the
+    // last of what it wrote, and it is logged as its own message rather than
+    // carried across. See PostgresOutputReader.flush, which is also where the
+    // reset that stops the level carrying over lives.
+    this.flushServerOutput();
     this.serverOutput.clear();
     this.pgProcess.on("error", (err) => {
       this.startupFailure = err;
       this.log("error", `PostgreSQL process could not be started: ${err}`);
     });
 
-    // Attached synchronously, before the PID record is written. `close` fires
+    // Attached synchronously, before the PID record is written. `exit` fires
     // once and is not replayed, so a child that dies inside that await would
     // otherwise go unnoticed: startupFailure would stay empty and startup
     // would wait out its full thirty seconds rather than failing fast.
@@ -3021,6 +3035,52 @@ export class LocalDevDBServer {
         if (deliberate) {
           this.stoppingProc = null;
         }
+
+        // Drops the read ends, which every OTHER way a child is let go already
+        // does: performGracefulShutdown, cleanupFailedStart, and the reuse
+        // path in performStart. This was the one that did not, and the gap is
+        // reached by two routes — the exit nobody asked for, and a child a
+        // failed start could not kill, which cleanupFailedStart deliberately
+        // leaves holding its pipes while it is still running and which arrives
+        // here as `deliberate` whenever it finally dies.
+        //
+        // What this is worth is worth stating exactly. The hazard the other
+        // three guard against is real in principle: PostgreSQL's backends
+        // inherit these pipes, so a postmaster killed without signaling its
+        // children could leave them holding the write ends, and a read end
+        // that never sees EOF stays ref'd and keeps the event loop up. In
+        // practice a backend polls for postmaster death and exits, so EOF does
+        // arrive and Node destroys the streams itself — provoking that orphan
+        // on macOS with PostgreSQL 18 did not manage it, and a test against a
+        // real kill therefore passes whatever this code does.
+        //
+        // The guarantee is testable even where the hazard is not, because it
+        // is about this instance rather than about PostgreSQL: a child this
+        // still speaks for is not left holding pipes nobody will close. A fake
+        // child asserts that directly, and does fail without the drop. See
+        // "letting go of a child that exited unasked" in the tests.
+        //
+        // "Still speaks for" is the whole scope. A superseded child returns
+        // above this, and its pipes are not this branch's to drop: the reuse
+        // path in performStart destroys them before it replaces the child, so
+        // by the time a late exit arrives here they are already gone.
+        //
+        // Draining is only for the unrequested route. The last thing a
+        // postmaster writes is why it is going, and a destroyed pipe emits no
+        // "end", so the flush belongs here rather than with that event. The
+        // other two routes have drained or flushed already, and making a
+        // deliberate stop wait out this bound again would add it to every
+        // shutdown for output that has been read.
+        const unrequested = !startOwnsThisExit && !deliberate;
+
+        if (unrequested) {
+          await this.drainServerOutput(proc);
+          this.flushServerOutput();
+        }
+
+        proc.stdout?.destroy();
+        proc.stderr?.destroy();
+        proc.stdin?.destroy();
 
         if (startOwnsThisExit) {
           // start() owned this failure when the child died: it will run

@@ -65,6 +65,7 @@ Whether you're building a side project or orchestrating millions of rows in prod
     - [Features](#features)
     - [Usage](#usage)
     - [Logging](#logging-1)
+      - [Stopping](#stopping)
       - [Migration Logging](#migration-logging)
     - [Example in Tests](#example-in-tests)
   - [Local Dev DB Server](#local-dev-db-server)
@@ -507,9 +508,13 @@ When the signal aborts, an in-flight `run` stops at the next safe point and reso
 
 **Note**: The CLI automatically manages the PostgreSQL pool lifecycle. It will create a pool if using environment variables or use your provided pool, and will properly end the pool when the operation completes. You do not need to end the pool yourself after calling `RunStratalineCLI`.
 
-> **Heads up, it ends a pool you passed too.** When `loadFrom: "pool"`, `RunStratalineCLI` calls `pool.end()` in a `finally` block on the **pool you supplied**, not just on pools it created. The pool is dead after the call resolves, so don't plan to reuse it afterward. Create a dedicated pool for the CLI, or let it create one via `loadFrom: "env"`.
+> **Heads up, it ends a pool you passed too.** When `loadFrom: "pool"`, `RunStratalineCLI` calls `pool.end()` on the **pool you supplied**, not just on pools it created, and there is no option to turn that off. The pool is dead after the call resolves, so don't plan to reuse it afterward. Create a dedicated pool for the CLI, or let it create one via `loadFrom: "env"`. Reusing one is worth calling out because the second run fails against a closed pool, and closing it again is a second failure on top of the first.
 >
-> The one exception is a **synchronous configuration error**, e.g. passing `envPrefix` together with `loadFrom: "pool"`, which throws `Cannot provide envPrefix when loadFrom='pool'`. These checks run _before_ the CLI adopts your pool, so on such a throw the pool is **left open** (it was never touched, and you still own the reference). That's deliberate: you can fix the config and retry with the same pool. Once the CLI gets past validation, the `finally` owns it and will end it.
+> The one exception is a **synchronous configuration error**, e.g. passing `envPrefix` together with `loadFrom: "pool"`, which throws `Cannot provide envPrefix when loadFrom='pool'`. These checks run _before_ the CLI adopts your pool, so on such a throw the pool is **left open** (it was never touched, and you still own the reference). That's deliberate: you can fix the config and retry with the same pool. Once the CLI gets past validation it owns the pool and will end it.
+>
+> A close that fails does not replace the reason a run failed. Where the run has already gone wrong, the close error is logged and that first failure is what reaches you. Where the run succeeded there is nothing to displace, so a pool that will not close throws.
+
+`MigrationManager` is the other half of that rule and does the opposite: it never ends a pool you give it, only returning each client to it. The two differ because they are for different jobs. `MigrationManager` is the library primitive you wire into an application that already owns its connections, so taking the pool away from it would be wrong. `RunStratalineCLI` is the batteries-included entry point for a process whose whole purpose is to run migrations and exit, so it owns the lifecycle end to end. Reach for `MigrationManager` when your program keeps running afterward.
 
 #### package.json Scripts
 
@@ -1361,6 +1366,31 @@ function render(data: LogDataInput) {
 ```
 
 The logger is the `Logger` interface exported from `strataline/logger`, and the data it receives is `LogDataInput`. The constructor's options object is exported as `TestDatabaseOptions`.
+
+##### Stopping
+
+`stop()` throws when the server could not be stopped, the way a server's `stop()` is generally expected to. `LocalDevDBServer.stop()` behaves the same way, so learning one surface does not teach you the wrong thing about the other.
+
+```typescript
+afterAll(async () => {
+  // Throws if PostgreSQL was still running when the stop gave up
+  await testDb.stop();
+});
+```
+
+It resolves once the server is down and its temporary directory is gone. It rejects when the stop gave up on a cluster that was confirmed still running, usually one taking a long time over its shutdown checkpoint on a loaded machine. The server and its data directory are kept in that case, so nothing is deleted out from under a live cluster, and calling `stop()` again asks the cluster afresh and finishes the job once the postmaster has gone. `start()` refuses in the meantime, since a second cluster would leave the first holding its port with nothing recording it.
+
+Because this usually runs in an `afterAll`, a rejection fails the suite. That is intended: a PostgreSQL still holding a port and a data directory is a real problem with the run rather than a detail to leave in a log nobody reads. Where it genuinely is not worth failing over, catch it at the call site:
+
+```typescript
+afterAll(async () => {
+  await testDb.stop().catch((error) => {
+    console.warn(`Test database did not stop: ${error}`);
+  });
+});
+```
+
+Concurrent `stop()` calls join the teardown already running rather than each starting their own, and a `start()` that overlaps one is refused, so a signal handler racing a test hook is safe in both directions.
 
 ##### Migration Logging
 

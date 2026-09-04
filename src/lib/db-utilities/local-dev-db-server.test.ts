@@ -17,6 +17,7 @@ import {
   postgresOutputLevel,
   sameDataDir,
 } from "./local-dev-db-server";
+import { EventEmitter } from "events";
 import { Pool } from "pg";
 import * as tmp from "tmp";
 import { join } from "path";
@@ -150,31 +151,81 @@ function shmSegmentForDataDir(
 }
 
 /**
- * A stand-in for a spawned child whose `close` this test fires by hand.
+ * A stand-in for a spawned child whose lifecycle event this test fires by
+ * hand.
  *
- * The event that matters here is one Node emits only once the stdio pipes are
- * closed as well as the process, which is what lets it lag arbitrarily far
- * behind the exit. Driving the listener directly is how a test reaches that
- * lag without a wedged postmaster and an orphaned backend holding the pipes.
+ * What these tests need is an exit that lands LATE: after the stop it belonged
+ * to gave up waiting, and after the restart that followed took over the
+ * instance. Driving the listener directly is how a test reaches that lag
+ * without a wedged postmaster and an orphaned backend holding the pipes.
+ *
+ * Registered under whichever event the handler asks for rather than a name
+ * this file picks. That is not defensive tidiness: the lifecycle used to hang
+ * off `close` and now hangs off `exit`, and a fake that captured only `close`
+ * silently stored nothing when it moved. `exit()` below then called an
+ * undefined listener and every test using it passed without running any of the
+ * code it names. Matching whatever is registered cannot go stale that way, and
+ * the throw makes a fake that captured nothing say so instead of quietly
+ * asserting about a handler that never ran.
  */
 function fakeChild(pid: number): {
   proc: unknown;
-  close: (code: number | null) => void;
+  exit: (code: number | null) => void;
+  stdout: { destroyed: boolean };
+  stderr: { destroyed: boolean };
+  stdin: { destroyed: boolean };
 } {
-  let onClose: ((code: number | null) => void) | undefined;
+  let listener: ((code: number | null) => void) | undefined;
+
+  const pipe = () => {
+    const state = { destroyed: false };
+
+    return {
+      state,
+      handle: {
+        get destroyed() {
+          return state.destroyed;
+        },
+        destroy: () => {
+          state.destroyed = true;
+        },
+      },
+    };
+  };
+
+  const stdout = pipe();
+  const stderr = pipe();
+  const stdin = pipe();
 
   return {
     proc: {
       pid,
       exitCode: null,
       signalCode: null,
-      on(event: string, listener: (code: number | null) => void) {
-        if (event === "close") {
-          onClose = listener;
+      stdout: stdout.handle,
+      stderr: stderr.handle,
+      stdin: stdin.handle,
+      on(event: string, fired: (code: number | null) => void) {
+        if (event === "exit" || event === "close") {
+          listener = fired;
         }
       },
+      // Whatever waits on this gets nothing, which is the case a stand-in is
+      // standing in for: the pipes are held open and the event never comes.
+      once() {},
     },
-    close: (code) => onClose?.(code),
+    exit: (code) => {
+      if (!listener) {
+        throw new Error(
+          "fakeChild captured no lifecycle listener, so nothing would have run",
+        );
+      }
+
+      listener(code);
+    },
+    stdout: stdout.state,
+    stderr: stderr.state,
+    stdin: stdin.state,
   };
 }
 
@@ -195,12 +246,12 @@ interface ChildLifecycleInternals {
  * but the event has not arrived and the next start() has already attached its
  * own child.
  *
- * @returns The superseded child, whose `close` is still to come.
+ * @returns The superseded child, whose exit is still to come.
  */
 async function supersedeAChild(
   internals: ChildLifecycleInternals,
   fresh: unknown,
-): Promise<{ close: (code: number | null) => void }> {
+): Promise<{ exit: (code: number | null) => void }> {
   // Nothing on disk to release. What these tests are about is which child the
   // close handler then speaks for.
   internals.releasePidRecord = async () => {};
@@ -4041,7 +4092,7 @@ describe("LocalDevDBServer", () => {
 
     internals.startingUp = true;
 
-    superseded.close(null);
+    superseded.exit(null);
 
     await new Promise((resolve) => setTimeout(resolve, 50));
 
@@ -4064,7 +4115,7 @@ describe("LocalDevDBServer", () => {
     const fresh = fakeChild(999002);
     const superseded = await supersedeAChild(internals, fresh.proc);
 
-    superseded.close(null);
+    superseded.exit(null);
 
     await new Promise((resolve) => setTimeout(resolve, 50));
 
@@ -4582,4 +4633,116 @@ describe("getCurrentUser, through a started server", () => {
       }
     }
   }, 60000);
+});
+
+describe("letting go of a child that exited unasked", () => {
+  /**
+   * A stdio pipe that records having been dropped.
+   *
+   * The real hazard is a PostgreSQL backend that inherited the write end and
+   * outlived the postmaster, so the read end never sees EOF and Node never
+   * destroys it by itself. That could not be provoked: a backend polls for
+   * postmaster death and exits, so a real kill always closes the pipes and a
+   * test against one passes whether or not this code drops them.
+   *
+   * What IS testable is the guarantee itself, which is about this instance
+   * rather than about PostgreSQL: a child that has exited must not be left
+   * holding pipes nobody will close. A fake child answers that directly, and
+   * without it the assertions below pass on any implementation at all.
+   */
+  const spyPipe = () => {
+    let destroyed = false;
+
+    return {
+      get destroyed() {
+        return destroyed;
+      },
+      destroy: () => {
+        destroyed = true;
+      },
+    };
+  };
+
+  /** Enough of a child process for the lifecycle handler to act on. */
+  const fakeChild = () => {
+    const proc = new EventEmitter() as EventEmitter & {
+      pid: number;
+      exitCode: number | null;
+      signalCode: string | null;
+      stdout: ReturnType<typeof spyPipe>;
+      stderr: ReturnType<typeof spyPipe>;
+      stdin: ReturnType<typeof spyPipe>;
+    };
+
+    proc.pid = 424242;
+    proc.exitCode = null;
+    proc.signalCode = null;
+    proc.stdout = spyPipe();
+    proc.stderr = spyPipe();
+    proc.stdin = spyPipe();
+
+    return proc;
+  };
+
+  interface Internals {
+    pgProcess: unknown;
+    attachExitHandler(proc: unknown): void;
+  }
+
+  it("drops the read ends, and still reports the exit", async () => {
+    let reported: number | undefined;
+
+    const scratch = tmp.dirSync({ unsafeCleanup: true, prefix: "pg-letgo-" });
+    const server = new LocalDevDBServer({
+      port: 1,
+      user: "u",
+      password: "p",
+      database: "d",
+      dataDir: join(scratch.name, "pgdata"),
+      pidFile: join(scratch.name, "dev-db.pid"),
+      onExit: (code) => {
+        reported = code;
+      },
+    });
+
+    try {
+      const internals = server as unknown as Internals;
+      const proc = fakeChild();
+
+      // Attached the way a real spawn attaches it, then told the instance this
+      // is its child, so the handler treats the exit below as its own.
+      internals.pgProcess = proc;
+      internals.attachExitHandler(proc);
+
+      // Nobody asked for this one: no stop() in flight and no start() owning
+      // it, which is the path that used to report the death and walk away
+      // leaving the pipes open.
+      proc.exitCode = 3;
+      proc.emit("exit", 3);
+
+      // The handler drains before it drops them, so this waits rather than
+      // asserting into the middle of that bound.
+      const deadline = Date.now() + 5000;
+
+      while (Date.now() < deadline && reported === undefined) {
+        await Bun.sleep(25);
+      }
+
+      // A ref'd pipe with nothing left to close it keeps the event loop up, so
+      // a host that wanted to wind down after its database died would never
+      // exit. Every deliberate path already dropped these; this one did not.
+      expect(proc.stdout.destroyed).toBe(true);
+      expect(proc.stderr.destroyed).toBe(true);
+      expect(proc.stdin.destroyed).toBe(true);
+
+      // And the drop must not have cost the rest of the release: the child
+      // reference goes, and the exit is reported, which is the only channel an
+      // unrequested one has.
+      expect(internals.pgProcess).toBeNull();
+      expect(reported).toBe(3);
+    } finally {
+      server.dispose();
+      scratch.removeCallback();
+    }
+  }, 30000);
 });

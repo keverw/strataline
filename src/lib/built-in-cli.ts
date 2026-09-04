@@ -5,7 +5,7 @@ import {
 } from "./migration-system";
 import { Pool } from "pg";
 import { makeSafeLogger } from "./callback-safety";
-import { createPrefixedLogger, type Logger } from "./logger";
+import { createPrefixedLogger, getErrorMessage, type Logger } from "./logger";
 
 async function testConnection(
   pool: Pool,
@@ -503,9 +503,10 @@ export async function RunStratalineCLI(config: {
       connectionTimeoutMillis: connectionTimeout,
     });
   } else if (config.loadFrom === "pool") {
-    // Validate *before* adopting the pool. Once poolInstance is set, the
-    // try/finally below owns it and calls pool.end() — including on the
-    // caller-supplied pool. A validation throw here happens before that block, so
+    // Validate *before* adopting the pool. Once poolInstance is set, the run
+    // below owns it and closes it on the way out — including the
+    // caller-supplied pool, unconditionally, since there is no option to opt
+    // out of that. A validation throw here happens before any of it, so
     // assigning poolInstance first would leave a caller's pool open on the
     // envPrefix misconfiguration. Check everything up front, then adopt.
 
@@ -535,6 +536,36 @@ export async function RunStratalineCLI(config: {
     const operation = args[2] || "help";
     const isDistributed = args.includes("--distributed");
 
+    /**
+     * Closes the adopted pool, reporting rather than raising a failure to.
+     *
+     * For the path where the run has already failed. That failure is the one
+     * worth raising, and a close error would displace it: the pool is adopted,
+     * including a caller-supplied one (see the ownership note above), so
+     * calling this twice with the same pool has pg reject the second close
+     * with "Called end on pool more than once" -- and the second run has by
+     * then already failed at testConnection against a closed pool, which is
+     * the diagnosis that names the actual mistake.
+     */
+    const closePoolReportingFailure = async (): Promise<void> => {
+      try {
+        await poolInstance.end();
+      } catch (closeError: unknown) {
+        logger.error({
+          message: `Error: could not close the PostgreSQL pool: ${getErrorMessage(
+            closeError,
+          )}. Reporting the earlier failure instead.`,
+        });
+      }
+    };
+
+    // Assigned in every branch of the switch below, then returned after the
+    // pool has been closed rather than from inside the try. The close used to
+    // sit in a `finally`, where an `await` that rejects REPLACES whatever was
+    // propagating out of the try -- which is how a run that failed for its own
+    // reasons came back reporting only that a pool could not be closed.
+    let cliResult: StratalineCLIResult;
+
     try {
       // Test database connection before proceeding
       const connected = await testConnection(
@@ -552,8 +583,6 @@ export async function RunStratalineCLI(config: {
         });
         throw new Error("Database connection failure");
       }
-
-      let cliResult: StratalineCLIResult;
 
       switch (operation) {
         case "run": {
@@ -594,16 +623,22 @@ Options:
           cliResult = { command: "help", exitCode: 0 };
           break;
       }
-
-      return cliResult;
     } catch (error: unknown) {
-      const errorMessage =
-        error instanceof Error ? error.message : String(error);
-      logger.error({ message: `Error: ${errorMessage}` });
+      logger.error({ message: `Error: ${getErrorMessage(error)}` });
+
+      // Closed here rather than in a `finally`, so a failure to close cannot
+      // take the place of the failure being reported.
+      await closePoolReportingFailure();
+
       throw error; // Re-throw to allow caller to handle it
-    } finally {
-      await poolInstance.end();
     }
+
+    // The run succeeded, so there is nothing for a close failure to displace,
+    // and a pool that will not close is a leaked resource rather than noise.
+    // It propagates.
+    await poolInstance.end();
+
+    return cliResult;
   } else {
     throw new Error("Database pool was not initialized properly");
   }

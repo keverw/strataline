@@ -175,6 +175,20 @@ export interface TestDatabaseOptions {
  */
 export class TestDatabaseInstance {
   private db?: RetargetablePostgres;
+  /**
+   * The server a stop gave up on while its postmaster was still running.
+   *
+   * The counterpart of `LocalDevDBServer`'s `unstoppableChild`, and here for
+   * the same reason: a stop that could not finish must not read as one that
+   * did. Held as the reference rather than a flag so a later {@link stop} has
+   * something to try again with, and so {@link start} can refuse rather than
+   * build a second cluster over the top of a live one.
+   *
+   * Only set where the cluster was CONFIRMED still there — see
+   * {@link stopServerWithinBound}. A stop that merely ran out of patience on a
+   * postmaster that had already gone releases normally.
+   */
+  private unstoppedServer: RetargetablePostgres | null = null;
   private pool?: Pool;
   private migrationsApplied: boolean = false;
   private tempDir?: string;
@@ -695,6 +709,37 @@ export class TestDatabaseInstance {
    * Start the embedded PostgreSQL server and apply migration
    */
   public async start(): Promise<void> {
+    // Ahead of everything, including the already-started guard below, which
+    // cannot see this: a stop that gave up leaves no pool. Building here would
+    // overwrite `db` and `tempDir` with a fresh cluster's and leave the live
+    // one holding its port and its files with nothing recording it, which is
+    // the outcome retaining them exists to prevent. LocalDevDBServer refuses
+    // its own `unstoppable` state for the same reason.
+    if (this.unstoppedServer) {
+      throw new Error(
+        "A previous test database could not be stopped and its PostgreSQL may still be running. " +
+          "Call stop() again once it has shut down, or construct a new TestDatabaseInstance.",
+      );
+    }
+
+    // Ahead of the already-started guard below, which cannot see a teardown in
+    // progress: cleanup() clears `pool` early and then spends up to ten
+    // seconds waiting on the server. A start() entering during that wait built
+    // a whole new cluster, and the teardown resumed to drop `db` and delete
+    // `tempDir` — by then the NEW cluster's, removed out from under a running
+    // postmaster with its only handle already thrown away. The narrower half
+    // is worse still: entering a moment earlier, while `pool` is briefly set,
+    // returned "already started" for an instance being torn down.
+    //
+    // Refused rather than joined, as LocalDevDBServer refuses a start against
+    // a shutdown. The two describe different end states and waiting would race
+    // the teardown for the same directory. Await stop() first.
+    if (this.cleanupInFlight) {
+      throw new Error(
+        "Cannot start the test database: it is currently being stopped. Await stop() first.",
+      );
+    }
+
     if (this.pool) {
       return;
     }
@@ -959,7 +1004,44 @@ export class TestDatabaseInstance {
   /**
    * Clean up resources (internal method)
    */
+  /**
+   * The teardown in progress, so concurrent callers share one rather than
+   * running two over the same state.
+   *
+   * The same memo `LocalDevDBServer` keeps as `shutdownInFlight`, and joined
+   * rather than refused for the same reason: a teardown that threw at an
+   * overlap would leave a server running, which is what the call exists to
+   * prevent. Held at the cleanup rather than at {@link stop}, so a failed
+   * {@link start} tearing its own attempt down joins it too.
+   *
+   * Two of these really did collide, and none of it was theoretical. Both read
+   * `pool` before either cleared it, so the second `pool.end()` rejected with
+   * pg's own "Called end on pool more than once" and was logged as an error
+   * that had not happened. Both then called `stopServerWithinBound` on one
+   * server, which sends a second SIGINT and races two ten-second bounds. And
+   * both decided whether the server had stopped, so one could record it as
+   * unstopped while the other released it, leaving the instance in whichever
+   * state finished last.
+   */
+  private cleanupInFlight: Promise<void> | null = null;
+
   private async cleanup(): Promise<void> {
+    if (this.cleanupInFlight) {
+      return this.cleanupInFlight;
+    }
+
+    // Cleared before the promise callers hold settles, so the next teardown
+    // starts a fresh one. `performCleanup` never throws on its own account,
+    // but `finally` rather than `then` regardless: a memo left behind by a
+    // rejection would have every later stop() join a teardown that is over.
+    this.cleanupInFlight = this.performCleanup().finally(() => {
+      this.cleanupInFlight = null;
+    });
+
+    return this.cleanupInFlight;
+  }
+
+  private async performCleanup(): Promise<void> {
     // Set running state to false immediately
     this.isRunning = false;
 
@@ -983,9 +1065,10 @@ export class TestDatabaseInstance {
     let serverStopped = true;
 
     if (this.db) {
+      const db = this.db;
+
       try {
-        serverStopped =
-          (await this.stopServerWithinBound(this.db)) === "stopped";
+        serverStopped = (await this.stopServerWithinBound(db)) === "stopped";
       } catch (error) {
         this.log(
           "error",
@@ -1000,13 +1083,27 @@ export class TestDatabaseInstance {
         // the same question a timeout asks rather than assuming.
         serverStopped = !(await this.serverStillRunning());
       }
-      this.db = undefined;
-      this.migrationsApplied = false;
 
-      // Nothing more will arrive through `onLog` now that the server this
-      // built is let go, so anything the assembler is still holding is the
-      // last of what it wrote and has nowhere later to be logged from.
-      this.flushServerOutput();
+      // Only a server confirmed gone is let go. Dropping the reference for one
+      // that is still running would leave nothing to try again with: `stop()`
+      // would find no server and report success, `start()` would build a
+      // second cluster over the top of the live one, and the only account of
+      // it would be a log line. Held instead, the same way LocalDevDBServer
+      // holds a child that outlived its escalation.
+      if (!serverStopped) {
+        this.unstoppedServer = db;
+      } else {
+        this.db = undefined;
+        this.unstoppedServer = null;
+        this.migrationsApplied = false;
+
+        // Nothing more will arrive through `onLog` now that the server this
+        // built is let go, so anything the assembler is still holding is the
+        // last of what it wrote and has nowhere later to be logged from. Not
+        // done on the branch above, where the server is still writing and a
+        // flush would cut a line it has not finished.
+        this.flushServerOutput();
+      }
     }
 
     if (this.tempDir && !serverStopped) {
@@ -1014,10 +1111,15 @@ export class TestDatabaseInstance {
         "warn",
         `Leaving the temporary directory in place: ${this.tempDir}. ` +
           "PostgreSQL was still running there when the stop gave up, so removing it now would " +
-          "delete a live cluster's files. Delete it once that server is gone.",
+          "delete a live cluster's files. Call stop() again once it has finished shutting down, " +
+          "or delete the directory by hand once that server is gone.",
       );
 
-      this.tempDir = undefined;
+      // The path is KEPT rather than cleared, which is what lets a later
+      // stop() ask whether that cluster is still there and finish the job.
+      // Returning is how the removal below is skipped; there is nothing after
+      // it in this method.
+      return;
     }
 
     // Clean up the temporary directory with a delay
@@ -1055,20 +1157,57 @@ export class TestDatabaseInstance {
   }
 
   /**
-   * Stop the embedded database server and clean up resources
-   * @returns A promise that resolves when the database is stopped
+   * Stops the embedded server and cleans up after it.
+   *
+   * Rejects when the server could not be stopped, the way a server's `stop()`
+   * is expected to: fastify's `close()`, Node's own `net.Server.close()`, and
+   * `LocalDevDBServer.stop()` all raise rather than hand back an outcome to
+   * inspect, and a teardown that reported failure only through a return value
+   * is a teardown most callers will never check. Both database surfaces here
+   * therefore fail the same way, so learning one does not teach the wrong
+   * thing about the other.
+   *
+   * The cost is deliberate and worth stating: this usually runs in an
+   * `afterAll`, so a rejection fails the suite. That is the point — a
+   * PostgreSQL still holding a port and a data directory is a real problem
+   * with the run, not a detail to leave in a log nobody reads. Where it is
+   * genuinely not worth failing over, `catch` it at the call site, which is a
+   * decision the caller can make and this method cannot.
+   *
+   * Safe to call again. A stop that could not finish keeps the server and its
+   * data directory, so a later call asks the cluster afresh and completes once
+   * the postmaster has gone.
+   *
+   * @throws When the stop gave up on a cluster confirmed still running, or
+   * when the teardown fails for any other reason.
    */
   public async stop(): Promise<void> {
     this.log("info", "Stopping test database...");
+
     try {
       await this.cleanup();
-      this.log("info", "Test database stopped");
     } catch (error) {
+      // Nothing here is expected — cleanup() handles its own filesystem and
+      // shutdown errors — so this is the unforeseen one. Logged for the
+      // context the throw does not carry, then raised rather than swallowed.
       this.log(
         "error",
-        `Error during database stop: ${(error as Error).message}`,
+        `Error during database stop: ${getErrorMessage(error)}`,
       );
-      // Don't rethrow to keep stop() fail-safe
+
+      throw error;
     }
+
+    if (this.unstoppedServer) {
+      throw new Error(
+        "Test database was not stopped: PostgreSQL was still running when the stop gave up, " +
+          `so the server and its data directory have been kept${
+            this.tempDir ? ` (${this.tempDir})` : ""
+          }. ` +
+          "Call stop() again once it has finished shutting down.",
+      );
+    }
+
+    this.log("info", "Test database stopped");
   }
 }

@@ -3,7 +3,7 @@ import { createConsoleLogger } from "../logger";
 import { TestDatabaseInstance, isBindFailure } from "./test-db-instance";
 import { Migration } from "../migration-system";
 import * as tmp from "tmp";
-import { existsSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "fs";
 import { join } from "path";
 import type EmbeddedPostgres from "embedded-postgres";
 
@@ -435,6 +435,8 @@ describe("stopping past the bound", () => {
 
   interface Internals {
     db?: EmbeddedPostgres;
+    unstoppedServer: EmbeddedPostgres | null;
+    pool?: { end(): Promise<unknown> };
     tempDir?: string;
     serverStillRunning(): Promise<boolean>;
   }
@@ -528,13 +530,152 @@ describe("stopping past the bound", () => {
     internals.tempDir = dataDir;
     internals.db = stallingDb;
 
-    await instance.stop();
+    await expect(instance.stop()).rejects.toThrow(/still running/);
 
     // The regression this encodes against: the timeout alone was read as "it
     // had already exited", and these files went out from under a server that
     // was still writing to them.
     expect(existsSync(dataDir)).toBe(true);
   }, 30_000);
+
+  it("joins a teardown already running rather than starting a second", async () => {
+    const instance = new TestDatabaseInstance();
+    const internals = instance as unknown as Internals;
+    const settleSoon = () => new Promise((r) => setTimeout(r, 50));
+
+    let stops = 0;
+    let poolEnds = 0;
+
+    internals.tempDir = cluster(ABSENT_PID);
+    internals.pool = {
+      end: async () => {
+        poolEnds++;
+
+        return settleSoon();
+      },
+    };
+    internals.db = {
+      stop: async () => {
+        stops++;
+
+        return settleSoon();
+      },
+    } as unknown as EmbeddedPostgres;
+
+    await Promise.all([instance.stop(), instance.stop(), instance.stop()]);
+
+    // Each of the three used to read `pool` and `db` before any of them had
+    // cleared either, so pg rejected the second `end()` with "Called end on
+    // pool more than once" — logged as an error that had not happened — and
+    // one server was sent three shutdowns racing three separate bounds.
+    expect(poolEnds).toBe(1);
+    expect(stops).toBe(1);
+
+    // A later teardown has to be a FRESH run rather than the settled memo
+    // handed back again. Asserted by giving it something new to do: with the
+    // memo cleared these are torn down, and with it left in place the call
+    // returns the old promise and touches neither.
+    internals.pool = {
+      end: async () => {
+        poolEnds++;
+
+        return settleSoon();
+      },
+    };
+    internals.db = {
+      stop: async () => {
+        stops++;
+
+        return settleSoon();
+      },
+    } as unknown as EmbeddedPostgres;
+
+    await instance.stop();
+
+    expect(poolEnds).toBe(2);
+    expect(stops).toBe(2);
+  }, 30_000);
+
+  it("refuses a start while a teardown is still running", async () => {
+    const instance = new TestDatabaseInstance();
+    const internals = instance as unknown as Internals;
+
+    internals.tempDir = cluster(ABSENT_PID);
+    internals.db = {
+      stop: () => new Promise<void>((settle) => setTimeout(settle, 300)),
+    } as unknown as EmbeddedPostgres;
+
+    // Deliberately not awaited: the point is the window while it runs.
+    const teardown = instance.stop();
+
+    // cleanup() clears `pool` early and then waits on the server, so neither
+    // the already-started guard nor the unstopped-server one can see this. A
+    // start admitted here builds a cluster the resuming teardown then drops
+    // and deletes, out from under a postmaster that is running.
+    await expect(instance.start()).rejects.toThrow(/currently being stopped/);
+
+    await teardown;
+  }, 30_000);
+
+  it("keeps the server and its directory so a later stop can finish the job", async () => {
+    const instance = new TestDatabaseInstance();
+    const internals = instance as unknown as Internals;
+    const dataDir = cluster(process.pid);
+
+    internals.tempDir = dataDir;
+    internals.db = stallingDb;
+
+    // Raised rather than logged, so a caller that supplied no logger is told
+    // too, and so a teardown cannot quietly pass over a live PostgreSQL.
+    await expect(instance.stop()).rejects.toThrow(/still running/);
+
+    // Dropping these was the regression: `stop()` reported success, and the
+    // only handle to the live server and the only record of its directory went
+    // with it, so nothing could try again and the postmaster was left holding
+    // its port with a log line as its sole account.
+    expect(internals.db).toBe(stallingDb);
+    expect(internals.unstoppedServer).toBe(stallingDb);
+    expect(internals.tempDir).toBe(dataDir);
+  }, 30_000);
+
+  it("refuses a start while a server it could not stop may still be running", async () => {
+    const instance = new TestDatabaseInstance();
+    const internals = instance as unknown as Internals;
+
+    internals.tempDir = cluster(process.pid);
+    internals.db = stallingDb;
+
+    await expect(instance.stop()).rejects.toThrow(/still running/);
+
+    // A stop that gave up leaves no pool, so the already-started guard cannot
+    // see this. Starting here would build a second cluster over the top of the
+    // live one and overwrite the references that are the only thing recording
+    // it.
+    await expect(instance.start()).rejects.toThrow(/could not be stopped/);
+  }, 30_000);
+
+  it("finishes the stop on a later call, once the postmaster has gone", async () => {
+    const instance = new TestDatabaseInstance();
+    const internals = instance as unknown as Internals;
+    const dataDir = cluster(process.pid);
+
+    internals.tempDir = dataDir;
+    internals.db = stallingDb;
+
+    await expect(instance.stop()).rejects.toThrow(/still running/);
+    expect(existsSync(dataDir)).toBe(true);
+
+    // The server has since shut down cleanly, which is what removing its own
+    // postmaster.pid means. The retained references are what let this second
+    // call ask again and act on the new answer.
+    unlinkSync(join(dataDir, "postmaster.pid"));
+
+    await instance.stop();
+
+    expect(existsSync(dataDir)).toBe(false);
+    expect(internals.unstoppedServer).toBeNull();
+    expect(internals.db).toBeUndefined();
+  }, 60_000);
 
   it("still removes the data directory when the stop gives up on a postmaster that is gone", async () => {
     const instance = new TestDatabaseInstance();

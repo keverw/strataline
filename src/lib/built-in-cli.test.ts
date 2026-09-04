@@ -809,6 +809,94 @@ describe("RunStratalineCLI", () => {
       ).rejects.toThrow("Must provide pool when loadFrom='pool'");
     });
 
+    /**
+     * A pool whose close fails, which is what a reused one does.
+     *
+     * `RunStratalineCLI` adopts the pool it is given and closes it on the way
+     * out, so handing it the same pool twice has pg reject the second close
+     * with "Called end on pool more than once". Stubbed rather than provoked
+     * with two real runs, because the point is what happens to the FIRST
+     * error when the close fails, and a stub says which error that was without
+     * depending on pg's wording.
+     */
+    const poolThatWillNotClose = (
+      onQuery: () => Promise<unknown>,
+    ): { pool: Pool; closeAttempts: () => number } => {
+      let attempts = 0;
+
+      return {
+        pool: {
+          on: () => {},
+          connect: async () => ({
+            query: onQuery,
+            release: () => {},
+          }),
+          query: onQuery,
+          end: async () => {
+            attempts++;
+
+            throw new Error("Called end on pool more than once");
+          },
+        } as unknown as Pool,
+        closeAttempts: () => attempts,
+      };
+    };
+
+    it("reports the run's own failure, not a pool that would not close", async () => {
+      const { pool, closeAttempts } = poolThatWillNotClose(() => {
+        throw new Error("the real diagnosis");
+      });
+
+      // The close still runs, and still says so in the log. What it must not
+      // do is take the place of the error being reported: a `finally` that
+      // awaited it replaced the reason the run failed with a message about
+      // closing, which names neither the cause nor anything to act on.
+      await expect(
+        RunStratalineCLI({
+          migrations: [],
+          loadFrom: "pool",
+          pool,
+          logger: mockLogger,
+          argv: ["node", "script.js", "run"],
+        }),
+      ).rejects.toThrow("Database connection failure");
+
+      expect(closeAttempts()).toBe(1);
+
+      expect(
+        logEntries.some(
+          (entry) =>
+            entry.level === "error" &&
+            entry.message.includes("could not close the PostgreSQL pool"),
+        ),
+      ).toBe(true);
+    });
+
+    it("still raises a close failure when the run itself succeeded", async () => {
+      const { pool, closeAttempts } = poolThatWillNotClose(async () => ({
+        rows: [{ ok: 1 }],
+      }));
+
+      // Nothing to displace here, and a pool that will not close is a leaked
+      // resource rather than noise, so this one is the news.
+      //
+      // A guard rather than a regression test, and worth saying which: the
+      // `finally` this replaced also let a close failure out on the success
+      // path, so this passes against both. It is here to stop the fix above
+      // being over-applied into swallowing every close failure.
+      await expect(
+        RunStratalineCLI({
+          migrations: [],
+          loadFrom: "pool",
+          pool,
+          logger: mockLogger,
+          argv: ["node", "script.js", "help"],
+        }),
+      ).rejects.toThrow("Called end on pool more than once");
+
+      expect(closeAttempts()).toBe(1);
+    });
+
     it("refuses an envPrefix alongside a pool, without ending that pool", async () => {
       const pool = testDb.getPool();
 
@@ -817,8 +905,8 @@ describe("RunStratalineCLI", () => {
       }
 
       // The refusal has to come before the pool is adopted. Once it is, the
-      // try/finally below owns it and calls end() on the way out -- on the
-      // CALLER's pool, which they are still using.
+      // run owns it and closes it on the way out -- the CALLER's pool, which
+      // they are still using.
       await expect(
         RunStratalineCLI({
           migrations: [],
