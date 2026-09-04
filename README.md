@@ -1287,7 +1287,7 @@ const testDbNoMigrations = new TestDatabaseInstance();
 // Or with all custom options
 const testDb = new TestDatabaseInstance({
   port: 5432, // Optional: specific port (default: auto-assigned)
-  logger: customLogger, // Optional: custom logger function
+  logger: customLogger, // Optional: custom structured logger
   user: "custom_user", // Optional: database username (default: 'test_user')
   password: "custom_pwd", // Optional: database password (default: 'test_password')
   databaseName: "custom", // Optional: database name (default: 'test_database')
@@ -1325,7 +1325,11 @@ await testDb.stop();
 You can use the built-in console logger or implement your own:
 
 ```typescript
-import { createConsoleLogger } from "strataline/logger";
+import {
+  createConsoleLogger,
+  type Logger,
+  type LogDataInput,
+} from "strataline/logger";
 
 // Use the built-in console logger, naming any source you want quieted.
 // Everything is shown by default. `{ pg: false }` is the usual choice for a
@@ -1599,7 +1603,7 @@ const server = new LocalDevDBServer({
   dataDir: "./pgdata", // Directory to store PostgreSQL data
   pidFile: "./.pg_pid", // File to store the PostgreSQL process ID
   // Optional
-  logger: customLogger, // Optional: custom logger function
+  logger: customLogger, // Optional: custom structured logger
   onExit: (exitCode) => process.exit(exitCode || 1), // Optional: server-exit notification
   logConnections: false, // Optional: enable PostgreSQL connection logging (default: false)
 });
@@ -1618,7 +1622,11 @@ const server = new LocalDevDBServer({
 You can customize logging behavior using the built-in console logger:
 
 ```typescript
-import { createConsoleLogger } from "strataline/logger";
+import {
+  createConsoleLogger,
+  type Logger,
+  type LogDataInput,
+} from "strataline/logger";
 
 // Create a logger, naming any source you want quieted. Everything is shown
 // by default. Quieting affects routine `info` output only: Strataline reads

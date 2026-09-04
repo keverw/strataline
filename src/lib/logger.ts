@@ -16,11 +16,10 @@ export type LogLevel = "info" | "warn" | "error";
  * built out of string prefixes, so the three tag sets shared no type and
  * adding a level meant editing each of them.
  *
- * Separating them makes a severity available to every origin. It does not by
- * itself supply one: LocalDevDBServer still logs PostgreSQL's output at `info`
- * whatever that output says, because the severity is inside the text
- * PostgreSQL wrote and nothing here reads it. What changed is that a source is
- * no longer the reason it cannot.
+ * Separating them makes a severity available to every origin. PostgreSQL's
+ * output readers recover the severity the server writes into each message, so
+ * its warnings and errors reach the corresponding logger methods instead of
+ * every line arriving at `info`.
  *
  * Severity is the method you call. This is the other axis, and it is a field.
  *

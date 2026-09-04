@@ -430,9 +430,9 @@ export class TestDatabaseInstance {
    * Puts a whole message through the logger at the level it asks for.
    *
    * PostgreSQL says how bad the line is, in the line. Reading it is what keeps
-   * `pgVerbose: false` a filter on routine output rather than one that also
-   * hides the FATAL saying why the server would not start. Which message the
-   * level belongs to, when a chunk broke one in half, is
+   * the `{ pg: false }` source filter focused on routine output rather than
+   * also hiding the FATAL saying why the server would not start. Which message
+   * the level belongs to, when a chunk broke one in half, is
    * PostgresOutputReader's.
    */
   private logServerOutput(reads: PostgresOutputRead[]): void {
