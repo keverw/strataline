@@ -40,6 +40,19 @@ import { readOsUsername } from "../src/lib/os-user";
 /** PostgreSQL allocates its semaphores in sets of exactly this size. */
 const POSTGRES_SEMAPHORES_PER_SET = 17;
 
+/**
+ * True when a token read out of `ipcs` is an id `ipcrm` can be pointed at.
+ *
+ * Both tables are parsed by column index, so the id is only an id while the
+ * layout is the one assumed. A localized build, a format change, or a line
+ * whose first token happens to be `m` or `s` all put something else at that
+ * position, and unlike the numeric fields beside it nothing else here would
+ * notice. Digits only, which is what an id is.
+ */
+function isIpcId(value: string | undefined): value is string {
+  return value !== undefined && /^\d+$/.test(value);
+}
+
 function isAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -137,8 +150,12 @@ const systemSharedMemoryProbes: SharedMemoryProbes = {
   // macOS columns: T ID KEY MODE OWNER GROUP CPID LPID
   listSegments: () => execSync("ipcs -mp", { encoding: "utf8" }),
   creatorIsAlive: isAlive,
+  // execFileSync rather than a command string, like the `ps` read above. The
+  // id is a token taken out of `ipcs` by column index, so a layout this does
+  // not expect makes it arbitrary text — and this is the destructive call.
+  // An argument array keeps it an argument whatever it holds.
   removeSegment: (id) => {
-    execSync(`ipcrm -m ${id}`);
+    execFileSync("ipcrm", ["-m", id], { stdio: "ignore" });
   },
 };
 
@@ -181,7 +198,11 @@ export function cleanSharedMemory(
     const owner = parts[4];
     const cpid = parseInt(parts[6], 10);
 
-    if (owner !== user || Number.isNaN(cpid)) {
+    // The id is validated like the number beside it, and for a sharper
+    // reason: it is what `ipcrm` is pointed at. A column layout this does not
+    // expect makes every field here something other than what it is named,
+    // and the numeric read beside it would notice while the id would not.
+    if (owner !== user || Number.isNaN(cpid) || !isIpcId(id)) {
       continue;
     }
 
@@ -231,8 +252,10 @@ const systemSemaphoreProbes: SemaphoreProbes = {
   // macOS columns: T ID KEY MODE OWNER GROUP CREATOR CGROUP NSEMS OTIME CTIME
   listSemaphores: () => execSync("ipcs -sa", { encoding: "utf8" }),
   countLivePostgres: livePostgresCount,
+  // An argument array rather than a command string, for the reason
+  // removeSegment above gives.
   removeSet: (id) => {
-    execSync(`ipcrm -s ${id}`);
+    execFileSync("ipcrm", ["-s", id], { stdio: "ignore" });
   },
 };
 
@@ -301,7 +324,7 @@ export function cleanSemaphores(
     const owner = parts[4];
     const nsems = parseInt(parts[8], 10);
 
-    if (owner !== user) {
+    if (owner !== user || !isIpcId(id)) {
       continue;
     }
 

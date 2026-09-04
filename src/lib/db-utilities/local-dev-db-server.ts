@@ -184,7 +184,11 @@ export type DevDBLifecycleState =
   | "starting"
   | "running"
   | "stopping"
-  /** A failed `start()` left a child that outlived even SIGKILL. */
+  /**
+   * A failed `start()` left a child that outlived even SIGKILL, and this
+   * instance is still holding it. Not permanent: once that child does die and
+   * its cleanup runs, the instance reads `stopped` again and can be started.
+   */
   | "unstoppable";
 
 /**
@@ -2308,8 +2312,11 @@ export class LocalDevDBServer {
    * - `starting` — `start()` and `stop()` both throw. Await the start.
    * - `running` — `stop()` stops it, `start()` logs and resolves.
    * - `stopping` — `start()` throws, `stop()` joins the shutdown in flight.
-   * - `unstoppable` — a failed start left a child that outlived even SIGKILL.
-   *   `start()` throws, `stop()` runs the escalation against it again.
+   * - `unstoppable` — a failed start left a child that outlived even SIGKILL
+   *   and this instance is still holding it. `start()` throws, `stop()` runs
+   *   the escalation against it again. It is a state the instance LEAVES: the
+   *   child's own exit runs the lifecycle cleanup, which drops the reference,
+   *   and the next reading is `stopped` with `start()` working normally again.
    *
    * `stopping` is the one asymmetric row, and {@link stop} says why: a stop
    * that refuses would leave a server running, so it waits instead.
@@ -2339,12 +2346,17 @@ export class LocalDevDBServer {
 
     // Ahead of the handle, which cannot see this. A failed start that could
     // not kill its child keeps the reference deliberately, and start() refuses
-    // on it whether or not the child has since died — so reading the handle
-    // here would answer `running`, or `stopped` once it exits with its `close`
-    // still held back by an orphaned backend, and both of those rows promise a
-    // start() that in fact throws. This is exactly the state the method exists
-    // to report, since the call that would otherwise reveal it is the one
-    // throwing.
+    // while it holds it — including after the child has died, in the window
+    // before the lifecycle cleanup drops the reference. Reading the handle
+    // here would answer `running` in the first case and `stopped` in the
+    // second, and both of those rows promise a start() that in fact throws.
+    // This is exactly the state the method exists to report, since the call
+    // that would otherwise reveal it is the one throwing.
+    //
+    // Only while the reference is held, which is the whole life of the state:
+    // once finalize() nulls pgProcess this reads `stopped` and start() works,
+    // because a child that has exited and been cleaned up after is no longer
+    // in anybody's way.
     if (proc && this.unstoppableChild === proc) {
       return "unstoppable";
     }
@@ -3686,7 +3698,7 @@ export class LocalDevDBServer {
         throw new Error(
           `A partially started PostgreSQL server (PID ${this.pgProcess.pid}) left by an earlier failed start could not be stopped. ` +
             (exited
-              ? "It has since exited, but this instance is still winding it down and cannot be reused; construct a new LocalDevDBServer."
+              ? "It has since exited and this instance is still winding it down, so there is nothing left to stop by hand: try again in a moment."
               : `It may still be holding port ${this.pgPort}. Stop it manually before starting the dev server.`),
         );
       }
