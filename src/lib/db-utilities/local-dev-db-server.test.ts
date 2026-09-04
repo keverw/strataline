@@ -2722,6 +2722,64 @@ describe("LocalDevDBServer", () => {
     expect(exitCalled).toBe(false);
   }, 90000);
 
+  it("should refuse a restart while a failed stop's server is still held", async () => {
+    // The mirror of the test above, and the reason that one was not enough.
+    // This surface has TWO teardowns — cleanupFailedStart for a failed start,
+    // performGracefulShutdown for a failed stop — and they leave the instance
+    // in the same state by different paths. Only the first used to record it,
+    // so a stop that gave up read as `running`, and the next start() took the
+    // already-running path and RESOLVED: a healthy server reported moments
+    // after stop() rejected saying it could not control one.
+    //
+    // Worse than a misleading reading, because `stoppingProc` is still aimed
+    // at that child. Its eventual death therefore reads as deliberate and
+    // never reaches onExit, so a caller who believed start() would be left
+    // with no database and nothing telling them so.
+    //
+    // (TestDatabaseInstance has one teardown that both origins funnel through,
+    // which is why its single `unstoppedServer` write covers both.)
+    type Internals = {
+      terminateProcess(pid: number, label: string): Promise<"gone" | "failed">;
+      pgProcess: { pid?: number } | null;
+    };
+
+    await server.start();
+
+    const internals = server as unknown as Internals;
+    const pid = internals.pgProcess?.pid;
+
+    expect(pid).toBeDefined();
+
+    // A process that survives SIGKILL cannot be provoked with one we own, so
+    // only the kill outcome is faked; the surrounding logic is the real thing.
+    const originalTerminate = internals.terminateProcess.bind(server);
+
+    internals.terminateProcess = async () => "failed";
+
+    await expect(server.stop()).rejects.toThrow(/could not be stopped/i);
+
+    internals.terminateProcess = originalTerminate;
+
+    // Not `running`. The instance is holding a PostgreSQL it just failed to
+    // stop, and both surfaces call that `unstoppable`.
+    expect(server.getLifecycleState()).toBe("unstoppable");
+
+    await expect(server.start()).rejects.toThrow(/could not be stopped/i);
+
+    // And the refusal is specific to that held child rather than a permanent
+    // wedge: stop() was always retryable, and once it succeeds the instance
+    // works again.
+    await server.stop();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    expect(server.getLifecycleState()).toBe("stopped");
+
+    await server.start();
+
+    expect(internals.pgProcess).not.toBeNull();
+    expect(exitCalled).toBe(false);
+  }, 90000);
+
   it("should not delete a PID record that was replaced mid-cleanup", async () => {
     // cleanupExistingProcess decides from a status read taken before the
     // escalation, and the escalation takes seconds. A postmaster that claimed

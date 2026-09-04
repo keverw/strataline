@@ -232,8 +232,9 @@ export type DevDBExitHandler = (exitCode: number) => void;
  * say about themselves. See {@link LocalDevDBServer.getLifecycleState}, and
  * ./lifecycle-state for what each state means and why the type lives there.
  *
- * `unstoppable` reaches this surface by its own route: a failed `start()` left
- * a child that outlived even SIGKILL, and this instance is still holding it.
+ * `unstoppable` reaches this surface by two routes rather than one, since it
+ * has two teardowns: a failed `start()` and a failed `stop()` each leave a
+ * child that outlived even SIGKILL, and this instance is still holding it.
  */
 export type DevDBLifecycleState = LifecycleState;
 
@@ -420,7 +421,9 @@ export class LocalDevDBServer {
     stderr: new PostgresOutputReader(),
   };
 
-  // The child a failed start left behind because it outlived even SIGKILL.
+  // The child a failed start or a failed stop left behind because it outlived
+  // even SIGKILL. Both teardowns record it, since either leaves this instance
+  // holding a PostgreSQL it could not stop.
   //
   // The reference rather than a flag, so it answers "which child" and not
   // merely "some child": it only means anything while pgProcess is still that
@@ -632,6 +635,34 @@ export class LocalDevDBServer {
       );
 
       if (outcome === "failed") {
+        // The state cleanupFailedStart records, reached from the other
+        // direction. This instance is still holding a PostgreSQL it could not
+        // stop, which is what the shared LifecycleState calls `unstoppable`:
+        // start() throws, stop() tries again. See ./lifecycle-state.
+        //
+        // Two teardowns is why this needs saying twice. A failed start and a
+        // failed stop leave the same instance in the same state, but they
+        // arrive by different paths — cleanupFailedStart and this method — and
+        // only the first used to record it. TestDatabaseInstance has one
+        // teardown that both origins funnel through, so its single write
+        // covers both; this surface has to write it in each.
+        //
+        // Without it the next start() finds a live child, no `unstoppableChild`
+        // to refuse on, and takes performStart's already-running path —
+        // RESOLVING with a healthy server moments after this call said it
+        // could not control one. `stoppingProc` is still aimed at that child
+        // too, so its eventual death reads as deliberate and never reaches
+        // onExit: the host would be left with no database and no notification.
+        //
+        // `stoppingProc` is deliberately left where it is. The escalation's
+        // SIGKILL may yet land, and reporting that death through onExit would
+        // have the documented handler exit the host over a stop it asked for.
+        // Refusing the start is what makes that silence correct rather than
+        // lossy. Both fields are let go when the child finally does die:
+        // finalize() drops this one, and the exit handler that ran it clears
+        // `stoppingProc` once it has read it.
+        this.unstoppableChild = proc;
+
         throw new Error(`PostgreSQL (PID ${pid}) could not be stopped.`);
       }
 
@@ -2347,11 +2378,12 @@ export class LocalDevDBServer {
    * - `starting` — `start()` and `stop()` both throw. Await the start.
    * - `running` — `stop()` stops it, `start()` logs and resolves.
    * - `stopping` — `start()` throws, `stop()` joins the shutdown in flight.
-   * - `unstoppable` — a failed start left a child that outlived even SIGKILL
-   *   and this instance is still holding it. `start()` throws, `stop()` runs
-   *   the escalation against it again. It is a state the instance LEAVES: the
-   *   child's own exit runs the lifecycle cleanup, which drops the reference,
-   *   and the next reading is `stopped` with `start()` working normally again.
+   * - `unstoppable` — a failed start or a failed stop left a child that
+   *   outlived even SIGKILL and this instance is still holding it. `start()`
+   *   throws, `stop()` runs the escalation against it again. It is a state
+   *   the instance LEAVES: the child's own exit runs the lifecycle cleanup,
+   *   which drops the reference, and the next reading is `stopped` with
+   *   `start()` working normally again.
    *
    * `stopping` is the one asymmetric row, and {@link stop} says why: a stop
    * that refuses would leave a server running, so it waits instead.
@@ -2379,8 +2411,8 @@ export class LocalDevDBServer {
 
     const proc = this.pgProcess;
 
-    // Ahead of the handle, which cannot see this. A failed start that could
-    // not kill its child keeps the reference deliberately, and start() refuses
+    // Ahead of the handle, which cannot see this. A teardown that could not
+    // kill the child keeps the reference deliberately, and start() refuses
     // while it holds it — including after the child has died, in the window
     // before the lifecycle cleanup drops the reference. Reading the handle
     // here would answer `running` in the first case and `stopped` in the
@@ -3222,13 +3254,13 @@ export class LocalDevDBServer {
           this.pgProcessLifecycle = null;
         }
 
-        // The child a failed start could not kill has now died and been
-        // cleaned up after, so it is no longer in anybody's way and this
-        // instance leaves the `unstoppable` state here. Nothing reads the
-        // field once pgProcess stops pointing at the same child, so clearing
-        // it changes no decision; what it does is let go of a dead child's
-        // handle, and with it the stdio stream objects hanging off it, rather
-        // than hold them for the life of the instance.
+        // The child a failed start or a failed stop could not kill has now
+        // died and been cleaned up after, so it is no longer in anybody's way
+        // and this instance leaves the `unstoppable` state here. Nothing reads
+        // the field once pgProcess stops pointing at the same child, so
+        // clearing it changes no decision; what it does is let go of a dead
+        // child's handle, and with it the stdio stream objects hanging off it,
+        // rather than hold them for the life of the instance.
         if (this.unstoppableChild === proc) {
           this.unstoppableChild = null;
         }
@@ -3336,9 +3368,10 @@ export class LocalDevDBServer {
         // does: performGracefulShutdown, cleanupFailedStart, and the reuse
         // path in performStart. This was the one that did not, and the gap is
         // reached by two routes — the exit nobody asked for, and a child a
-        // failed start could not kill, which cleanupFailedStart deliberately
-        // leaves holding its pipes while it is still running and which arrives
-        // here as `deliberate` whenever it finally dies.
+        // failed teardown could not kill, which cleanupFailedStart and
+        // performGracefulShutdown both deliberately leave holding its pipes
+        // while it is still running and which arrives here as `deliberate`
+        // whenever it finally dies.
         //
         // What this is worth is worth stating exactly. The hazard the other
         // three guard against is real in principle: PostgreSQL's backends
@@ -3791,10 +3824,12 @@ export class LocalDevDBServer {
     if (this.pgProcess) {
       const held = this.pgProcess;
 
-      // A child that outlived a failed start's SIGKILL is not a running
-      // server. Resolving here would report a success the earlier start()
-      // already rejected, and send the caller off to connect to a server that
-      // never came up.
+      // A child that outlived a SIGKILL is not a running server, whichever
+      // call gave up on it. Resolving here would report a success the earlier
+      // call already rejected: for a failed start, sending the caller off to
+      // connect to a server that never came up; for a failed stop, handing
+      // back a healthy database moments after stop() said it could not
+      // control one.
       if (this.unstoppableChild === this.pgProcess) {
         // Whether it is still holding the port is a separate question from
         // whether this instance can be restarted, and Node's own report on the
@@ -3808,7 +3843,7 @@ export class LocalDevDBServer {
           this.pgProcess.signalCode !== null;
 
         throw new Error(
-          `A partially started PostgreSQL server (PID ${this.pgProcess.pid}) left by an earlier failed start could not be stopped. ` +
+          `A PostgreSQL server (PID ${this.pgProcess.pid}) held by this instance could not be stopped. ` +
             (exited
               ? "It has since exited and this instance is still winding it down, so there is nothing left to stop by hand: try again in a moment."
               : `It may still be holding port ${this.pgPort}. Stop it manually before starting the dev server.`),
