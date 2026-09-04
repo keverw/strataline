@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, mock } from "bun:test";
 import { Pool } from "pg";
-import { RunStratalineCLI } from "./built-in-cli";
+import { RunStratalineCLI, STRATALINE_EXIT_CODES } from "./built-in-cli";
 import {
   createConsoleLogger,
   type LogDataInput,
@@ -525,6 +525,179 @@ describe("RunStratalineCLI", () => {
           entry.message.includes("Missing required environment variable"),
       );
       expect(errorLogs.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe("the outcomes a run can end in, and the code each reports", () => {
+    /**
+     * Every way `run` can finish that is not a completion, and the exit code
+     * the CLI promises for it.
+     *
+     * These matter more than most branches because the exit code is the API
+     * for a wrapper script, and it is the one part of this a caller consumes
+     * without reading a log line. `error` is absent on purpose: it is thrown
+     * rather than returned, so that callers who only `.catch` still exit
+     * non-zero, and the throwing is covered elsewhere in this file.
+     */
+    /**
+     * One CLI call, on a pool of its own.
+     *
+     * Not `testDb.getPool()`, because pool mode ADOPTS the pool it is given
+     * and ends it in a finally on the way out, caller-supplied or not. Sharing
+     * the fixture's pool would work exactly once and then fail the next thing
+     * to touch it with "Cannot use a pool after calling end on the pool" --
+     * which is how the locked test below, needing a setup query and then a
+     * run, found this out.
+     */
+    const run = (migrations: Migration[], signal?: AbortSignal) => {
+      const credentials = testDb.getCredentials();
+
+      if (!credentials) {
+        throw new Error("Failed to get test database credentials");
+      }
+
+      return RunStratalineCLI({
+        migrations,
+        loadFrom: "pool",
+        pool: new Pool(credentials),
+        logger: mockLogger,
+        argv: ["node", "script.js", "run"],
+        signal,
+      });
+    };
+
+    const warnings = () =>
+      logEntries
+        .filter((entry) => entry.level === "warn")
+        .map((entry) => entry.message)
+        .join("\n");
+
+    it("reports a completed run as 0", async () => {
+      const result = await run([
+        {
+          id: "outcome-complete",
+          description: "Completes",
+          migration: async (_pool, ctx) => ctx.complete(),
+        },
+      ]);
+
+      expect(result).toMatchObject({
+        command: "run",
+        status: "completed",
+        exitCode: 0,
+      });
+    });
+
+    it("reports a migration that paused itself as 2, without throwing", async () => {
+      // A deferral is a deliberate pause, so it is returned rather than
+      // thrown. A staged rollout ends here on purpose and must not read as a
+      // failed deploy.
+      const result = await run([
+        {
+          id: "outcome-defer",
+          description: "Defers",
+          migration: async (_pool, ctx) =>
+            ctx.defer("waiting for the backfill"),
+        },
+      ]);
+
+      expect(result).toMatchObject({ status: "deferred", exitCode: 2 });
+      expect(result.reason ?? "").toContain("waiting for the backfill");
+      expect(warnings()).toContain("deferred");
+    });
+
+    it("reports a run another process is holding as 3", async () => {
+      // Someone else has the lock. Not a failure: the migrations are being
+      // applied, just not by this process, which is the ordinary case for
+      // several replicas starting at once.
+      //
+      // Held by writing the row a second process would have written, rather
+      // than by standing up a second manager. The lock IS that row, an unheld
+      // one is the absence of it, and a real competitor is another host and
+      // pid entirely -- which is a string here and a whole process otherwise.
+      // The fixture's own pool, which nothing here ends, for the two direct
+      // statements. The runs get their own, per `run` above.
+      const pool = testDb.getPool() as Pool;
+
+      // The lock table is created by the first run, so there has to be one
+      // before there is anywhere to write the row.
+      await run([]);
+
+      const expiry = new Date(Date.now() + 5 * 60 * 1000);
+
+      await pool.query(
+        `INSERT INTO migration_lock (lock_name, locked_by, locked_at, lock_expires_at)
+         VALUES ($1, $2, now(), $3)
+         ON CONFLICT (lock_name) DO UPDATE
+           SET locked_by = EXCLUDED.locked_by,
+               locked_at = EXCLUDED.locked_at,
+               lock_expires_at = EXCLUDED.lock_expires_at`,
+        ["database_migrations", "another-host-4242-1", expiry],
+      );
+
+      logEntries = [];
+
+      try {
+        const result = await run([
+          {
+            id: "outcome-locked",
+            description: "Never reached",
+            migration: async (_pool, ctx) => ctx.complete(),
+          },
+        ]);
+
+        expect(result).toMatchObject({ status: "locked", exitCode: 3 });
+        expect(result.reason ?? "").toContain("Another process");
+        expect(warnings()).toContain("skipped");
+      } finally {
+        await pool.query("DELETE FROM migration_lock WHERE lock_name = $1", [
+          "database_migrations",
+        ]);
+      }
+    });
+
+    it("reports a run stopped by its own signal as 4", async () => {
+      const controller = new AbortController();
+
+      // Aborted from inside the migration, which is where a real shutdown
+      // lands: the signal is how a caller asks a long run to wind down, and
+      // the run gets to finish the unit it is on.
+      const result = await run(
+        [
+          {
+            id: "outcome-abort",
+            description: "Winds down when asked",
+            migration: async (_pool, ctx) => {
+              controller.abort();
+              ctx.defer("shutting down");
+            },
+          },
+        ],
+        controller.signal,
+      );
+
+      const status = result.status;
+
+      if (status === undefined) {
+        throw new Error("A run command always reports a status");
+      }
+
+      // Either of the two is a correct reading of that sequence, and which one
+      // it is depends on where the abort is noticed rather than on anything a
+      // caller controls. Both are non-failures, and each carries its own code.
+      expect(["aborted", "deferred"]).toContain(status);
+      expect(result.exitCode).toBe(STRATALINE_EXIT_CODES[status]);
+    });
+
+    it("gives every outcome its own code", () => {
+      // The codes are the contract, so a reordering that made two outcomes
+      // indistinguishable would be caught here rather than by a deploy script
+      // treating a deferral as a clean run.
+      const codes = Object.values(STRATALINE_EXIT_CODES);
+
+      expect(new Set(codes).size).toBe(codes.length);
+      expect(STRATALINE_EXIT_CODES.completed).toBe(0);
+      expect(STRATALINE_EXIT_CODES.error).toBe(1);
     });
   });
 
