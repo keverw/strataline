@@ -1051,10 +1051,10 @@ describe("LocalDevDBServer", () => {
       { stdio: "ignore" },
     );
 
-    try {
-      const internals = server as unknown as Internals;
-      const realRunPgCommand = internals.runPgCommand.bind(server);
+    const internals = server as unknown as Internals;
+    const realRunPgCommand = internals.runPgCommand.bind(server);
 
+    try {
       internals.runPgCommand = async (command, args, options) => {
         const target = args[args.indexOf("-D") + 1];
 
@@ -1087,9 +1087,14 @@ describe("LocalDevDBServer", () => {
         "# theirs\n",
       );
       expect(existsSync(join(dataDir, "PG_VERSION"))).toBe(true);
-
-      internals.runPgCommand = realRunPgCommand;
     } finally {
+      // In the finally with the unmount rather than after the assertions. A
+      // failing expect() above skips whatever follows it, and the stub writes
+      // into a data directory that is about to be detached, so leaving it
+      // installed lets one broken assertion here reach the tests that run
+      // next.
+      internals.runPgCommand = realRunPgCommand;
+
       execFileSync("hdiutil", ["detach", dataDir, "-force"], {
         stdio: "ignore",
       });
