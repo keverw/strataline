@@ -1901,7 +1901,34 @@ export async function getLocalDevDBServerStatus(
   // opening a connection. A server that answers names its own data directory,
   // which is identity rather than inference.
   const probe = options.connectionProbe ?? identifyViaConnection;
-  const answer = await probe(options.connection);
+
+  // Guarded like every other probe, for the reason guardProbes gives: this is
+  // an injectable option, so it is somebody else's code, and a probe's whole
+  // contract is that it may not be able to answer. `identifyViaConnection`
+  // reports a refusal rather than throwing, but a supplied one need not, and a
+  // throw here used to escape this call, then cleanupExistingProcess, and
+  // reject LocalDevDBServer.start() — which is start() failing over the
+  // tiebreaker rather than falling back to the cautious answer the cheap
+  // checks already reached.
+  //
+  // So a throw is the "could not identify" it should have been, and the
+  // status it leaves standing is the indeterminate one that got us here. What
+  // it adds is why, recorded as a probe failure like any other, since a
+  // tiebreaker that could not run is exactly what a person reading a refusal
+  // wants named.
+  let answer: DevDBConnectionResult;
+
+  try {
+    answer = await probe(options.connection);
+  } catch (e) {
+    const failure = `connection identification: ${describeProbeError(e)}`;
+
+    return {
+      ...status,
+      probeFailures: mergeProbeFailures(status.probeFailures, [failure]),
+      reason: `${status.reason}; the server on port ${options.connection.port} could not be asked to identify itself (${getProbeErrorMessage(e)})`,
+    };
+  }
 
   if (answer.dataDir !== null) {
     if (sameDataDir(answer.dataDir, options.dataDir)) {

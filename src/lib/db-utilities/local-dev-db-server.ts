@@ -1469,11 +1469,17 @@ export class LocalDevDBServer {
       // failing to fill it are distinguishable. `wx` fails with EEXIST where
       // the name is taken, and a failure to open creates nothing, so there is
       // nothing to undo and nothing of anybody else's to touch.
-      const handle = await open(path, "wx").catch((refused: unknown) => {
-        throw (refused as NodeJS.ErrnoException)?.code === "EEXIST"
-          ? refused
-          : e;
-      });
+      //
+      // The open's own error, for the reason the write branch below gives:
+      // the link failing is what sent us here and describes the filesystem,
+      // while this one describes what actually went wrong. A read-only mount
+      // and a directory this user may not write both fail HERE rather than at
+      // the write, so throwing the link's error would report exactly the
+      // "operation not permitted, link" that names the one thing that is not
+      // the problem. EEXIST is not special-cased any more because nothing has
+      // to be: it is rethrown as itself along with everything else, so callers
+      // still recognize somebody having taken the name.
+      const handle = await open(path, "wx");
 
       try {
         try {
