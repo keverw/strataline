@@ -70,7 +70,7 @@ jobs:
       # itself from the step list alone.
       - name: Test (Linux and macOS)
         if: runner.os != 'Windows'
-        run: bun test
+        run: bun run test
 
       # PostgreSQL refuses to start under an account with administrative
       # privileges, by design and with no way to override it:
@@ -134,7 +134,7 @@ jobs:
           # minutes of a job that appears to be doing nothing, with no way to
           # tell a suite that is working through its tests from one that has
           # wedged on the first.
-          $process = Start-Process -FilePath $bun -ArgumentList 'test' `
+          $process = Start-Process -FilePath $bun -ArgumentList 'run', 'test' `
             -Credential $credential `
             -WorkingDirectory $env:GITHUB_WORKSPACE `
             -RedirectStandardOutput $outFile `
