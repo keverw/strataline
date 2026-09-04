@@ -9,7 +9,9 @@ import {
   link,
   unlink,
   mkdir,
+  readdir,
   rm,
+  rmdir,
   realpath,
 } from "fs/promises";
 import { constants } from "fs";
@@ -1528,6 +1530,216 @@ export class LocalDevDBServer {
   }
 
   /**
+   * Runs initdb against one target, with the arguments both call sites share.
+   *
+   * Pin initdb's locale rather than inherit the host shell's: a Linux-style
+   * LC_ALL=C.UTF-8 makes initdb fail on macOS, whose libc has no such locale,
+   * and an inherited one makes collation vary per machine. "C" + UTF8 is valid
+   * everywhere and sorts by byte order — right for a throwaway DB, so do not
+   * "fix" it to en_US.
+   *
+   * `-U postgres`, so the cluster's superuser is a name this code chose rather
+   * than one it has to work out. Without it initdb names the bootstrap
+   * superuser after whoever ran it, and the connection then has to arrive at
+   * the same name independently -- which means asking the operating system who
+   * this process is, and being right on every platform and runtime. Where that
+   * guess was wrong, every start failed with `role "..." does not exist`
+   * against a database it had just created, and the guess was wrong in
+   * ordinary situations: an inherited USERNAME, a container that pins it, a
+   * process launched under other credentials.
+   *
+   * A name that is decided here cannot disagree with itself. It also makes the
+   * cluster independent of the account that happened to create it, so a data
+   * directory still works when the next start runs as somebody else.
+   */
+  private async runInitdb(
+    pgBinaries: PostgresBinaries,
+    target: string,
+  ): Promise<{ stdout: string; stderr: string; code: number | null }> {
+    return this.runPgCommand(pgBinaries.initdb, [
+      "-D",
+      target,
+      "-U",
+      LocalDevDBServer.BOOTSTRAP_USER,
+      "--locale=C",
+      "--encoding=UTF8",
+    ]);
+  }
+
+  /**
+   * Turns a failed initdb into an error carrying initdb's own diagnosis.
+   *
+   * runPgCommand captures that output and nothing else reads it, so discarding
+   * it left the one message that says WHY unread: a locale libc rejects, a
+   * directory that is not empty, or on macOS an exhausted SysV shared-memory
+   * table, whose "No space left on device" reads as a full disk until you see
+   * it came from initdb. A caller left with only "failed to initialize" has to
+   * go and reproduce the failure by hand to learn anything at all.
+   */
+  private initdbFailure(result: {
+    stdout: string;
+    stderr: string;
+    code: number | null;
+  }): Error {
+    const detail = result.stderr.trim() || result.stdout.trim();
+
+    return new Error(
+      `Failed to initialize PostgreSQL data directory at ${this.pgDataDir}${
+        detail
+          ? `: ${detail}`
+          : ` (initdb exited with code ${result.code} without reporting a reason)`
+      }` + ipcExhaustionHint(detail),
+    );
+  }
+
+  /** True while `path` is a directory holding nothing. */
+  private async isEmptyDirectory(path: string): Promise<boolean> {
+    try {
+      return (await readdir(path)).length === 0;
+    } catch {
+      // Absent, not a directory, or not ours to list. None of the three is a
+      // directory this may initialize into.
+      return false;
+    }
+  }
+
+  /**
+   * Initializes the cluster inside `destination` itself, for a directory
+   * nothing can be renamed onto.
+   *
+   * The one case the staged-and-renamed publish cannot serve, and it is an
+   * ordinary setup rather than an exotic one: a `dataDir` that is a mount
+   * point. A volume mounted there in a container or a devcontainer, or a
+   * second disk parked at that path, is a filesystem of its own, so the
+   * staging sibling — which lives in the PARENT directory — is on the other
+   * side of a filesystem boundary. `rename()` refuses to cross one: macOS
+   * reports EXDEV and Linux EBUSY for a mount point, and `rmdir` reports EBUSY
+   * for one either way, so neither publishing nor clearing the name can work.
+   * Verified against a real mounted volume rather than reasoned about.
+   *
+   * initdb has no such trouble, because it never crosses anything: it writes
+   * into the directory it is given, which is what the in-place initdb this
+   * replaced always did, and it accepts an existing directory as long as it is
+   * empty. So this is the older behavior kept for exactly the case that needs
+   * it, rather than a second strategy on the ordinary path.
+   *
+   * What it gives up is the protection the staging exists for, and it gives it
+   * up in both directions. An initdb that is interrupted OR that fails leaves
+   * the directory holding part of a cluster and no postgresql.conf, which the
+   * next start reads as neither initialized nor empty and reports rather than
+   * clears — see the failure branch below for why clearing it would be the one
+   * destructive act this module never commits. Nothing serializes two starts
+   * here either: the staged path is safe against that by construction, since
+   * each stages under a name only it knows and the loser recognizes the
+   * winner's postgresql.conf, while this one has every start writing into the
+   * same directory. Both are the behavior a mounted `dataDir` had before any
+   * of this, which is why they are confined to this path and why the ordinary
+   * one is still the staged publish.
+   */
+  private async initializeInPlace(
+    pgBinaries: PostgresBinaries,
+    destination: string,
+  ): Promise<void> {
+    this.log(
+      "setup",
+      `${this.pgDataDir} is a filesystem of its own, so a cluster initialized beside it cannot be moved in. Initializing in place instead.`,
+    );
+
+    const initResult = await this.runInitdb(pgBinaries, destination);
+
+    if (initResult.code !== 0) {
+      // Deliberately nothing is removed, and this is the one place that
+      // decision is worth spelling out, because tidying up looks free here
+      // and is not.
+      //
+      // What is in the directory now is not what the emptiness check saw. The
+      // check happened before an initdb that takes about half a second, and
+      // the directory is SHARED: unlike the staging sibling, whose name is a
+      // uuid nothing else knows, this name is the one every start against
+      // this dataDir is aiming at. Two first-time starts can both find it
+      // empty and both come here, and initdb refuses a directory that is not
+      // empty — so the one that loses is the one that fails, and a cleanup
+      // here would delete the WINNER's freshly initialized cluster out from
+      // under a start that is about to spawn a postmaster against it. An
+      // ordinary `rm -rf` of a listing taken after the await does the same to
+      // anything else that wrote there meanwhile.
+      //
+      // That is the read-then-unlink the claim protocol at the top of this
+      // file exists to rule out, and it cannot be claimed the same way: a
+      // rename of a mount point is what does not work here in the first
+      // place. Only positive disproof licenses destruction, and an emptiness
+      // reading from before the write is not any.
+      //
+      // So the directory is left as it is, which is what the in-place initdb
+      // this path restores always did. A retry reports it — the publish above
+      // finds a destination that is no longer empty and says the remains of
+      // an interrupted first run are in the way — and the message below says
+      // the same thing while the reason is still in hand.
+      throw new Error(
+        this.initdbFailure(initResult).message +
+          `\n\nAnything initdb wrote has been left in ${this.pgDataDir}, since this start cannot tell it apart from what another start or another program may have put there. ` +
+          "Check what is in that directory and empty it before trying again.",
+      );
+    }
+  }
+
+  /**
+   * Publishes the staged cluster at `destination`, clearing an empty
+   * directory out of the way where the platform will not rename over one.
+   *
+   * POSIX `rename()` replaces an empty destination directory, so a first run
+   * against a `dataDir` that already exists and is empty works there with
+   * nothing extra. Windows does not: `MoveFileEx`'s replace flag is
+   * documented as not applying to directories at all, so ANY existing
+   * destination fails with EPERM, empty or not.
+   *
+   * Pre-creating the data directory is an ordinary thing to do — a volume
+   * mount, a `mkdir -p` in a setup script, a directory an earlier version's
+   * in-place `initdb` was pointed at — and every one of those would otherwise
+   * fail the FIRST start on Windows, with the message below telling the
+   * caller to check what is in a directory that is empty. That is the one
+   * case the staged-and-renamed publish must not have made worse than the
+   * in-place initdb it replaced.
+   *
+   * So an empty destination is removed and the rename tried once more. Only
+   * an empty one, and `rmdir` is what establishes that rather than a listing:
+   * it refuses a directory holding anything, so the decision and the removal
+   * are a single syscall and nothing can be deleted on the strength of a
+   * reading that was already stale. It also refuses a file and a symlink,
+   * which is what leaves the ENOTDIR diagnosis below reporting itself.
+   *
+   * Anything else, and any second failure, reports the ORIGINAL error. That
+   * is the one describing what is actually in the way, and the caller's
+   * branches read its errno.
+   */
+  private async publishInitializedCluster(
+    staged: string,
+    destination: string,
+  ): Promise<void> {
+    try {
+      await rename(staged, destination);
+    } catch (e) {
+      try {
+        await rmdir(destination);
+      } catch {
+        // Not there, not empty, or not ours to remove. Nothing was cleared,
+        // so there is nothing to try again and the first error still stands.
+        throw e;
+      }
+
+      try {
+        await rename(staged, destination);
+      } catch {
+        // The name was free a moment ago and is not now — another start
+        // publishing into it is the way that happens, and the caller's own
+        // race check reads that from the config it left. Either way the
+        // first error is the one that says what was in the way.
+        throw e;
+      }
+    }
+  }
+
+  /**
    * Removes a directory tree this instance created, ignoring a failure.
    *
    * Only ever called on the staging directory initdb was pointed at, whose
@@ -2382,58 +2594,16 @@ export class LocalDevDBServer {
       // own target and is where the directory now comes from.
       await mkdir(dirname(destination), { recursive: true });
 
-      // Pin initdb's locale rather than inherit the host shell's: a
-      // Linux-style LC_ALL=C.UTF-8 makes initdb fail on macOS, whose libc has
-      // no such locale, and an inherited one makes collation vary per machine.
-      // "C" + UTF8 is valid everywhere and sorts by byte order — right for a
-      // throwaway DB, so do not "fix" it to en_US.
-      // `-U postgres`, so the cluster's superuser is a name this code chose
-      // rather than one it has to work out. Without it initdb names the
-      // bootstrap superuser after whoever ran it, and the connection then has
-      // to arrive at the same name independently -- which means asking the
-      // operating system who this process is, and being right on every
-      // platform and runtime. Where that guess was wrong, every start failed
-      // with `role "..." does not exist` against a database it had just
-      // created, and the guess was wrong in ordinary situations: an inherited
-      // USERNAME, a container that pins it, a process launched under other
-      // credentials.
-      //
-      // A name that is decided here cannot disagree with itself. It also makes
-      // the cluster independent of the account that happened to create it, so
-      // a data directory still works when the next start runs as somebody
-      // else.
-      const initResult = await this.runPgCommand(pgBinaries.initdb, [
-        "-D",
-        stagedDataDir,
-        "-U",
-        LocalDevDBServer.BOOTSTRAP_USER,
-        "--locale=C",
-        "--encoding=UTF8",
-      ]);
+      const initResult = await this.runInitdb(pgBinaries, stagedDataDir);
 
       if (initResult.code !== 0) {
         await this.removeDirectoryIfPresent(stagedDataDir);
 
-        // Carry initdb's own diagnosis. runPgCommand captures it and nothing
-        // else reads it, so discarding it here left the one message that says
-        // WHY unread: a locale libc rejects, a directory that is not empty, or
-        // on macOS an exhausted SysV shared-memory table, whose "No space left
-        // on device" reads as a full disk until you see it came from initdb.
-        // A caller left with only "failed to initialize" has to go and
-        // reproduce the failure by hand to learn anything at all.
-        const detail = initResult.stderr.trim() || initResult.stdout.trim();
-
-        throw new Error(
-          `Failed to initialize PostgreSQL data directory at ${this.pgDataDir}${
-            detail
-              ? `: ${detail}`
-              : ` (initdb exited with code ${initResult.code} without reporting a reason)`
-          }` + ipcExhaustionHint(detail),
-        );
+        throw this.initdbFailure(initResult);
       }
 
       try {
-        await rename(stagedDataDir, destination);
+        await this.publishInitializedCluster(stagedDataDir, destination);
       } catch (e) {
         await this.removeDirectoryIfPresent(stagedDataDir);
 
@@ -2453,13 +2623,27 @@ export class LocalDevDBServer {
           return;
         }
 
-        // An empty directory at the destination is renamed over on POSIX, so
-        // a directory reaching here is one holding something. That is not this
-        // start's to delete: it may be a data directory left half initialized
-        // by an older strataline, and it may equally be a directory the caller
-        // pointed `dataDir` at by mistake, with files in it that are not
-        // PostgreSQL's at all. Nothing here can tell those apart, and only one
-        // of them is safe to remove, so say what is in the way instead.
+        // A destination that is still there and still empty is one nothing
+        // can be renamed onto or removed — a mount point, in practice. initdb
+        // will happily write into it, so fall back to that rather than report
+        // a directory full of files that is in fact empty. See
+        // initializeInPlace, which is also where what this gives up is
+        // written down.
+        if (await this.isEmptyDirectory(destination)) {
+          await this.initializeInPlace(pgBinaries, destination);
+
+          return;
+        }
+
+        // An empty destination has already been cleared and retried by
+        // publishInitializedCluster, and one that could be neither is handled
+        // just above, so a directory reaching here is one holding something.
+        // That is not this start's to delete: it may be a data directory left
+        // half initialized by an older strataline, and it may equally be a
+        // directory the caller pointed `dataDir` at by mistake, with files in
+        // it that are not PostgreSQL's at all. Nothing here can tell those
+        // apart, and only one of them is safe to remove, so say what is in the
+        // way instead.
         // EPERM and EACCES join the list only where the destination is
         // actually there, which is what tells "the name is taken" apart from
         // "this user may not write here". POSIX rename() replaces an empty

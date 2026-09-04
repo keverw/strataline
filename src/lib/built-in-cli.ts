@@ -7,6 +7,40 @@ import { Pool } from "pg";
 import { makeSafeLogger } from "./callback-safety";
 import { createPrefixedLogger, getErrorMessage, type Logger } from "./logger";
 
+/**
+ * A configured value that must BE a whole number, not merely start with one.
+ *
+ * `parseInt` takes a prefix and stops at the first character it cannot use,
+ * so `5432oops` reads as 5432, `4.5` as 4, and `1000ms` as 1000. Every one of
+ * those then passes the range check at its call site and silently configures
+ * something other than what was written. The truncated timeout is the quiet
+ * one: nothing ever fails, the pool just behaves differently than the
+ * environment says it should, and there is no message anywhere connecting the
+ * two.
+ *
+ * Null for anything that is not a run of digits, which each caller turns into
+ * the same error a value outside the range gets, naming the variable and
+ * showing what was read. That is the rule `parseWholeInteger` in
+ * ./db-utilities/pid-file already applies to PID records, for the same
+ * reason: a number that has to be trusted has to be the whole of what was
+ * written.
+ *
+ * Digits only, so a negative is rejected here rather than by the range check
+ * below it. None of these settings has a meaning below zero, and every one of
+ * them is bounded at or above it by its caller, so nothing is lost.
+ */
+function parseWholeNumber(value: string): number | null {
+  const trimmed = value.trim();
+
+  if (!/^\d+$/.test(trimmed)) {
+    return null;
+  }
+
+  const parsed = Number(trimmed);
+
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
 async function testConnection(
   pool: Pool,
   logger: Logger,
@@ -434,10 +468,11 @@ export async function RunStratalineCLI(config: {
 
     // Parse and validate port. POSTGRES_PORT is required and already confirmed
     // present by the missing-vars check above; the `?? ""` only satisfies the
-    // type (an empty string parses to NaN, which the range check below rejects).
-    const port = parseInt(portValue ?? "", 10);
+    // type (an empty string is not a whole number, which the check below
+    // rejects along with everything else that is not one).
+    const port = parseWholeNumber(portValue ?? "");
 
-    if (isNaN(port) || port <= 0 || port > 65535) {
+    if (port === null || port <= 0 || port > 65535) {
       throw new Error(
         "Invalid " +
           prefix +
@@ -450,9 +485,9 @@ export async function RunStratalineCLI(config: {
     let maxConnections = 20;
 
     if (maxConnectionsValue) {
-      maxConnections = parseInt(maxConnectionsValue, 10);
+      const parsed = parseWholeNumber(maxConnectionsValue);
 
-      if (isNaN(maxConnections) || maxConnections <= 0) {
+      if (parsed === null || parsed <= 0) {
         throw new Error(
           "Invalid " +
             prefix +
@@ -460,14 +495,16 @@ export async function RunStratalineCLI(config: {
             maxConnectionsValue,
         );
       }
+
+      maxConnections = parsed;
     }
 
     let idleTimeout = 30000;
 
     if (idleTimeoutValue) {
-      idleTimeout = parseInt(idleTimeoutValue, 10);
+      const parsed = parseWholeNumber(idleTimeoutValue);
 
-      if (isNaN(idleTimeout) || idleTimeout < 0) {
+      if (parsed === null || parsed < 0) {
         throw new Error(
           "Invalid " +
             prefix +
@@ -475,14 +512,16 @@ export async function RunStratalineCLI(config: {
             idleTimeoutValue,
         );
       }
+
+      idleTimeout = parsed;
     }
 
     let connectionTimeout = 2000;
 
     if (connectionTimeoutValue) {
-      connectionTimeout = parseInt(connectionTimeoutValue, 10);
+      const parsed = parseWholeNumber(connectionTimeoutValue);
 
-      if (isNaN(connectionTimeout) || connectionTimeout < 0) {
+      if (parsed === null || parsed < 0) {
         throw new Error(
           "Invalid " +
             prefix +
@@ -490,6 +529,8 @@ export async function RunStratalineCLI(config: {
             connectionTimeoutValue,
         );
       }
+
+      connectionTimeout = parsed;
     }
 
     poolInstance = new Pool({

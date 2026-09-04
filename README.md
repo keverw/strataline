@@ -422,6 +422,8 @@ Optional environment variables for pool configuration:
 - `POSTGRES_IDLE_TIMEOUT`: Idle timeout in milliseconds (default: 30000)
 - `POSTGRES_CONNECTION_TIMEOUT`: Connection timeout in milliseconds (default: 2000)
 
+Each of the four numeric variables has to be a whole number and nothing else. A value that merely starts with one is rejected rather than truncated to it, so `1000ms` and `4.5` are errors naming the variable rather than settings of `1000` and `4`.
+
 A ready-to-copy [`.env.example`](.env.example) is included. To get started:
 
 ```bash

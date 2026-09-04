@@ -736,14 +736,41 @@ describe("RunStratalineCLI", () => {
     });
 
     it("refuses a port outside the range a port can take", () => {
-      // parseInt is happy with both of these, which is the whole reason the
-      // range is checked separately from the parse.
+      // Both of these are whole numbers, which is the whole reason the range
+      // is checked separately from the parse.
       return Promise.all([
         expect(run({ ...validEnv(), POSTGRES_PORT: "0" })).rejects.toThrow(
           "must be a valid port number (1-65535)",
         ),
         expect(run({ ...validEnv(), POSTGRES_PORT: "70000" })).rejects.toThrow(
           "must be a valid port number (1-65535)",
+        ),
+      ]);
+    });
+
+    it("refuses a value that merely starts with a number", () => {
+      // parseInt takes a prefix, so every one of these used to be accepted as
+      // the number it starts with: the port silently became 5432, the pool
+      // size 20, and a timeout written in milliseconds lost its unit and its
+      // fraction. A range check cannot catch any of them, since what comes
+      // out is inside the range — it is a different setting than the one that
+      // was written, configured without a word.
+      return Promise.all([
+        expect(
+          run({ ...validEnv(), POSTGRES_PORT: "5432oops" }),
+        ).rejects.toThrow("Invalid POSTGRES_PORT"),
+        expect(
+          run({ ...validEnv(), POSTGRES_MAX_CONNECTIONS: "20 connections" }),
+        ).rejects.toThrow(
+          "POSTGRES_MAX_CONNECTIONS: must be a positive number",
+        ),
+        expect(
+          run({ ...validEnv(), POSTGRES_IDLE_TIMEOUT: "1000ms" }),
+        ).rejects.toThrow("POSTGRES_IDLE_TIMEOUT: must be a non-negative"),
+        expect(
+          run({ ...validEnv(), POSTGRES_CONNECTION_TIMEOUT: "4.5" }),
+        ).rejects.toThrow(
+          "POSTGRES_CONNECTION_TIMEOUT: must be a non-negative",
         ),
       ]);
     });

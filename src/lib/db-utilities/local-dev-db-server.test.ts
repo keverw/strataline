@@ -909,6 +909,193 @@ describe("LocalDevDBServer", () => {
     }
   }, 180000);
 
+  it("initializes a data directory that already exists and is empty", async () => {
+    // A `mkdir -p` in a setup script, a volume mounted at that path, or the
+    // directory an earlier version's in-place initdb was pointed at. All
+    // ordinary, and all of them a FIRST start, since nothing has initialized
+    // anything yet.
+    //
+    // The publish-by-rename this start does is where that can go wrong, and
+    // only on Windows: POSIX rename() replaces an empty destination directory,
+    // while MoveFileEx's replace flag does not apply to directories at all, so
+    // any existing destination fails with EPERM whether it holds anything or
+    // not. Read as "the name is taken" that becomes a start refused on the
+    // grounds that a directory holds files it does not have, permanently and
+    // on the ordinary path. So this passes on POSIX either way and is the
+    // regression guard on Windows, where CI runs it.
+    const dataDir = join(tempDir.name, "pgdata");
+
+    mkdirSync(dataDir, { recursive: true });
+
+    await server.start();
+
+    expect(existsSync(join(dataDir, "postgresql.conf"))).toBe(true);
+  }, 180000);
+
+  it("initializes a data directory that is a mount point of its own", async () => {
+    // The one shape the staged-and-renamed publish cannot serve: a `dataDir`
+    // that is a filesystem of its own. A volume mounted there in a container
+    // or a devcontainer, or a second disk parked at that path, puts the
+    // staging sibling — which lives in the PARENT directory — on the other
+    // side of a filesystem boundary, and rename() will not cross one. macOS
+    // reports EXDEV and Linux EBUSY, and `rmdir` reports EBUSY for a mount
+    // point either way, so neither publishing nor clearing the name works and
+    // the fallback to an in-place initdb is the whole of what makes this run.
+    //
+    // Not a hypothetical, and not Windows-only: the in-place initdb this
+    // replaced handled it by construction, so failing here would be a
+    // regression on every platform.
+    //
+    // macOS alone, for want of a way to build the premise elsewhere. `hdiutil`
+    // needs no privileges, while a loopback mount on Linux and a mounted VHD
+    // on Windows both need root or an administrator, which CI's non-admin
+    // account deliberately is not. A test that cannot arrange its own premise
+    // is not a failure.
+    if (process.platform !== "darwin") {
+      return;
+    }
+
+    const dataDir = join(tempDir.name, "pgdata");
+    const image = join(tempDir.name, "volume");
+
+    mkdirSync(dataDir, { recursive: true });
+
+    execFileSync(
+      "hdiutil",
+      ["create", "-size", "128m", "-fs", "APFS", "-volname", "pgvol", image],
+      { stdio: "ignore" },
+    );
+
+    execFileSync(
+      "hdiutil",
+      ["attach", `${image}.dmg`, "-mountpoint", dataDir, "-nobrowse"],
+      { stdio: "ignore" },
+    );
+
+    try {
+      await server.start();
+
+      expect(existsSync(join(dataDir, "postgresql.conf"))).toBe(true);
+
+      // In the mounted volume rather than in the directory underneath it,
+      // which is what an in-place initdb gets right and a rename onto the
+      // mount point could not have done at all.
+      const pool = new Pool({
+        host: "127.0.0.1",
+        port: serverPort,
+        user: "test_dev_user",
+        password: "test_dev_password",
+        database: "test_dev_database",
+      });
+
+      try {
+        expect((await pool.query("SELECT 1 AS ok")).rows[0].ok).toBe(1);
+      } finally {
+        await pool.end();
+      }
+    } finally {
+      // Ahead of the unmount, since the postmaster has the volume open and a
+      // busy volume does not detach.
+      await server.stop();
+
+      execFileSync("hdiutil", ["detach", dataDir, "-force"], {
+        stdio: "ignore",
+      });
+    }
+  }, 180000);
+
+  it("leaves a mounted data directory alone when the in-place initdb fails", async () => {
+    // The hazard the in-place fallback brings with it, and the reason it
+    // cleans up after nothing. Unlike the staging sibling, whose name is a
+    // uuid nothing else knows, the destination is the name EVERY start against
+    // this dataDir is aiming at. Two first-time starts can both find it empty
+    // and both initdb into it, and initdb refuses a directory that is not
+    // empty — so the loser is the one that fails, and it fails with the
+    // WINNER's freshly initialized cluster sitting in the directory.
+    //
+    // Tidying up there would delete that cluster out from under a start that
+    // is about to spawn a postmaster against it. It is the read-then-unlink
+    // the claim protocol exists to rule out, reached from the one path that
+    // cannot use the claim protocol, since renaming a mount point is what does
+    // not work here to begin with.
+    //
+    // So this stands in for the winner directly: the in-place initdb reports
+    // failure with a cluster already in the directory, and what has to survive
+    // is every byte of it.
+    if (process.platform !== "darwin") {
+      return;
+    }
+
+    type Internals = {
+      runPgCommand(
+        command: string,
+        args: string[],
+        options?: { user?: string; silent?: boolean; timeoutMs?: number },
+      ): Promise<{ stdout: string; stderr: string; code: number | null }>;
+    };
+
+    const dataDir = join(tempDir.name, "pgdata");
+    const image = join(tempDir.name, "volume");
+
+    mkdirSync(dataDir, { recursive: true });
+
+    execFileSync(
+      "hdiutil",
+      ["create", "-size", "128m", "-fs", "APFS", "-volname", "pgvol", image],
+      { stdio: "ignore" },
+    );
+
+    execFileSync(
+      "hdiutil",
+      ["attach", `${image}.dmg`, "-mountpoint", dataDir, "-nobrowse"],
+      { stdio: "ignore" },
+    );
+
+    try {
+      const internals = server as unknown as Internals;
+      const realRunPgCommand = internals.runPgCommand.bind(server);
+
+      internals.runPgCommand = async (command, args, options) => {
+        const target = args[args.indexOf("-D") + 1];
+
+        // The staged one still has to succeed, since publishing it is what
+        // fails with EXDEV and sends the start down the in-place path at all.
+        if (!command.includes("initdb") || target !== dataDir) {
+          return realRunPgCommand(command, args, options);
+        }
+
+        // What another start finished writing while this one was working.
+        writeFileSync(join(dataDir, "postgresql.conf"), "# theirs\n");
+        writeFileSync(join(dataDir, "PG_VERSION"), "18\n");
+
+        return {
+          stdout: "",
+          stderr:
+            'initdb: error: directory "' +
+            dataDir +
+            '" exists but is not empty',
+          code: 1,
+        };
+      };
+
+      await expect(server.start()).rejects.toThrow(/Failed to initialize/);
+
+      // Left exactly as it was found, which for the race this stands in for is
+      // another server's whole data directory.
+      expect(existsSync(join(dataDir, "postgresql.conf"))).toBe(true);
+      expect(readFileSync(join(dataDir, "postgresql.conf"), "utf8")).toBe(
+        "# theirs\n",
+      );
+      expect(existsSync(join(dataDir, "PG_VERSION"))).toBe(true);
+
+      internals.runPgCommand = realRunPgCommand;
+    } finally {
+      execFileSync("hdiutil", ["detach", dataDir, "-force"], {
+        stdio: "ignore",
+      });
+    }
+  }, 180000);
+
   it("says what is in the way when the data directory holds something else", async () => {
     // The remains of an interrupted first run under an older strataline, or a
     // directory the caller pointed `dataDir` at by mistake. Nothing can tell
