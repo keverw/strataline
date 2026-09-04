@@ -1762,7 +1762,9 @@ server.getLifecycleState(); // "running"
 | `stopping`    | **rejects**       | joins the shutdown in flight  |
 | `unstoppable` | **rejects**       | runs the escalation again     |
 
-`unstoppable` is the state a failed `start()` leaves when the partially started server outlived even `SIGKILL`. The instance keeps the child rather than forgetting it, so `stop()` can try again, and `start()` refuses until it is gone. It is reported separately because the child's own exit status cannot distinguish it: an orphaned backend holding the inherited stdio pipes keeps the reference alive after the postmaster has died, which would otherwise read as `running` or `stopped` and promise a `start()` that in fact throws.
+`unstoppable` is the state a failed `start()` leaves when the partially started server outlived even `SIGKILL`. The instance keeps the child rather than forgetting it, so `stop()` can try again, and `start()` refuses while it holds it. It is reported separately because the child's own exit status cannot distinguish it. A child that is still running reads as `running`, and one that has just died reads as `stopped` until its cleanup has finished, so both of those rows would promise a `start()` that in fact throws.
+
+It is a state the instance leaves rather than one it is stuck in. Whenever that child does exit, its cleanup releases the PID record and drops the reference, and the next reading is `stopped` with `start()` working normally again. So a caller that hits this has two things worth trying, in order: `stop()`, which runs the escalation once more, and simply waiting, which is enough if the process has since gone on its own.
 
 Stopping is deliberately the forgiving one. The two refusals fail in opposite directions: a `start()` that rejects leaves no server, which is visible and costs a retry, while a `stop()` that rejected would leave a postmaster holding the port and the data directory, produced by the one call whose whole job was to prevent that. Teardown is idempotent nearly everywhere for the same reason, `net.Server.close()` and Go's `http.Server.Shutdown` included.
 

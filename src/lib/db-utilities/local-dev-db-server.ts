@@ -383,9 +383,14 @@ export class LocalDevDBServer {
   };
 
   // The child a failed start left behind because it outlived even SIGKILL.
-  // Held as the reference rather than a flag so it needs no clearing: it only
-  // means anything while pgProcess is still that same child, and every other
-  // state either nulls pgProcess or replaces it with a different one.
+  //
+  // The reference rather than a flag, so it answers "which child" and not
+  // merely "some child": it only means anything while pgProcess is still that
+  // same one, and every other state either nulls pgProcess or replaces it with
+  // a different one. That identity check is what makes the field safe to read
+  // without clearing, which is not the same as there being no reason to clear
+  // it — a dead child's handle holds its stdio stream objects, so finalize()
+  // drops this alongside the rest of what that child owned.
   private unstoppableChild: ReturnType<typeof spawn> | null = null;
 
   // The child whose exit this instance currently speaks for, replaced only by
@@ -3137,6 +3142,17 @@ export class LocalDevDBServer {
 
         if (this.pgProcessLifecycle?.proc === proc) {
           this.pgProcessLifecycle = null;
+        }
+
+        // The child a failed start could not kill has now died and been
+        // cleaned up after, so it is no longer in anybody's way and this
+        // instance leaves the `unstoppable` state here. Nothing reads the
+        // field once pgProcess stops pointing at the same child, so clearing
+        // it changes no decision; what it does is let go of a dead child's
+        // handle, and with it the stdio stream objects hanging off it, rather
+        // than hold them for the life of the instance.
+        if (this.unstoppableChild === proc) {
+          this.unstoppableChild = null;
         }
       })();
 
