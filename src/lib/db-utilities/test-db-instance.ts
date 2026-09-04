@@ -199,7 +199,7 @@ export class TestDatabaseInstance {
   private tempDir?: string;
   private port: number;
   /**
-   * Whether {@link findFreePort} chose the port, rather than the caller.
+   * Whether `findFreePort` chose the port, rather than the caller.
    *
    * The retry below is allowed only on a port this picked. See
    * {@link startWithPortRetry}.
@@ -463,8 +463,8 @@ export class TestDatabaseInstance {
    * only one stream to keep them for: embedded-postgres reads the postmaster's
    * stderr alone, and hands every chunk of it to a single `onLog`.
    *
-   * See {@link PostgresOutputReader} for why what is logged is assembled
-   * while {@link attemptOutput} above stays exactly as it arrived.
+   * See `PostgresOutputReader` in ./postgres-output for why what is logged is
+   * assembled while {@link attemptOutput} above stays exactly as it arrived.
    */
   private readonly attemptLines = new PostgresOutputReader();
 
@@ -655,10 +655,10 @@ export class TestDatabaseInstance {
   /**
    * Starts the server, taking another port if this one was claimed in the gap.
    *
-   * The race this closes: {@link findFreePort} confirms a port is free and
-   * then closes the socket it proved it with, and initdb runs between that and
-   * the postmaster binding it. Anything may take the number in between, and
-   * on a busy machine the likeliest thief is the kernel handing it out as the
+   * The race this closes: `findFreePort` in ./free-port confirms a port is
+   * free and then closes the socket it proved it with, and initdb runs between
+   * that and the postmaster binding it. Anything may take the number in
+   * between, and on a busy machine the likeliest thief is the kernel handing it out as the
    * local port for an outgoing connection. Choosing from outside the ephemeral
    * range makes that rare rather than impossible, and a program that binds the
    * port deliberately is not covered by the range choice at all.

@@ -80,7 +80,7 @@ const POSTGRES_SEVERITY_PATTERN =
  *
  * That is NOT how the surfaces log a running server, and the difference is
  * worth knowing before reaching for this. They read through
- * {@link PostgresOutputReader}, which splits the stream into messages and
+ * `PostgresOutputReader` below, which splits the stream into messages and
  * gives each the level it stated, because a routine LOG that happened to
  * arrive in the same chunk as a FATAL is still routine. What both agree on is
  * the thing that would be lost by splitting per LINE: a FATAL is followed by

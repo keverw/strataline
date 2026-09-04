@@ -295,9 +295,9 @@ function getCurrentUser(): string {
 }
 
 /**
- * Configuration for {@link LocalDevDBServer}. Unlike {@link TestDatabaseOptions},
- * the connection fields (`port`, `user`, `password`, `database`, `dataDir`,
- * `pidFile`) are required — the dev server runs on a fixed, predictable port and
+ * Configuration for {@link LocalDevDBServer}. Unlike `TestDatabaseOptions` on
+ * the `strataline/test-db-instance` entry point, the connection fields
+ * (`port`, `user`, `password`, `database`, `dataDir`, `pidFile`) are required — the dev server runs on a fixed, predictable port and
  * data directory rather than a throwaway one. Only `logger`, `onExit`, and
  * `logConnections` are optional.
  */
@@ -815,14 +815,23 @@ export class LocalDevDBServer {
       // running initdb. The branch above cannot see it, so disposing here used
       // to remove the protection silently and say nothing. It no longer
       // removes it for good — startPostgresServer arms again beside the spawn
-      // — and that is exactly why it is worth a line: the call did less than
-      // it looks like it did, and a caller relying on it would find the
+      // — and that is exactly why it is worth a line: the call may do less
+      // than it looks like it did, and a caller relying on it would find the
       // instance managed again with nothing having said so.
+      //
+      // "May", because which of the two happens is not known yet and this line
+      // is written now. A start that goes on to spawn re-registers and undoes
+      // this; one that fails first never spawns, and cleanupFailedStart
+      // releases the handlers on its own, so the disposal stands by a
+      // different route. Both end correctly. Saying flatly that it did not
+      // stick would be wrong in the second case, and a message that overstates
+      // is how a reader stops believing the ones that do not.
       this.log(
         "warn",
-        "dispose() was called while a start is in flight, so it did not stick: that start registers " +
-          "itself again when it spawns, and the server it creates will still be stopped when this " +
-          "process exits. Call dispose() again once start() has settled if that is not what you want.",
+        "dispose() was called while a start is in flight, so it may not stick: if that start gets as " +
+          "far as spawning a server, it registers this instance again, and that server will still be " +
+          "stopped when this process exits. Call dispose() again once start() has settled if that is " +
+          "not what you want.",
       );
     }
 

@@ -52,8 +52,8 @@ import { fileExists, getFilePresence } from "./file-presence";
  * fingerprint only describes the process it was taken from while identifying.
  *
  * One platform note recurs with them: macOS reports a flat command line, so an
- * argument containing a space cannot be recovered by parsing. See
- * {@link ParsedDataDir} for what that costs and how it is signaled.
+ * argument containing a space cannot be recovered by parsing. See the
+ * `ParsedDataDir` interface below for what that costs and how it is signaled.
  */
 
 /**
@@ -281,7 +281,7 @@ const bootTimeMemo = createRetryingMemo(detectBootTime);
  * platform is not supported.
  *
  * A real reading is remembered, and so is a platform having no probe at all; a
- * probe that merely FAILED is not — see {@link createRetryingMemo}.
+ * probe that merely FAILED is not — see `createRetryingMemo` above.
  */
 export function getSystemBootTime(): number | null {
   return bootTimeMemo.get();
@@ -1096,7 +1096,7 @@ export interface VerifyPidResult {
    *
    * The difference matters wherever a heuristic about the past could otherwise
    * overrule what the live process says about itself; see
-   * {@link probeStatusFromFiles}.
+   * `probeStatusFromFiles` below.
    */
   verifiedBy: "command" | "clock" | null;
   kind: DevDBStaleKind | null;
