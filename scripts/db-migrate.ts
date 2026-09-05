@@ -1,7 +1,8 @@
 // Load environment variables - this is only needed if you are using Node.js, Bun does not need it
 // import 'dotenv/config'
 
-import { RunStratalineCLI, createCLIConsoleLogger } from "../src/cli";
+import { RunStratalineCLI } from "../src/cli";
+import { createConsoleLogger } from "../src/logger";
 import type { Migration } from "../src/migration";
 
 // For a real application, you would import your migrations
@@ -10,7 +11,7 @@ const migrations: Migration[] = [];
 
 // Use the built-in CLI console logger
 // You can customize this or implement your own logger if needed
-const logger = createCLIConsoleLogger(true);
+const logger = createConsoleLogger();
 
 // Run the CLI with environment variables.
 // The returned result carries a distinct exit code per outcome:
