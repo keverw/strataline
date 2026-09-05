@@ -355,6 +355,26 @@ describe("readPostmasterPidFile", () => {
 });
 
 describe("isProcessAlive", () => {
+  /** Runs `work` with `process.kill` replaced, restoring it either way. */
+  function withKill(fake: typeof process.kill, work: () => void): void {
+    const real = process.kill;
+
+    process.kill = fake;
+
+    try {
+      work();
+    } finally {
+      process.kill = real;
+    }
+  }
+
+  /** A `process.kill` that always fails with `code`. */
+  function failingWith(code: string): typeof process.kill {
+    return (() => {
+      throw Object.assign(new Error(`kill: ${code}`), { code });
+    }) as unknown as typeof process.kill;
+  }
+
   test("is true for this process", () => {
     expect(isProcessAlive(process.pid)).toBe(true);
   });
@@ -366,6 +386,47 @@ describe("isProcessAlive", () => {
   test("is false for nonsense input", () => {
     expect(isProcessAlive(0)).toBe(false);
     expect(isProcessAlive(-1)).toBe(false);
+  });
+
+  // The errno branch is driven through a stubbed `process.kill` rather than a
+  // real PID, because what is under test is which errno counts as absence and
+  // no PID names one of them on demand. Aiming at PID 1 gets EPERM only for an
+  // unprivileged user: as root the call simply succeeds, so a test written
+  // that way passes without the code it exists to hold. clean-ipc.test.ts
+  // stubs the same way, for the same reason.
+  test("reads ESRCH as the number being free", () => {
+    // The one answer that licenses deleting a postmaster.pid, since it is the
+    // only one that says nothing holds the number.
+    withKill(failingWith("ESRCH"), () => {
+      expect(isProcessAlive(4242)).toBe(false);
+    });
+  });
+
+  test("reads EPERM as alive, since something is there", () => {
+    // POSIX for a process belonging to another user. It is alive, and it is
+    // certainly not a server this spawned.
+    withKill(failingWith("EPERM"), () => {
+      expect(isProcessAlive(4242)).toBe(true);
+    });
+  });
+
+  test("reads EACCES as alive, which is what Windows says instead", () => {
+    // libuv opens the process to signal it and maps ERROR_ACCESS_DENIED to
+    // EACCES rather than EPERM, so a postmaster started from an elevated shell
+    // reaches here. Read as absence it took verifyPid to `process-gone`, and a
+    // start then deleted the postmaster.pid of a server that was running.
+    withKill(failingWith("EACCES"), () => {
+      expect(isProcessAlive(4242)).toBe(true);
+    });
+  });
+
+  test("reads an unrecognized failure as alive", () => {
+    // Absence of evidence is not evidence of absence. An errno this does not
+    // know about is not ESRCH, so it is not an absence, and only positive
+    // disproof may license destroying a record.
+    withKill(failingWith("EINVAL"), () => {
+      expect(isProcessAlive(4242)).toBe(true);
+    });
   });
 });
 

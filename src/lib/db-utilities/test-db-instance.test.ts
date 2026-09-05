@@ -1011,6 +1011,37 @@ describe("getLifecycleState", () => {
     expect(db.isReady()).toBe(false);
   });
 
+  it("reports stopping while a teardown is in flight", () => {
+    const db = new TestDatabaseInstance();
+    const internals = db as unknown as { cleanupInFlight: unknown };
+
+    internals.cleanupInFlight = new Promise<void>(() => {});
+
+    expect(db.getLifecycleState()).toBe("stopping");
+    expect(db.isReady()).toBe(false);
+  });
+
+  it("reports stopping while a retry stop runs against a retained server", () => {
+    const db = new TestDatabaseInstance();
+    const internals = db as unknown as {
+      unstoppedServer: unknown;
+      cleanupInFlight: unknown;
+    };
+
+    // Both at once is what a RETRY stop looks like: the server a previous stop
+    // gave up on is still held, and a fresh teardown is running against it.
+    // That instance is mid-teardown rather than resting, so start() throws and
+    // stop() JOINS the teardown already running rather than trying again —
+    // which is the `stopping` row, not the `unstoppable` one. It is also the
+    // row LocalDevDBServer reports for the same situation, and the two
+    // surfaces answering one LifecycleState is the whole point of the type.
+    internals.unstoppedServer = {};
+    internals.cleanupInFlight = new Promise<void>(() => {});
+
+    expect(db.getLifecycleState()).toBe("stopping");
+    expect(db.isReady()).toBe(false);
+  });
+
   it("reports running only while there is a pool to query", async () => {
     const db = new TestDatabaseInstance();
 

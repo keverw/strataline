@@ -288,23 +288,33 @@ export class TestDatabaseInstance {
    * two cannot disagree, being read from the same two fields.
    */
   public getLifecycleState(): LifecycleState {
-    // Ordered as the guards in start() are, so the answer and the refusal
-    // cannot disagree. A teardown clears `pool` before it waits on the server,
-    // so reading the pool first would call an instance being torn down
-    // `stopped` and promise a start() that in fact throws.
+    // Ordered so the answer and the refusal cannot disagree, which is not
+    // quite the order start() guards in — see the retained-server note below.
+    // A teardown clears `pool` before it waits on the server, so reading the
+    // pool first would call an instance being torn down `stopped` and promise
+    // a start() that in fact throws.
     if (this.startInFlight) {
       return "starting";
     }
 
-    // Ahead of the teardown check, which cannot tell the two apart: a stop
-    // that gave up has finished, so nothing is in flight by then, and the
-    // retained server is the only thing saying the instance still holds one.
-    if (this.unstoppedServer) {
-      return "unstoppable";
-    }
-
+    // Ahead of the retained server, in the order `LocalDevDBServer` reads its
+    // own two fields. A stop that gave up has finished, so the ordinary way to
+    // hold `unstoppedServer` is with nothing in flight — but a RETRY stop sets
+    // both at once, and that instance is mid-teardown rather than resting:
+    // start() throws and stop() joins the one already running, which is the
+    // `stopping` row rather than the `unstoppable` one. Reading the retained
+    // server first answered `unstoppable` there, so the two surfaces this type
+    // exists to unify gave opposite answers for the same situation.
     if (this.cleanupInFlight) {
       return "stopping";
+    }
+
+    // Nothing in flight, so the retained server is the only thing saying this
+    // instance still holds one. Behind the teardown check for the reason
+    // above, and ahead of the pool below, which cannot see it: a stop that
+    // gave up leaves no pool and would otherwise read `stopped`.
+    if (this.unstoppedServer) {
+      return "unstoppable";
     }
 
     return this.isRunning && this.pool ? "running" : "stopped";

@@ -1000,8 +1000,10 @@ export function dataDirFromCommand(command: string): string | null {
 }
 
 /**
- * Checks whether *some* process exists at this PID. This proves only that the
- * number is in use — never that the process is ours. Always pair it with
+ * Checks whether this PID is free. Only a definitive `false` is a claim: the
+ * number holds nothing. `true` is the number being in use OR a question this
+ * could not answer, since only positive disproof may license deleting a
+ * record. It never says the process is ours. Always pair it with
  * {@link verifyPid}.
  */
 export function isProcessAlive(pid: number): boolean {
@@ -1015,9 +1017,20 @@ export function isProcessAlive(pid: number): boolean {
 
     return true;
   } catch (e) {
-    // EPERM means the process exists but belongs to another user, so it is
-    // alive but definitely not a server we spawned.
-    return (e as NodeJS.ErrnoException)?.code === "EPERM";
+    // ESRCH is the only answer that means the number is free. Everything else
+    // is a process that IS there and could not be signaled, or a question this
+    // could not get an answer to, and neither licenses treating the record as
+    // stale — `false` here reaches verifyPid as `process-gone`, which is what
+    // authorizes deleting a postmaster.pid.
+    //
+    // POSIX reports EPERM for a process belonging to another user. Windows
+    // reports EACCES for the same thing: libuv opens the process to signal it
+    // and maps ERROR_ACCESS_DENIED that way, so an elevated postmaster used to
+    // read as a number nobody holds. Named by what is decisive rather than by
+    // listing
+    // the two, so a platform with a third errno for "not yours" is not a
+    // silently wrong answer as well.
+    return (e as NodeJS.ErrnoException)?.code !== "ESRCH";
   }
 }
 
