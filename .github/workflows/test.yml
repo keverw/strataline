@@ -1,0 +1,206 @@
+name: Test
+
+# `push` and `pull_request` read this file from the commit being tested, so a
+# workflow added on a feature branch runs there without being merged first.
+# `workflow_dispatch` is different: its button only appears once the file is on
+# the default branch. It is listed here so it works after the merge, and is not
+# what this relies on to run in the meantime.
+#
+# `push` is deliberately unfiltered for now, so this runs on the branch it was
+# added on rather than waiting for a merge. The cost is that a pull request
+# from a branch in this repository matches both triggers and runs twice. Once
+# this is on the default branch, narrow it to avoid that:
+#
+#   push:
+#     branches: [main]
+#
+# which leaves pull requests covered by the `pull_request` trigger alone.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same branch cancels the run it supersedes. The suite starts
+# a real PostgreSQL per test file, so overlapping runs are not free.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      # Every platform reports, rather than the first failure canceling the
+      # rest. The point of the matrix is knowing which ones are broken.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    # The suite talks to a real PostgreSQL and starts and stops it repeatedly,
+    # so it is slower than a unit-test run and the default six hours is no
+    # bound at all for a job that has hung.
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # The lockfile is the point: a resolution that drifts per platform would
+      # make a failure here a question about the install rather than the code.
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Type check
+        run: bun run type-check
+
+      - name: Lint
+        run: bun run lint
+
+      # Bun's own default timeout is per test. The suite already passes
+      # --timeout, and the job timeout above is what covers a wedged run.
+      # Named by platform, both of them, because a skipped step is still listed
+      # in every job. Called "Test" and "Test (as a non-administrator)" they
+      # read as one run and one variant, and whichever is greyed out looks
+      # arbitrary. Saying which platform each is for makes the skip explain
+      # itself from the step list alone.
+      - name: Test (Linux and macOS)
+        if: runner.os != 'Windows'
+        run: bun run test
+
+      # PostgreSQL refuses to start under an account with administrative
+      # privileges, by design and with no way to override it:
+      #
+      #   Execution of PostgreSQL by a user with administrative permissions is
+      #   not permitted.
+      #
+      # GitHub's Windows runner IS such an account, so every test that needs a
+      # database failed there while everything else passed. embedded-postgres
+      # has no answer either: its `createPostgresUser` option reads
+      # `process.getuid()`, which does not exist on Windows.
+      #
+      # So the suite is run as a local user made for it. Start-Process is what
+      # can launch under other credentials and still be waited on for an exit
+      # code, at the cost of not being able to share this console, hence the
+      # redirected output read back afterwards.
+      - name: Test (Windows, as a non-administrator)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = 'pgrunner'
+          $plain = 'Str@taline-CI-' + [guid]::NewGuid().ToString('N').Substring(0, 12)
+          $password = ConvertTo-SecureString $plain -AsPlainText -Force
+
+          New-LocalUser -Name $name -Password $password -AccountNeverExpires -PasswordNeverExpires | Out-Null
+          Add-LocalGroupMember -Group 'Users' -Member $name
+
+          # The workspace, and the Bun install that lives outside it. Both have
+          # to be readable and executable by an account that did not create
+          # them, and the data directories the suite makes must be writable.
+          icacls $env:GITHUB_WORKSPACE /grant "${name}:(OI)(CI)F" /T /Q | Out-Null
+          icacls $env:USERPROFILE\.bun /grant "${name}:(OI)(CI)RX" /T /Q | Out-Null
+
+          # TEMP points into the runner's own profile, which this account
+          # cannot read: the suite creates its data directories there through
+          # tmp.dir(), and every one of them failed with
+          # "EPERM: operation not permitted, lstat 'C:\Users\RUNNER~1\AppData'".
+          # Start-Process passes the caller's environment on unless told to
+          # build a new one, so redirecting it here is enough.
+          $temp = Join-Path $env:GITHUB_WORKSPACE 'ci-temp'
+          New-Item -ItemType Directory -Path $temp -Force | Out-Null
+          icacls $temp /grant "${name}:(OI)(CI)F" /T /Q | Out-Null
+          $env:TEMP = $temp
+          $env:TMP = $temp
+
+          $bun = (Get-Command bun).Source
+          $credential = New-Object System.Management.Automation.PSCredential($name, $password)
+
+          # Created before the readers below open them, and emptied so a
+          # rerun on the same runner cannot show the previous attempt's output.
+          $outFile = Join-Path $env:GITHUB_WORKSPACE 'bun-test-out.txt'
+          $errFile = Join-Path $env:GITHUB_WORKSPACE 'bun-test-err.txt'
+          Set-Content -Path $outFile -Value '' -NoNewline
+          Set-Content -Path $errFile -Value '' -NoNewline
+          icacls $outFile /grant "${name}:F" /Q | Out-Null
+          icacls $errFile /grant "${name}:F" /Q | Out-Null
+
+          # No -Wait, so the two files can be followed while the run is still
+          # going. Waiting on the process and printing afterwards means four
+          # minutes of a job that appears to be doing nothing, with no way to
+          # tell a suite that is working through its tests from one that has
+          # wedged on the first.
+          $process = Start-Process -FilePath $bun -ArgumentList 'run', 'test' `
+            -Credential $credential `
+            -WorkingDirectory $env:GITHUB_WORKSPACE `
+            -RedirectStandardOutput $outFile `
+            -RedirectStandardError $errFile `
+            -PassThru
+
+          # ReadWrite sharing, because the child still holds these open for
+          # writing. Anything less fails to open them at all.
+          function Open-Follow($path) {
+            [System.IO.StreamReader]::new(
+              [System.IO.File]::Open(
+                $path,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::ReadWrite))
+          }
+
+          # Flat, deliberately: `@(a), @(b)` builds an array OF arrays, and the
+          # loop below would then call ReadLine on an array rather than a
+          # reader.
+          $readers = @((Open-Follow $outFile), (Open-Follow $errFile))
+
+          function Write-Pending($readers) {
+            foreach ($reader in $readers) {
+              while ($null -ne ($line = $reader.ReadLine())) {
+                Write-Host $line
+              }
+            }
+          }
+
+          # Shorter than the job's own timeout, and the difference is the
+          # point. A job killed at its timeout takes the step with it and
+          # reports nothing, so a run that hangs teaches nothing at all. Ending
+          # it here means the output above has already been streamed, the tree
+          # is killed rather than left holding a postmaster, and the failure
+          # says it was a hang rather than looking like an ordinary one.
+          $deadline = (Get-Date).AddMinutes(14)
+          $timedOut = $false
+
+          while (-not $process.HasExited) {
+            Write-Pending $readers
+
+            if ((Get-Date) -gt $deadline) {
+              $timedOut = $true
+              Write-Host "::error::bun test did not finish within 14 minutes. Killing it; the output above is where it stopped."
+              # The whole tree: a stuck test usually means a postmaster is
+              # still up, and killing only bun would leave it running.
+              $process.Kill($true)
+              break
+            }
+
+            Start-Sleep -Milliseconds 250
+          }
+
+          $process.WaitForExit()
+
+          # Once more after it exits, for whatever was written between the last
+          # poll and the process going away.
+          Write-Pending $readers
+
+          foreach ($reader in $readers) {
+            $reader.Dispose()
+          }
+
+          if ($timedOut) {
+            exit 1
+          }
+
+          exit $process.ExitCode

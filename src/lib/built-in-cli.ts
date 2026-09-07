@@ -4,110 +4,46 @@ import {
   type MigrationResult,
 } from "./migration-system";
 import { Pool } from "pg";
-import { Logger, LogDataInput, BaseLogger, getErrorMessage } from "./logger";
+import { makeSafeLogger } from "./callback-safety";
+import { createPrefixedLogger, getErrorMessage, type Logger } from "./logger";
 
 /**
- * Logger function type for Strataline CLI
+ * A configured value that must BE a whole number, not merely start with one.
+ *
+ * `parseInt` takes a prefix and stops at the first character it cannot use,
+ * so `5432oops` reads as 5432, `4.5` as 4, and `1000ms` as 1000. Every one of
+ * those then passes the range check at its call site and silently configures
+ * something other than what was written. The truncated timeout is the quiet
+ * one: nothing ever fails, the pool just behaves differently than the
+ * environment says it should, and there is no message anywhere connecting the
+ * two.
+ *
+ * Null for anything that is not a run of digits, which each caller turns into
+ * the same error a value outside the range gets, naming the variable and
+ * showing what was read. That is the rule `parseWholeInteger` in
+ * ./db-utilities/pid-file already applies to PID records, for the same
+ * reason: a number that has to be trusted has to be the whole of what was
+ * written.
+ *
+ * Digits only, so a negative is rejected here rather than by the range check
+ * below it. None of these settings has a meaning below zero, and every one of
+ * them is bounded at or above it by its caller, so nothing is lost.
  */
-export type CLILoggerFunction = (
-  type:
-    | "info"
-    | "error"
-    | "warn"
-    | "migrate-info"
-    | "migrate-error"
-    | "migrate-warn",
-  message: string,
-) => void;
+function parseWholeNumber(value: string): number | null {
+  const trimmed = value.trim();
 
-/**
- * Console-based logger implementation for Strataline CLI
- * @param migrateVerbose Whether to log verbose migration messages
- */
-export const createCLIConsoleLogger = (
-  migrateVerbose: boolean = true,
-): CLILoggerFunction => {
-  return (type, message) => {
-    switch (type) {
-      case "info":
-        // eslint-disable-next-line no-console
-        console.log(message);
-        break;
-      case "error":
-        // eslint-disable-next-line no-console
-        console.error(message);
-        break;
-      case "warn":
-        // eslint-disable-next-line no-console
-        console.warn(message);
-        break;
-      case "migrate-info":
-        if (migrateVerbose) {
-          // eslint-disable-next-line no-console
-          console.log(`[MIGRATE-INFO] ${message}`);
-        }
-        break;
-      case "migrate-error":
-        // eslint-disable-next-line no-console
-        console.error(`[MIGRATE-ERROR] ${message}`);
-        break;
-      case "migrate-warn":
-        // eslint-disable-next-line no-console
-        console.warn(`[MIGRATE-WARN] ${message}`);
-        break;
-    }
-  };
-};
-
-/**
- * Adapter that converts between the Strataline Logger interface and our CLI logger
- * This separates CLI tool logs from migration system logs while preserving severity levels
- */
-class CLIStratalineLogger extends BaseLogger implements Logger {
-  private cliLogger: CLILoggerFunction;
-
-  constructor(logger: CLILoggerFunction) {
-    super();
-    this.cliLogger = logger;
+  if (!/^\d+$/.test(trimmed)) {
+    return null;
   }
 
-  info(data: LogDataInput): void {
-    const taskPrefix = data.task ? `[${data.task}]` : "";
-    const stagePrefix = data.stage ? `[${data.stage}]` : "";
-    const prefix = `${taskPrefix} ${stagePrefix}`.trim();
-    const message = prefix ? `${prefix} ${data.message}` : data.message;
+  const parsed = Number(trimmed);
 
-    // All info logs through this adapter are migration-related
-    this.cliLogger("migrate-info", message);
-  }
-
-  error(data: LogDataInput): void {
-    const taskPrefix = data.task ? `[${data.task}]` : "";
-    const stagePrefix = data.stage ? `[${data.stage}]` : "";
-    const prefix = `${taskPrefix} ${stagePrefix}`.trim();
-    const errorMsg = data.error
-      ? `${data.message}: ${getErrorMessage(data.error)}`
-      : data.message;
-    const message = prefix ? `${prefix} ${errorMsg}` : errorMsg;
-
-    // All errors through this adapter are migration-related
-    this.cliLogger("migrate-error", message);
-  }
-
-  warn(data: LogDataInput): void {
-    const taskPrefix = data.task ? `[${data.task}]` : "";
-    const stagePrefix = data.stage ? `[${data.stage}]` : "";
-    const prefix = `${taskPrefix} ${stagePrefix}`.trim();
-    const message = prefix ? `${prefix} ${data.message}` : data.message;
-
-    // All warnings through this adapter are migration-related
-    this.cliLogger("migrate-warn", message);
-  }
+  return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
 async function testConnection(
   pool: Pool,
-  logger: CLILoggerFunction,
+  logger: Logger,
   loadedFrom: "env" | "pool" = "env",
   envPrefix: string = "",
   env: Record<string, string | undefined> = process.env,
@@ -117,20 +53,22 @@ async function testConnection(
 
     try {
       await client.query("SELECT 1");
-      logger("info", "Successfully connected to database");
+      logger.info({ message: "Successfully connected to database" });
       return true;
     } finally {
       client.release();
     }
   } catch (error: unknown) {
     // Log the error with detailed connection information
-    logger("error", "Error connecting to database:");
+    logger.error({ message: "Error connecting to database:" });
     const errorMessage = error instanceof Error ? error.message : String(error);
-    logger("error", `→ ${errorMessage}`);
+    logger.error({ message: `→ ${errorMessage}` });
 
     // Only show environment variable details if we're using env mode
     if (loadedFrom === "env") {
-      logger("error", "\nPlease check your database connection settings:");
+      logger.error({
+        message: "\nPlease check your database connection settings:",
+      });
 
       // Use the environment variables with the correct prefix
       const host = env[`${envPrefix}POSTGRES_HOST`];
@@ -138,18 +76,20 @@ async function testConnection(
       const database = env[`${envPrefix}POSTGRES_DATABASE`];
       const user = env[`${envPrefix}POSTGRES_USER`];
 
-      logger("error", `→ Host: ${host}`);
-      logger("error", `→ Port: ${port}`);
-      logger("error", `→ Database: ${database}`);
-      logger("error", `→ User: ${user}`);
+      logger.error({ message: `→ Host: ${host}` });
+      logger.error({ message: `→ Port: ${port}` });
+      logger.error({ message: `→ Database: ${database}` });
+      logger.error({ message: `→ User: ${user}` });
     } else {
-      logger(
-        "error",
-        "\nPlease check that the provided database pool is configured correctly.",
-      );
+      logger.error({
+        message:
+          "\nPlease check that the provided database pool is configured correctly.",
+      });
     }
 
-    logger("error", "\nMake sure PostgreSQL is running and accessible.");
+    logger.error({
+      message: "\nMake sure PostgreSQL is running and accessible.",
+    });
 
     return false;
   }
@@ -170,20 +110,25 @@ async function runMigrations(
   pool: Pool,
   mode: "job" | "distributed",
   migrations: Migration[],
-  logger: CLILoggerFunction,
+  logger: Logger,
   signal?: AbortSignal,
 ): Promise<MigrationResult> {
-  logger("info", `Initializing database migration manager in ${mode} mode...`);
+  logger.info({
+    message: `Initializing database migration manager in ${mode} mode...`,
+  });
 
-  // Create migration manager with our adapter for logging
-  const stratalineLogger = new CLIStratalineLogger(logger);
+  // Stamped as the migration system's lines rather than the CLI's own. The
+  // ordinary prefixer does it, since a source is a field like task and stage.
+  const stratalineLogger = createPrefixedLogger(logger, {
+    source: "migration",
+  });
   const manager = new MigrationManager(pool, stratalineLogger);
 
   // Register all migrations from the config
   manager.register(migrations);
 
   // Run pending migrations
-  logger("info", "Running pending schema changes...");
+  logger.info({ message: "Running pending schema changes..." });
   const result = await manager.runSchemaChanges(mode, { signal });
 
   if (result.success) {
@@ -193,33 +138,31 @@ async function runMigrations(
     // Lead with a clear, human summary so it's obvious at a glance whether
     // anything happened, rather than leaving the reader to parse the lists.
     if (appliedNow === 0 && previouslyApplied === 0) {
-      logger("info", "No migrations registered — nothing to do.");
+      logger.info({ message: "No migrations registered — nothing to do." });
     } else if (appliedNow === 0) {
-      logger(
-        "info",
-        `✓ Already up to date — all ${previouslyApplied} migration(s) were applied in previous runs.`,
-      );
+      logger.info({
+        message: `✓ Already up to date — all ${previouslyApplied} migration(s) were applied in previous runs.`,
+      });
     } else {
-      logger("info", `✓ Applied ${appliedNow} migration(s) in this run.`);
+      logger.info({
+        message: `✓ Applied ${appliedNow} migration(s) in this run.`,
+      });
     }
 
     // Always show migrations applied in this run (even if none)
-    logger(
-      "info",
-      `Applied during this run: ${result.completedMigrations.join(", ") || "none"}`,
-    );
+    logger.info({
+      message: `Applied during this run: ${result.completedMigrations.join(", ") || "none"}`,
+    });
 
     // Always show migrations that were already applied in previous runs (even if none)
-    logger(
-      "info",
-      `Previously applied: ${result.previouslyAppliedMigrations.join(", ") || "none"}`,
-    );
+    logger.info({
+      message: `Previously applied: ${result.previouslyAppliedMigrations.join(", ") || "none"}`,
+    });
 
     // Always show pending migrations (even if none)
-    logger(
-      "info",
-      `Pending migrations: ${result.pendingMigrations.join(", ") || "none"}`,
-    );
+    logger.info({
+      message: `Pending migrations: ${result.pendingMigrations.join(", ") || "none"}`,
+    });
 
     return result;
   } else {
@@ -229,58 +172,58 @@ async function runMigrations(
     // caller-requested graceful shutdown.
     switch (result.status) {
       case "deferred":
-        logger("warn", `⏸ Migration run paused — deferred: ${result.reason}`);
+        logger.warn({
+          message: `⏸ Migration run paused — deferred: ${result.reason}`,
+        });
         break;
       case "locked":
-        logger("warn", `⏭ Migration run skipped: ${result.reason}`);
+        logger.warn({ message: `⏭ Migration run skipped: ${result.reason}` });
         break;
       case "aborted":
-        logger("warn", `⏹ Migration run aborted: ${result.reason}`);
+        logger.warn({ message: `⏹ Migration run aborted: ${result.reason}` });
         break;
       case "lock_lost":
         // Unsafe condition — log loudly, but it's returned (not thrown) with
         // its own exit code so callers can distinguish it from a generic error.
-        logger("error", `✗ Migration lock lost mid-run: ${result.reason}`);
+        logger.error({
+          message: `✗ Migration lock lost mid-run: ${result.reason}`,
+        });
         break;
       default:
-        logger("error", `✗ Migration failed: ${result.reason}`);
+        logger.error({ message: `✗ Migration failed: ${result.reason}` });
         break;
     }
 
-    logger(
-      "info",
-      `Completed during this run: ${result.completedMigrations.join(", ") || "none"}`,
-    );
+    logger.info({
+      message: `Completed during this run: ${result.completedMigrations.join(", ") || "none"}`,
+    });
 
     if (
       result.previouslyAppliedMigrations &&
       result.previouslyAppliedMigrations.length > 0
     ) {
-      logger(
-        "info",
-        `Previously applied migrations: ${result.previouslyAppliedMigrations.join(", ")}`,
-      );
+      logger.info({
+        message: `Previously applied migrations: ${result.previouslyAppliedMigrations.join(", ")}`,
+      });
     }
 
     // Remaining work is always surfaced when a run ends early.
-    logger(
-      "info",
-      `Pending migrations: ${result.pendingMigrations.join(", ") || "none"}`,
-    );
+    logger.info({
+      message: `Pending migrations: ${result.pendingMigrations.join(", ") || "none"}`,
+    });
 
     if (result.lastAttemptedMigration) {
-      logger(
-        "info",
-        `Last attempted migration: ${result.lastAttemptedMigration}`,
-      );
+      logger.info({
+        message: `Last attempted migration: ${result.lastAttemptedMigration}`,
+      });
     }
 
     // Show raw error details if available for debugging (unhandled exceptions only)
     if (result.error) {
-      logger("error", `Error details: ${result.error.message}`);
+      logger.error({ message: `Error details: ${result.error.message}` });
 
       if (result.error.stack) {
-        logger("error", `Stack trace: ${result.error.stack}`);
+        logger.error({ message: `Stack trace: ${result.error.stack}` });
       }
     }
 
@@ -304,10 +247,13 @@ async function runMigrations(
 async function showMigrationStatus(
   pool: Pool,
   migrations: Migration[],
-  logger: CLILoggerFunction,
+  logger: Logger,
 ): Promise<void> {
-  // Create migration manager with our adapter for logging
-  const stratalineLogger = new CLIStratalineLogger(logger);
+  // Stamped as the migration system's lines rather than the CLI's own. The
+  // ordinary prefixer does it, since a source is a field like task and stage.
+  const stratalineLogger = createPrefixedLogger(logger, {
+    source: "migration",
+  });
   const manager = new MigrationManager(pool, stratalineLogger);
 
   // Register all migrations from the config
@@ -316,11 +262,11 @@ async function showMigrationStatus(
   // Get migration status
   const status = await manager.getMigrationStatus();
 
-  logger("info", "\nMigration Status:");
-  logger("info", "=================");
+  logger.info({ message: "\nMigration Status:" });
+  logger.info({ message: "=================" });
 
   if (status.length === 0) {
-    logger("info", "No migrations have been applied yet.");
+    logger.info({ message: "No migrations have been applied yet." });
   } else {
     const formatDate = (completedAt: number): string =>
       completedAt
@@ -383,11 +329,11 @@ async function showMigrationStatus(
     const renderRow = (cells: string[]): string =>
       cells.map((cell, col) => cell.padEnd(widths[col])).join(" | ");
 
-    logger("info", renderRow(headers));
-    logger("info", widths.map((w) => "-".repeat(w)).join("-+-"));
+    logger.info({ message: renderRow(headers) });
+    logger.info({ message: widths.map((w) => "-".repeat(w)).join("-+-") });
 
     for (const row of rows) {
-      logger("info", renderRow(row));
+      logger.info({ message: renderRow(row) });
     }
   }
 }
@@ -459,11 +405,16 @@ export async function RunStratalineCLI(config: {
   loadFrom: "env" | "pool";
   envPrefix?: string; // Prefix for env vars, e.g., "API_" for "API_POSTGRES_USER"
   pool?: Pool;
-  logger: CLILoggerFunction;
+  logger: Logger;
   argv?: string[];
   env?: Record<string, string | undefined>;
   signal?: AbortSignal;
 }): Promise<StratalineCLIResult> {
+  // Wrapped once on the way in, so no call site below has to remember to guard
+  // it: a logger that throws, or an `async` one that rejects, loses its line
+  // and degrades rather than ending the process. See makeSafeLogger.
+  const logger = makeSafeLogger(config.logger);
+
   let poolInstance: Pool | undefined;
 
   // Validate configuration
@@ -494,15 +445,15 @@ export async function RunStratalineCLI(config: {
     if (missingEnvVars.length > 0) {
       const formattedVars = missingEnvVars.map((v) => prefix + v);
 
-      config.logger(
-        "error",
-        "Missing required environment variables: " + formattedVars.join(", "),
-      );
+      logger.error({
+        message:
+          "Missing required environment variables: " + formattedVars.join(", "),
+      });
 
-      config.logger(
-        "error",
-        "Please ensure all required database configuration is set in your .env file or environment variables.",
-      );
+      logger.error({
+        message:
+          "Please ensure all required database configuration is set in your .env file or environment variables.",
+      });
 
       throw new Error(
         "Missing required environment variables: " + formattedVars.join(", "),
@@ -517,10 +468,11 @@ export async function RunStratalineCLI(config: {
 
     // Parse and validate port. POSTGRES_PORT is required and already confirmed
     // present by the missing-vars check above; the `?? ""` only satisfies the
-    // type (an empty string parses to NaN, which the range check below rejects).
-    const port = parseInt(portValue ?? "", 10);
+    // type (an empty string is not a whole number, which the check below
+    // rejects along with everything else that is not one).
+    const port = parseWholeNumber(portValue ?? "");
 
-    if (isNaN(port) || port <= 0 || port > 65535) {
+    if (port === null || port <= 0 || port > 65535) {
       throw new Error(
         "Invalid " +
           prefix +
@@ -533,9 +485,9 @@ export async function RunStratalineCLI(config: {
     let maxConnections = 20;
 
     if (maxConnectionsValue) {
-      maxConnections = parseInt(maxConnectionsValue, 10);
+      const parsed = parseWholeNumber(maxConnectionsValue);
 
-      if (isNaN(maxConnections) || maxConnections <= 0) {
+      if (parsed === null || parsed <= 0) {
         throw new Error(
           "Invalid " +
             prefix +
@@ -543,14 +495,16 @@ export async function RunStratalineCLI(config: {
             maxConnectionsValue,
         );
       }
+
+      maxConnections = parsed;
     }
 
     let idleTimeout = 30000;
 
     if (idleTimeoutValue) {
-      idleTimeout = parseInt(idleTimeoutValue, 10);
+      const parsed = parseWholeNumber(idleTimeoutValue);
 
-      if (isNaN(idleTimeout) || idleTimeout < 0) {
+      if (parsed === null || parsed < 0) {
         throw new Error(
           "Invalid " +
             prefix +
@@ -558,14 +512,16 @@ export async function RunStratalineCLI(config: {
             idleTimeoutValue,
         );
       }
+
+      idleTimeout = parsed;
     }
 
     let connectionTimeout = 2000;
 
     if (connectionTimeoutValue) {
-      connectionTimeout = parseInt(connectionTimeoutValue, 10);
+      const parsed = parseWholeNumber(connectionTimeoutValue);
 
-      if (isNaN(connectionTimeout) || connectionTimeout < 0) {
+      if (parsed === null || parsed < 0) {
         throw new Error(
           "Invalid " +
             prefix +
@@ -573,6 +529,8 @@ export async function RunStratalineCLI(config: {
             connectionTimeoutValue,
         );
       }
+
+      connectionTimeout = parsed;
     }
 
     poolInstance = new Pool({
@@ -586,9 +544,10 @@ export async function RunStratalineCLI(config: {
       connectionTimeoutMillis: connectionTimeout,
     });
   } else if (config.loadFrom === "pool") {
-    // Validate *before* adopting the pool. Once poolInstance is set, the
-    // try/finally below owns it and calls pool.end() — including on the
-    // caller-supplied pool. A validation throw here happens before that block, so
+    // Validate *before* adopting the pool. Once poolInstance is set, the run
+    // below owns it and closes it on the way out — including the
+    // caller-supplied pool, unconditionally, since there is no option to opt
+    // out of that. A validation throw here happens before any of it, so
     // assigning poolInstance first would leave a caller's pool open on the
     // envPrefix misconfiguration. Check everything up front, then adopt.
 
@@ -608,10 +567,9 @@ export async function RunStratalineCLI(config: {
   // set up migration manager
   if (poolInstance) {
     poolInstance.on("error", (err) => {
-      config.logger(
-        "error",
-        `Unexpected error on idle client in PostgreSQL pool: ${err.message}`,
-      );
+      logger.error({
+        message: `Unexpected error on idle client in PostgreSQL pool: ${err.message}`,
+      });
     });
 
     // Get the operation from command line arguments (use provided argv or fall back to process.argv)
@@ -619,11 +577,41 @@ export async function RunStratalineCLI(config: {
     const operation = args[2] || "help";
     const isDistributed = args.includes("--distributed");
 
+    /**
+     * Closes the adopted pool, reporting rather than raising a failure to.
+     *
+     * For the path where the run has already failed. That failure is the one
+     * worth raising, and a close error would displace it: the pool is adopted,
+     * including a caller-supplied one (see the ownership note above), so
+     * calling this twice with the same pool has pg reject the second close
+     * with "Called end on pool more than once" -- and the second run has by
+     * then already failed at testConnection against a closed pool, which is
+     * the diagnosis that names the actual mistake.
+     */
+    const closePoolReportingFailure = async (): Promise<void> => {
+      try {
+        await poolInstance.end();
+      } catch (closeError: unknown) {
+        logger.error({
+          message: `Error: could not close the PostgreSQL pool: ${getErrorMessage(
+            closeError,
+          )}. Reporting the earlier failure instead.`,
+        });
+      }
+    };
+
+    // Assigned in every branch of the switch below, then returned after the
+    // pool has been closed rather than from inside the try. The close used to
+    // sit in a `finally`, where an `await` that rejects REPLACES whatever was
+    // propagating out of the try -- which is how a run that failed for its own
+    // reasons came back reporting only that a pool could not be closed.
+    let cliResult: StratalineCLIResult;
+
     try {
       // Test database connection before proceeding
       const connected = await testConnection(
         poolInstance,
-        config.logger,
+        logger,
         config.loadFrom,
         config.loadFrom === "env" ? config.envPrefix || "" : "",
         config.env,
@@ -631,14 +619,11 @@ export async function RunStratalineCLI(config: {
 
       if (!connected) {
         // Add a clear message about aborting the operation
-        config.logger(
-          "error",
-          "\nAborting operation due to database connection failure.\n",
-        );
+        logger.error({
+          message: "\nAborting operation due to database connection failure.\n",
+        });
         throw new Error("Database connection failure");
       }
-
-      let cliResult: StratalineCLIResult;
 
       switch (operation) {
         case "run": {
@@ -646,7 +631,7 @@ export async function RunStratalineCLI(config: {
             poolInstance,
             isDistributed ? "distributed" : "job",
             config.migrations,
-            config.logger,
+            logger,
             config.signal,
           );
           cliResult = {
@@ -658,18 +643,13 @@ export async function RunStratalineCLI(config: {
           break;
         }
         case "status":
-          await showMigrationStatus(
-            poolInstance,
-            config.migrations,
-            config.logger,
-          );
+          await showMigrationStatus(poolInstance, config.migrations, logger);
           cliResult = { command: "status", exitCode: 0 };
           break;
         case "help":
         default:
-          config.logger(
-            "info",
-            `
+          logger.info({
+            message: `
 Strataline Database Migration CLI
 
 Available commands:
@@ -680,20 +660,26 @@ Available commands:
 Options:
   --distributed  Run migrations in distributed mode
 `,
-          );
+          });
           cliResult = { command: "help", exitCode: 0 };
           break;
       }
-
-      return cliResult;
     } catch (error: unknown) {
-      const errorMessage =
-        error instanceof Error ? error.message : String(error);
-      config.logger("error", `Error: ${errorMessage}`);
+      logger.error({ message: `Error: ${getErrorMessage(error)}` });
+
+      // Closed here rather than in a `finally`, so a failure to close cannot
+      // take the place of the failure being reported.
+      await closePoolReportingFailure();
+
       throw error; // Re-throw to allow caller to handle it
-    } finally {
-      await poolInstance.end();
     }
+
+    // The run succeeded, so there is nothing for a close failure to displace,
+    // and a pool that will not close is a leaked resource rather than noise.
+    // It propagates.
+    await poolInstance.end();
+
+    return cliResult;
   } else {
     throw new Error("Database pool was not initialized properly");
   }

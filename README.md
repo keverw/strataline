@@ -52,6 +52,7 @@ Whether you're building a side project or orchestrating millions of rows in prod
 - [Logging & Schema Helpers](#logging--schema-helpers)
   - [Logging](#logging)
     - [Logger Module](#logger-module)
+      - [Sources and Filtering](#sources-and-filtering)
       - [Creating Custom Loggers](#creating-custom-loggers)
   - [Schema Helpers](#schema-helpers)
 - [Database Tables](#database-tables)
@@ -64,6 +65,7 @@ Whether you're building a side project or orchestrating millions of rows in prod
     - [Features](#features)
     - [Usage](#usage)
     - [Logging](#logging-1)
+      - [Stopping](#stopping)
       - [Migration Logging](#migration-logging)
     - [Example in Tests](#example-in-tests)
   - [Local Dev DB Server](#local-dev-db-server)
@@ -72,6 +74,9 @@ Whether you're building a side project or orchestrating millions of rows in prod
     - [Logging](#logging-2)
     - [Data Persistence](#data-persistence)
     - [Process Management](#process-management)
+    - [How Shutdown Works](#how-shutdown-works)
+    - [Who Exits](#who-exits)
+    - [Probing for a Running Server](#probing-for-a-running-server)
     - [Using With Your Application](#using-with-your-application)
     - [Git Configuration](#git-configuration)
   - [Locale and Collation](#locale-and-collation)
@@ -349,15 +354,16 @@ Create a script file to run your migrations:
 // Load environment variables - this is only needed if you are using Node.js, Bun does not need it
 // import 'dotenv/config'
 
-import { RunStratalineCLI, createCLIConsoleLogger } from "strataline/cli";
+import { RunStratalineCLI } from "strataline/cli";
+import { createConsoleLogger } from "strataline/logger";
 import { migrations } from "../path/to/your/migrations";
 
-// Use the built-in CLI console logger. The single argument is `migrateVerbose`
-// (default `true`): it gates only the verbose per-migration `[MIGRATE-INFO]`
-// lines. Migration errors/warnings and the CLI's own info always print, so
-// passing `false` quiets the chatter without hiding problems. You can customize
-// this or implement your own logger if needed.
-const logger = createCLIConsoleLogger(true);
+// Use the built-in console logger. It shows everything by default; name a
+// source to quiet its routine output. `{ migration: false }` drops only the
+// per-migration `[MIGRATION]` info lines. Migration errors and warnings, and
+// the CLI's own info, always print, so quieting a source never hides a
+// problem. You can customize this or implement your own logger if needed.
+const logger = createConsoleLogger();
 
 // Run the CLI with environment variables.
 // RunStratalineCLI resolves with a result whose `exitCode` distinguishes the
@@ -416,6 +422,8 @@ Optional environment variables for pool configuration:
 - `POSTGRES_IDLE_TIMEOUT`: Idle timeout in milliseconds (default: 30000)
 - `POSTGRES_CONNECTION_TIMEOUT`: Connection timeout in milliseconds (default: 2000)
 
+`POSTGRES_PORT` and the three above have to be whole numbers and nothing else. A value that merely starts with one is rejected rather than truncated to it, so `1000ms` and `4.5` are errors naming the variable rather than settings of `1000` and `4`.
+
 A ready-to-copy [`.env.example`](.env.example) is included. To get started:
 
 ```bash
@@ -442,14 +450,14 @@ The CLI supports the following commands:
 
 `RunStratalineCLI` resolves with a `StratalineCLIResult` that includes a suggested `exitCode`, so a wrapper script can distinguish outcomes. A genuine **error is thrown** (not returned), so callers that only `.catch()` still exit non-zero.
 
-| Outcome     | `exitCode` | Behavior                                            |
-| ----------- | ---------- | --------------------------------------------------- |
-| `completed` | `0`        | Returned                                            |
-| `error`     | `1`        | **Thrown** (caller's `.catch` maps to 1)            |
-| `deferred`  | `2`        | Returned because a migration paused itself          |
-| `locked`    | `3`        | Returned because another process holds the lock     |
-| `aborted`   | `4`        | Returned because graceful shutdown was requested    |
-| `lock_lost` | `5`        | Returned because the lock was lost mid-run (unsafe) |
+| Outcome | `exitCode` | Behavior |
+| --- | --- | --- |
+| `completed` | `0` | Returned |
+| `error` | `1` | **Thrown** (caller's `.catch` maps to 1) |
+| `deferred` | `2` | Returned because a migration paused itself |
+| `locked` | `3` | Returned because another process holds the lock |
+| `aborted` | `4` | Returned because graceful shutdown was requested |
+| `lock_lost` | `5` | Returned because the lock was lost mid-run (unsafe) |
 
 Note `locked` (code `3`) and `lock_lost` (code `5`) are deliberately distinct: `locked` means another process already holds the lock so this run did nothing (benign), whereas `lock_lost` means this run held the lock and lost it partway through, a possible concurrent-run condition worth investigating.
 
@@ -477,7 +485,7 @@ interface StratalineCLIResult {
 
 > **`status` and `reason` are populated only for the `run` command.** The `status`/`help` commands resolve with just `{ command, exitCode: 0 }`, so `result.status` and `result.reason` are `undefined` for them. Branch on `result.command` (or check for `undefined`) before reading `status`.
 
-The CLI logger type is exported as `CLILoggerFunction` (the signature of the `logger` you pass to `RunStratalineCLI`, and what `createCLIConsoleLogger` returns).
+The `logger` you pass to `RunStratalineCLI`, and what `createConsoleLogger` returns, is the `Logger` interface exported from `strataline/logger`. The CLI's own lines carry no `source`, and the migration system's carry `source: "migration"`.
 
 #### Graceful Shutdown
 
@@ -502,9 +510,13 @@ When the signal aborts, an in-flight `run` stops at the next safe point and reso
 
 **Note**: The CLI automatically manages the PostgreSQL pool lifecycle. It will create a pool if using environment variables or use your provided pool, and will properly end the pool when the operation completes. You do not need to end the pool yourself after calling `RunStratalineCLI`.
 
-> **Heads up, it ends a pool you passed too.** When `loadFrom: "pool"`, `RunStratalineCLI` calls `pool.end()` in a `finally` block on the **pool you supplied**, not just on pools it created. The pool is dead after the call resolves, so don't plan to reuse it afterward. Create a dedicated pool for the CLI, or let it create one via `loadFrom: "env"`.
+> **Heads up, it ends a pool you passed too.** When `loadFrom: "pool"`, `RunStratalineCLI` calls `pool.end()` on the **pool you supplied**, not just on pools it created, and there is no option to turn that off. The pool is dead after the call resolves, so don't plan to reuse it afterward. Create a dedicated pool for the CLI, or let it create one via `loadFrom: "env"`. Reusing one is worth calling out because the second run fails against a closed pool, and closing it again is a second failure on top of the first.
 >
-> The one exception is a **synchronous configuration error**, e.g. passing `envPrefix` together with `loadFrom: "pool"`, which throws `Cannot provide envPrefix when loadFrom='pool'`. These checks run _before_ the CLI adopts your pool, so on such a throw the pool is **left open** (it was never touched, and you still own the reference). That's deliberate: you can fix the config and retry with the same pool. Once the CLI gets past validation, the `finally` owns it and will end it.
+> The one exception is a **synchronous configuration error**, e.g. passing `envPrefix` together with `loadFrom: "pool"`, which throws `Cannot provide envPrefix when loadFrom='pool'`. These checks run _before_ the CLI adopts your pool, so on such a throw the pool is **left open** (it was never touched, and you still own the reference). That's deliberate: you can fix the config and retry with the same pool. Once the CLI gets past validation it owns the pool and will end it.
+>
+> A close that fails does not replace the reason a run failed. Where the run has already gone wrong, the close error is logged and that first failure is what reaches you. Where the run succeeded there is nothing to displace, so a pool that will not close throws.
+
+`MigrationManager` is the other half of that rule and does the opposite: it never ends a pool you give it, only returning each client to it. The two differ because they are for different jobs. `MigrationManager` is the library primitive you wire into an application that already owns its connections, so taking the pool away from it would be wrong. `RunStratalineCLI` is the batteries-included entry point for a process whose whole purpose is to run migrations and exit, so it owns the lifecycle end to end. Reach for `MigrationManager` when your program keeps running afterward.
 
 #### package.json Scripts
 
@@ -824,7 +836,7 @@ Alongside `MigrationResult`, `MigrationStatus`, `DataMigrationJobResult`, and `D
 
 > **`Migration` is generic: `Migration<TPayload, TReturn>`.** The examples use the bare `Migration` (which defaults to `Migration<Record<string, unknown>, unknown>`), but you can parameterize it to type the two values that flow through a single migration: `TPayload` types `ctx.payload` (the per-batch input you pass to `runDataMigrationJobOnly`), and `TReturn` types the `data` argument to `ctx.complete(data)` / `ctx.defer(reason, data)` (and `ctx.updateMetadata`). For example, `Migration<{ startId: number; endId: number }, { processed: number }>` gives you a fully typed `ctx.payload` and a checked `ctx.complete({ processed })`. `register<TPayload, TReturn>()` and `runDataMigrationJobOnly<TPayload, TReturn>()` carry the same parameters.
 
-The logger the `MigrationManager` constructor accepts is the [`Logger`](#logger-module) interface. If `Logger` collides with a type already in your codebase, alias it on import: `import type { Logger as StratalineLogger } from "strataline/migration"`.
+The logger the `MigrationManager` constructor accepts is the [`Logger`](#logger-module) interface. If `Logger` collides with a type already in your codebase, alias it on import: `import type { Logger as StratalineLogger } from "strataline/logger"`.
 
 ## Backpressure Handling
 
@@ -888,7 +900,7 @@ Key points:
 - **Cancellation is cooperative.** Strataline can't forcibly kill your in-flight code. Your migration must check `ctx.signal.aborted` (or listen for its `"abort"` event) and stop gracefully. **When you see the abort, stop at a safe point and call `ctx.defer("reason")`** (or `ctx.complete()` if the work genuinely finished). Do **not** just `return` without calling one of them: a data migration that finishes without calling `complete()` or `defer()` is treated as an error. Because migrations are resumable, after a `defer()` the next run picks up where it left off. (The overall run result is still `"aborted"` regardless, but `defer()` keeps the migration's recorded state clean.)
 - **Between migrations**, the run also stops at the next migration boundary when the signal is aborted, returning `status: "aborted"`.
 - **No run status is persisted.** It is just feedback in the returned result. `migration_status` has no "status" column, only per-phase progress flags (plus `last_error`/`metadata`). So whether a run ends `"deferred"` or `"aborted"`, the affected migration identically stays **pending** (phase flags incomplete) and resumes on the next run. (When a migration `defer()`s, the reason/data you passed _do_ get persisted to `last_error`/`metadata`, but that's because you passed them, separate from the run's status.)
-- **Workers are cancelled the same way**, with one return-value asymmetry: `runDataMigrationJobOnly(id, payload, { signal })` exposes `ctx.signal`, but `"aborted"` is only ever a `runSchemaChanges` result. A cancelled worker should `ctx.defer()`, so its `DataMigrationJobResult` comes back as `"deferred"` (retry this batch later), never `"aborted"`. Lock loss doesn't apply to workers either because `runDataMigrationJobOnly` never acquires the lock or runs the renewal timer. Only `runSchemaChanges` does.
+- **Workers are canceled the same way**, with one return-value asymmetry: `runDataMigrationJobOnly(id, payload, { signal })` exposes `ctx.signal`, but `"aborted"` is only ever a `runSchemaChanges` result. A canceled worker should `ctx.defer()`, so its `DataMigrationJobResult` comes back as `"deferred"` (retry this batch later), never `"aborted"`. Lock loss doesn't apply to workers either because `runDataMigrationJobOnly` never acquires the lock or runs the renewal timer. Only `runSchemaChanges` does.
 
 **Lock loss is treated as a safety abort.** While a run is in progress the lock is renewed on a timer (see [Lock Lifecycle and Cleanup](#lock-lifecycle-and-cleanup)). If a renewal discovers the lock is no longer ours because another process took it over after it expired, Strataline **auto-aborts** the in-flight run rather than continuing without exclusivity. Concretely, it trips the same abort path used for shutdown (so `ctx.signal` fires and your data migration can wind down), then `runSchemaChanges` returns `status: "lock_lost"` with a `[lock]` reason. This is a dedicated status, distinct from both `"aborted"` (a graceful shutdown) and `"locked"` (couldn't acquire in the first place), and through the CLI it exits with code `5`, because running without a valid lock is an unsafe condition worth investigating.
 
@@ -940,11 +952,11 @@ migration: async (pool, ctx) => {
 
 **Ownership:** what matters is the **call path, not the mode**. Any `runSchemaChanges` call is the orchestrator and writes `metadata` (and `migration_complete`). This includes single-machine **job mode** (`runSchemaChanges("job")`), not just distributed. Only `runDataMigrationJobOnly` (a worker) has no-op writes, though it can still **read** `ctx.metadata`. Watch out: `ctx.mode === "job"` is true in _both_ a single-machine `runSchemaChanges("job")` run _and_ inside a worker (which forces `mode: "job"`), so `ctx.mode` alone doesn't tell you whether your writes persist. The call path does. See the distributed-mode note below for why.
 
-| You called                        | `ctx.mode`       | `complete()` marks done? | `metadata` persists? |
-| --------------------------------- | ---------------- | ------------------------ | -------------------- |
-| `runSchemaChanges("job")`         | `"job"`          | Yes                      | Yes                  |
-| `runSchemaChanges("distributed")` | `"distributed"`  | Yes                      | Yes                  |
-| `runDataMigrationJobOnly(...)`    | `"job"` (forced) | No                       | No                   |
+| You called | `ctx.mode` | `complete()` marks done? | `metadata` persists? |
+| --- | --- | --- | --- |
+| `runSchemaChanges("job")` | `"job"` | Yes | Yes |
+| `runSchemaChanges("distributed")` | `"distributed"` | Yes | Yes |
+| `runDataMigrationJobOnly(...)` | `"job"` (forced) | No | No |
 
 The first and third rows both run with `ctx.mode === "job"` yet differ on persistence, proof that the **call path** (which method you invoked), not `ctx.mode`, decides ownership. A worker just returns its value in `DataMigrationJobResult.data`. Your orchestrator pass decides whether to save it.
 
@@ -986,14 +998,50 @@ Strataline includes a dedicated logger module that provides:
 
 The logger system automatically formats messages with task and stage prefixes, making it easy to trace the origin of each log message in complex migration scenarios.
 
-A few lower-level building blocks are also exported from `strataline/migration` for advanced use: the `LogData` / `LogLevel` / `LogDataInput` types, the `buildLogPrefix` and `getErrorMessage` helpers, a `MutableLogger` (wraps another logger and can be toggled on/off via `setVerbose`, with `isVerbose()` to read the current state, handy in tests), `createPrefixedLogger` (a standalone function that creates a prefixed logger. Handles both `BaseLogger` subclasses and plain `Logger` objects), and `PrefixedLogger` (the internal class behind `createPrefixed`/`createPrefixedLogger`. Prefer those over constructing it directly). Most users only need `BaseLogger`, `ConsoleLogger`, and `consoleLogger`.
+A few lower-level building blocks are also exported from `strataline/logger` for advanced use: the `LogData` / `LogLevel` / `LogDataInput` types, the `buildLogPrefix` and `getErrorMessage` helpers, a `MutableLogger` (wraps another logger and can be toggled on/off via `setVerbose`, with `isVerbose()` to read the current state, handy in tests), `createPrefixedLogger` (a standalone function that creates a prefixed logger. Handles both `BaseLogger` subclasses and plain `Logger` objects), and `PrefixedLogger` (the internal class behind `createPrefixed`/`createPrefixedLogger`. Prefer those over constructing it directly). Most users only need `BaseLogger`, `ConsoleLogger`, and `consoleLogger`.
+
+##### Sources and Filtering
+
+Every line carries two independent things: a severity, which is the method you call (`info`, `warn`, `error`), and a `source`, which says where the line came from. The sources Strataline emits are:
+
+| `source`      | What it is                                      |
+| ------------- | ----------------------------------------------- |
+| `"pg"`        | PostgreSQL's own server output                  |
+| `"setup"`     | A dev server's startup and initialization steps |
+| `"migration"` | The migration system                            |
+
+Lines a surface logs in its own voice carry no `source` at all. That is deliberate, so quieting a source can never take the message that matters with it.
+
+`createConsoleLogger` builds a console logger that quiets whichever sources you name. The whole logging API lives at `strataline/logger`, which is its own entry point rather than a passenger on any one surface, since the dev server and the test database need it as much as migrations do:
+
+```typescript
+import { createConsoleLogger } from "strataline/logger";
+
+createConsoleLogger(); // everything, the default
+createConsoleLogger({ pg: false }); // no routine PostgreSQL output
+createConsoleLogger({ pg: false, setup: false }); // also no dev server startup steps
+createConsoleLogger({ migration: false }); // no per-migration chatter
+```
+
+Two rules make this safe to use without reading the source list first:
+
+- **Only routine `info` output is quieted.** A warning or an error is never hidden. Strataline reads the severity PostgreSQL prints in its own lines, so a `WARNING`, `ERROR`, `FATAL`, or `PANIC` reaches your logger at that level and prints even under `{ pg: false }`. That means `{ pg: false }` drops `listening on IPv4 address` without also hiding the `FATAL` explaining why the server would not start.
+- **A source you did not name is shown.** Absent means visible, so a filter built for one surface is safe to hand to another. The wrong one is louder than you intended, never quieter, and a logger you wrote for your own sources keeps printing them.
+
+To apply the same filtering to a logger of your own rather than to the console, wrap it in `SourceFilterLogger`:
+
+```typescript
+import { SourceFilterLogger } from "strataline/logger";
+
+const logger = new SourceFilterLogger(myPinoAdapter, { pg: false });
+```
 
 ##### Creating Custom Loggers
 
 You can create your own logger by extending the `BaseLogger` class:
 
 ```typescript
-import { BaseLogger, LogDataInput } from "strataline/migration";
+import { BaseLogger, LogDataInput } from "strataline/logger";
 
 // Create a custom logger that sends logs to a service
 class ApiLogger extends BaseLogger {
@@ -1058,7 +1106,7 @@ prefixedLogger.info({ message: "Starting process" });
 
 The `helpers` object, passed as the second argument to `beforeSchema` and `afterSchema` functions, provides a set of safe, idempotent methods for common schema modifications. These helpers automatically log their actions using the configured logger and perform existence checks before attempting changes, preventing errors if an object already exists or doesn't exist when trying to remove it.
 
-> **Schema Resolution:** Existence checks resolve relations through Postgres's `to_regclass` / `pg_catalog`, so they honour the connection's `search_path` and accept schema-qualified names (e.g. `"reporting.users"`). The check looks in the same place the subsequent DDL will run, not blindly across every schema. Note that table, column, index, and constraint **names are written directly into the SQL statement**. SQL placeholders (`$1`, `$2`, …) can only stand in for _values_ (data), never for identifiers like table or column names, so those names can't be parameterized and must be concatenated in. The same is true of the **column types, default values, and constraint definitions** you pass (e.g. `columnType`, `defaultValue`, the `columns` map values, and the `constraints` strings). These are interpolated directly too, **not** parameterized, so a value-shaped argument like `defaultValue` is _not_ safe to build from user input. Treat all of them as trusted, code-defined values. Don't build them from untrusted input.
+> **Schema Resolution:** Existence checks resolve relations through Postgres's `to_regclass` / `pg_catalog`, so they honor the connection's `search_path` and accept schema-qualified names (e.g. `"reporting.users"`). The check looks in the same place the subsequent DDL will run, not blindly across every schema. Note that table, column, index, and constraint **names are written directly into the SQL statement**. SQL placeholders (`$1`, `$2`, …) can only stand in for _values_ (data), never for identifiers like table or column names, so those names can't be parameterized and must be concatenated in. The same is true of the **column types, default values, and constraint definitions** you pass (e.g. `columnType`, `defaultValue`, the `columns` map values, and the `constraints` strings). These are interpolated directly too, **not** parameterized, so a value-shaped argument like `defaultValue` is _not_ safe to build from user input. Treat all of them as trusted, code-defined values. Don't build them from untrusted input.
 
 **Available Helpers:**
 
@@ -1232,10 +1280,7 @@ This helper creates short-lived, non-persistent Postgres clusters for testing pu
 #### Usage
 
 ```typescript
-import {
-  TestDatabaseInstance,
-  createTestDBConsoleLogger,
-} from "strataline/test-db-instance";
+import { TestDatabaseInstance } from "strataline/test-db-instance";
 import { migrations } from "./path/to/your/migrations";
 
 // Create a test database with migrations
@@ -1249,7 +1294,7 @@ const testDbNoMigrations = new TestDatabaseInstance();
 // Or with all custom options
 const testDb = new TestDatabaseInstance({
   port: 5432, // Optional: specific port (default: auto-assigned)
-  logger: customLogger, // Optional: custom logger function
+  logger: customLogger, // Optional: custom structured logger
   user: "custom_user", // Optional: database username (default: 'test_user')
   password: "custom_pwd", // Optional: database password (default: 'test_password')
   databaseName: "custom", // Optional: database name (default: 'test_database')
@@ -1269,6 +1314,8 @@ const pool = testDb.getPool();
 
 // Or get connection credentials for direct connection. Returns
 // { host, port, database, user, password }, or null until start() has completed.
+// `host` is 127.0.0.1: the cluster listens on IPv4 only, so a name that can
+// resolve to ::1 is not what you want to hand to a client.
 const credentials = testDb.getCredentials();
 
 // Reset the database (drops all tables in the `public` schema and reapplies
@@ -1285,50 +1332,80 @@ await testDb.stop();
 You can use the built-in console logger or implement your own:
 
 ```typescript
-// Use the built-in console logger with options.
-// Defaults: createTestDBConsoleLogger(pgVerbose = false, migrateVerbose = true),
-// so PostgreSQL server logs are hidden unless you opt in (errors always show).
+import {
+  createConsoleLogger,
+  type Logger,
+  type LogDataInput,
+} from "strataline/logger";
+
+// Use the built-in console logger, naming any source you want quieted.
+// Everything is shown by default. `{ pg: false }` is the usual choice for a
+// test suite, since PostgreSQL's routine output is rarely what a failing test
+// is about. Only routine `info` lines are affected: a PostgreSQL WARNING,
+// ERROR, FATAL or PANIC reaches your logger at that level and still prints.
 const testDb = new TestDatabaseInstance({
-  logger: createTestDBConsoleLogger(
-    true, // true enables verbose PostgreSQL logs
-    true, // true enables verbose migration logs
-  ),
+  logger: createConsoleLogger({
+    pg: false, // quiet PostgreSQL's routine server logs
+    // migration: false,  // quiet the migration system's routine chatter
+  }),
 });
 
 // Or implement your own logger
-const customLogger = (
-  type:
-    | "info"
-    | "error"
-    | "warn"
-    | "pg"
-    | "migrate-info"
-    | "migrate-error"
-    | "migrate-warn",
-  message: string,
-) => {
-  // Types: info/error/warn (general), pg (PostgreSQL server), migrate-info/migrate-error/migrate-warn (Strataline migrations)
-  console.log(`[${type.toUpperCase()}] ${message}`);
+const customLogger: Logger = {
+  info: (data) => console.log(render(data)),
+  warn: (data) => console.warn(render(data)),
+  error: (data) => console.error(render(data), data.error ?? ""),
 };
+
+// Severity is the method that was called. `source` says which part of the
+// system is talking: "pg" is the PostgreSQL server, "migration" is Strataline's
+// migration system, and no source at all is the test database's own voice.
+function render(data: LogDataInput) {
+  const from = data.source ? `[${data.source.toUpperCase()}] ` : "";
+
+  return `${from}${data.message}`;
+}
 ```
 
-This logger signature is exported as `TestDBLoggerFunction` if you prefer to annotate your logger with the named type instead of writing the shape inline. The constructor's options object is likewise exported as `TestDatabaseOptions`.
+The logger is the `Logger` interface exported from `strataline/logger`, and the data it receives is `LogDataInput`. The constructor's options object is exported as `TestDatabaseOptions`.
+
+##### Stopping
+
+`stop()` throws when the server could not be stopped, the way a server's `stop()` is generally expected to. `LocalDevDBServer.stop()` behaves the same way, so learning one surface does not teach you the wrong thing about the other.
+
+```typescript
+afterAll(async () => {
+  // Throws if PostgreSQL was still running when the stop gave up
+  await testDb.stop();
+});
+```
+
+It resolves once the server is down and its temporary directory is gone. It rejects when the stop gave up on a cluster that was confirmed still running, usually one taking a long time over its shutdown checkpoint on a loaded machine. The server and its data directory are kept in that case, so nothing is deleted out from under a live cluster, and calling `stop()` again asks the cluster afresh and finishes the job once the postmaster has gone. `start()` refuses in the meantime, since a second cluster would leave the first holding its port with nothing recording it.
+
+Because this usually runs in an `afterAll`, a rejection fails the suite. That is intended: a PostgreSQL still holding a port and a data directory is a real problem with the run rather than a detail to leave in a log nobody reads. Where it genuinely is not worth failing over, catch it at the call site:
+
+```typescript
+afterAll(async () => {
+  await testDb.stop().catch((error) => {
+    console.warn(`Test database did not stop: ${error}`);
+  });
+});
+```
+
+Concurrent `stop()` calls join the teardown already running rather than each starting their own, and a `start()` that overlaps one is refused, so a signal handler racing a test hook is safe in both directions.
 
 ##### Migration Logging
 
 The TestDatabaseInstance automatically creates a Strataline-compatible logger adapter that works with or without a provided logger:
 
-- If you provide a logger, migration logs will be sent through your logger with the appropriate type:
-  - `migrate-info`: For informational migration logs
-  - `migrate-error`: For migration errors
-  - `migrate-warn`: For migration warnings
+- If you provide a logger, migration logs reach it with `source: "migration"`, at whichever level the migration system used
 - If you don't provide a logger, migrations will run silently with no logs
 
 When you provide a logger to TestDatabaseInstance, it will:
 
-1. Use that logger for its own operation logs (info, error, warn)
-2. Use that logger for PostgreSQL logs (pg)
-3. Automatically create an adapter to send Strataline migration logs through the same logger (migrate-info, migrate-error, migrate-warn)
+1. Use that logger for its own operation logs, which carry no `source`
+2. Use that logger for PostgreSQL logs, which carry `source: "pg"`
+3. Send Strataline migration logs through the same logger with `source: "migration"`
 
 This ensures all logs flow through a single logging interface, making it easy to direct logs to your preferred destination.
 
@@ -1416,10 +1493,8 @@ Create a script to run your local development database server:
 // scripts/dev-db.ts
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
-import {
-  LocalDevDBServer,
-  createDevDBConsoleLogger,
-} from "strataline/local-dev-db-server";
+import { LocalDevDBServer } from "strataline/local-dev-db-server";
+import { createConsoleLogger } from "strataline/logger";
 
 // Calculate paths relative to the current script
 const __filename = fileURLToPath(import.meta.url);
@@ -1435,13 +1510,96 @@ const server = new LocalDevDBServer({
   database: "myapp_dev",
   dataDir: DATA_DIR,
   pidFile: PID_FILE,
-  logger: createDevDBConsoleLogger(), // Optional: remove this line to run silently
+  logger: createConsoleLogger(), // Optional: remove this line to run silently
+  // `|| 1`: onExit fires for any exit this process did not ask for, and a
+  // clean shutdown from elsewhere (`pg_ctl stop`) exits 0, which would
+  // otherwise report a vanished database as a successful run.
+  onExit: (code) => process.exit(code || 1),
 });
 
-server.start().catch((error) => {
-  console.error(`Fatal error: ${error}`);
-  process.exit(1);
+// Held, not just awaited. A signal can arrive during startup, and shutdown()
+// rejects while a start is in flight, so the handler has to wait for the start
+// to settle rather than call shutdown() into a refusal. Exiting there instead
+// would leave the postmaster to the synchronous `exit` hook, which only
+// SIGKILLs it: no shutdown checkpoint, a stranded postmaster.pid, and leaked
+// SysV IPC objects.
+let settled = false;
+
+const startup = server.start().then(
+  (): unknown => {
+    settled = true;
+
+    return null;
+  },
+  (error: unknown) => {
+    settled = true;
+
+    return error;
+  },
+);
+
+startup.then((error) => {
+  if (error !== null) {
+    console.error(`Fatal error: ${error}`);
+    process.exit(1);
+  }
 });
+
+// Clears the bounded phases with room over: a previous server's shutdown
+// escalation runs to about 42 seconds, the readiness wait polls for about 30
+// more, and user and database setup follows. Not a ceiling on a start, since
+// initdb has no bound of its own, but well clear of what a working machine
+// does. The bound is for a start that is stuck rather than one that is slow,
+// since trapping a signal suppresses Node's own termination and an unbounded
+// wait would ignore SIGTERM forever.
+const START_WAIT_MS = 90_000;
+
+let stopping: Promise<void> | null = null;
+
+function abandonStartup(reason: string): void {
+  console.error(`${reason} Exiting without a clean shutdown.`);
+  process.exit(1);
+}
+
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+  process.on(signal, () => {
+    // A second signal while the first is still WAITING gives up on the wait.
+    // Once the shutdown is running it is left alone: cutting an escalation off
+    // part-way can leave a data directory needing recovery.
+    if (stopping) {
+      if (!settled) {
+        abandonStartup("Signaled again while still waiting for startup.");
+      }
+
+      return;
+    }
+
+    const startWait = setTimeout(
+      () => abandonStartup("Timed out waiting for startup to finish."),
+      START_WAIT_MS,
+    );
+
+    startWait.unref();
+
+    stopping = startup
+      .then((error) => {
+        clearTimeout(startWait);
+
+        // A failed start has already torn its own child down, and the handler
+        // above is about to exit. Nothing here to stop.
+        if (error !== null) {
+          return;
+        }
+
+        return server.shutdown(signal).then(() => process.exit(0));
+      })
+      .catch((error: unknown) => {
+        clearTimeout(startWait);
+        console.error(`Shutdown failed: ${error}`);
+        process.exit(1);
+      });
+  });
+}
 ```
 
 Add the script to your `package.json`:
@@ -1477,8 +1635,8 @@ const server = new LocalDevDBServer({
   dataDir: "./pgdata", // Directory to store PostgreSQL data
   pidFile: "./.pg_pid", // File to store the PostgreSQL process ID
   // Optional
-  logger: customLogger, // Optional: custom logger function
-  onExit: (exitCode) => process.exit(exitCode), // Optional: custom exit handler
+  logger: customLogger, // Optional: custom structured logger
+  onExit: (exitCode) => process.exit(exitCode || 1), // Optional: server-exit notification
   logConnections: false, // Optional: enable PostgreSQL connection logging (default: false)
 });
 ```
@@ -1489,35 +1647,50 @@ const server = new LocalDevDBServer({
 
 > **Heads up: a `postgres` superuser is also created.** Besides the user you configure, startup ensures a `postgres` superuser exists with the well-known password `postgres` (it's created if missing, or its password is reset to `postgres` if it already exists). This is a local-development convenience, but it means the cluster has a predictable superuser login. Keep the dev server bound to localhost (it is, by default) and **don't expose its port** on shared or untrusted networks.
 
-**Exit Handling:** `onExit` governs how an **already-running** server terminates when PostgreSQL's process exits, on `SIGINT`/`SIGTERM`/`SIGHUP`, or during cleanup. By default these call `process.exit()`. Provide an `onExit` callback (e.g. in tests) to intercept termination instead of exiting the process. A **failed `start()`** is handled differently: it does **not** call `onExit`, it **rejects the returned promise**, so handle startup errors with `server.start().catch(...)` (as in the example above). The `stop()` method triggers the same graceful shutdown as `SIGTERM`.
+**Exit Handling:** The library never exits the host process. `onExit` is an optional notification that fires only when an already-running PostgreSQL server exits without being asked, carrying PostgreSQL's exit code. It is not called by `stop()`, `shutdown(signal)`, a failed `start()`, or an operating-system signal. Handle startup errors through the promise returned by `start()`, and wire host signal handlers explicitly as shown below.
 
 #### Logging
 
 You can customize logging behavior using the built-in console logger:
 
 ```typescript
-import { createDevDBConsoleLogger } from "strataline/local-dev-db-server";
+import {
+  createConsoleLogger,
+  type Logger,
+  type LogDataInput,
+} from "strataline/logger";
 
-// Create a logger with custom verbosity settings.
-// Defaults: createDevDBConsoleLogger(pgVerbose = true, setupVerbose = true) —
-// note both default to verbose here, unlike createTestDBConsoleLogger whose
-// pgVerbose defaults to false.
-const logger = createDevDBConsoleLogger(
-  true, // pgVerbose: show PostgreSQL server logs
-  true, // setupVerbose: show setup/initialization logs
-);
+// Create a logger, naming any source you want quieted. Everything is shown
+// by default. Quieting affects routine `info` output only: Strataline reads
+// the severity PostgreSQL prints in its own lines, so a WARNING, ERROR, FATAL
+// or PANIC reaches your logger at that level and is shown either way. So
+// `{ pg: false }` quiets "listening on IPv4 address" without hiding the FATAL
+// that says why the server would not start.
+const logger = createConsoleLogger({
+  pg: false, // quiet PostgreSQL's routine server logs
+  setup: false, // quiet the startup and initialization steps
+});
 
 // Or implement your own logger
-const customLogger = (
-  type: "info" | "error" | "warn" | "pg" | "setup",
-  message: string,
-) => {
-  // Types: info/error/warn (general), pg (PostgreSQL server), setup (initialization)
-  console.log(`[${type.toUpperCase()}] ${message}`);
+const customLogger: Logger = {
+  info: (data) => console.log(render(data)),
+  warn: (data) => console.warn(render(data)),
+  error: (data) => console.error(render(data), data.error ?? ""),
 };
+
+// Severity is the method that was called. `source` says which part of the
+// system is talking: "pg" is the PostgreSQL server, "setup" is initialization,
+// and no source at all is the dev server's own voice.
+function render(data: LogDataInput) {
+  const from = data.source ? `[${data.source.toUpperCase()}] ` : "";
+
+  return `${from}${data.message}`;
+}
 ```
 
-This logger signature is exported as `DevDBLoggerFunction`, and the `onExit` callback type as `DevDBExitHandler` (`(exitCode: number) => void`), if you prefer the named types over writing the shapes inline. The constructor's configuration object is exported as `LocalDevDBServerConfig`.
+> **If your process _is_ the server, you own every way it can end.** This library never exits your process, so a script whose whole job is to run the dev server has two things to wire: a signal handler that stops the server and exits, and an `onExit` that exits when PostgreSQL dies on its own. Omit the second and ordinary flow control takes over. With nothing left pending the script exits by itself, but with code `0`, reporting a crashed database as a clean run. Exit non-zero from it rather than forwarding PostgreSQL's code as it stands, since a clean shutdown asked for from somewhere else, a `pg_ctl stop` for instance, reaches `onExit` with code `0` and would read as a successful run. Callers that legitimately carry on afterwards, such as tests or a provisioning step that stops the server and moves on, are exactly the ones that should not exit from there.
+
+The logger is the `Logger` interface exported from `strataline/logger`, and the `onExit` callback type is exported as `DevDBExitHandler` (`(exitCode: number) => void`), if you prefer the named types over writing the shapes inline. The constructor's configuration object is exported as `LocalDevDBServerConfig`, and `getLifecycleState()`'s return type as `DevDBLifecycleState`.
 
 #### Data Persistence
 
@@ -1538,10 +1711,231 @@ bun run dev:db
 
 The dev server includes robust process management:
 
-- **Automatic Cleanup**: Handles graceful shutdown on `Ctrl+C` or process termination
-- **Stale Process Detection**: Automatically cleans up any existing PostgreSQL processes on startup
+- **Clean Shutdown**: Stops the verified server with PostgreSQL's fast-shutdown signal, escalating only as far as needed, so a connected client does not leave a stale data directory
+- **Stale Process Detection**: Cleans up a previous server only after verifying its identity, and refuses startup when the evidence is ambiguous
 - **PID File Management**: Tracks the server process ID for reliable cleanup
-- **Signal Handling**: Responds to `SIGINT`, `SIGTERM`, and `SIGHUP` signals
+- **Verified Termination**: Only ever signals a PID that has been positively matched to this cluster and this boot, and leaves an unidentifiable process alone rather than guessing
+- **Host-Owned Signals**: Installs no signal handlers. Call `shutdown(signal)` from the host's `SIGINT`, `SIGTERM`, or `SIGHUP` handler when the server should stop with the process
+
+#### How Shutdown Works
+
+PostgreSQL reads signals as distinct shutdown _modes_ rather than as a generic "stop", which makes the obvious approach the wrong one:
+
+| Signal | PostgreSQL meaning |
+| --- | --- |
+| `SIGTERM` | Smart shutdown, which waits for every client to disconnect first |
+| `SIGINT` | Fast shutdown, which disconnects clients, rolls back, and exits cleanly |
+| `SIGQUIT` | Immediate shutdown, with no clean exit and recovery on next start |
+
+Sending `SIGTERM` therefore hangs for as long as an application holds a connection, and whatever timeout sits behind it eventually escalates to a hard kill, leaving a stale `postmaster.pid` and a data directory needing recovery. That is usually what is happening when a dev server "sometimes doesn't stop properly".
+
+Shutdown escalates only as far as it must:
+
+1. `SIGINT` (fast shutdown), deliberately not `SIGTERM`.
+2. `SIGQUIT` (immediate shutdown), which still cleans up child processes and shared memory.
+3. `SIGKILL`, only as a last resort, since it can orphan children and leave shared memory behind.
+
+On Windows, where Node maps these names to unconditional process termination rather than PostgreSQL signal semantics, the first two are sent with `pg_ctl kill <signal> <verified-pid>`. The PID-addressed form is intentional: `pg_ctl stop -D` would reread `postmaster.pid` in a child process after verification, allowing a replacement server to become the target.
+
+`SIGKILL` is the exception there, and stays with Node. `pg_ctl` delivers signals through PostgreSQL's own emulated-signal pipe, which the server has to be healthy enough to service. The one signal that exists for a server too wedged to service anything is the one `pg_ctl` cannot deliver, and it reports success either way. Node maps `SIGKILL` to `TerminateProcess`, which is what a last resort has to be.
+
+`stop()` resolves once the server has actually stopped, rather than once shutdown has merely been requested, and it never exits the host process or calls `onExit`. That holds whether or not there was anything to stop, so a defensive `stop()` in test teardown is safe as long as the start it is tearing down has been awaited.
+
+Overlapping lifecycle requests are not queued. `start()` rejects while a start or a shutdown is in flight, and `stop()` and `shutdown(signal)` reject while a start is. A second `stop()` is the exception: it joins the shutdown already running. Sequence them by awaiting the first, and ask `getLifecycleState()` when you need to know which one that is:
+
+```ts
+type DevDBLifecycleState =
+  | "stopped"
+  | "starting"
+  | "running"
+  | "stopping"
+  | "unstoppable";
+
+server.getLifecycleState(); // "running"
+```
+
+| State         | `start()`         | `stop()` / `shutdown(signal)` |
+| ------------- | ----------------- | ----------------------------- |
+| `stopped`     | starts a server   | resolves, nothing to stop     |
+| `starting`    | **rejects**       | **rejects**                   |
+| `running`     | logs and resolves | stops it                      |
+| `stopping`    | **rejects**       | joins the shutdown in flight  |
+| `unstoppable` | **rejects**       | runs the escalation again     |
+
+`unstoppable` is the state a failed `start()` or a failed `stop()` leaves when the server outlived even `SIGKILL`. Either teardown reports it, so a `stop()` that gave up reads as `unstoppable` rather than `running`. The instance keeps the child rather than forgetting it, so `stop()` can try again, and `start()` refuses while it holds it. It is reported separately because the child's own exit status cannot distinguish it. A child that is still running reads as `running`, and one that has just died reads as `stopped` until its cleanup has finished, so both of those rows would promise a `start()` that in fact throws.
+
+It is a state the instance leaves rather than one it is stuck in. Whenever that child does exit, its cleanup releases the PID record and drops the reference, and the next reading is `stopped` with `start()` working normally again. So a caller that hits this has two things worth trying, in order: `stop()`, which runs the escalation once more, and simply waiting, which is enough if the process has since gone on its own.
+
+Stopping is deliberately the forgiving one. The two refusals fail in opposite directions: a `start()` that rejects leaves no server, which is visible and costs a retry, while a `stop()` that rejected would leave a postmaster holding the port and the data directory, produced by the one call whose whole job was to prevent that. Teardown is idempotent nearly everywhere for the same reason, `net.Server.close()` and Go's `http.Server.Shutdown` included.
+
+What a joined caller gives up is knowing whose request stopped the server. The escalation belongs to whoever asked first, so a `stop()` joined to a `shutdown("SIGTERM")` resolves for a stop it had no part in, and a failure rejects both. Check `getLifecycleState()` first where that matters. Nothing has to check in order to be correct, which is the point.
+
+This is the instance's own view and nothing more. A server left behind by a previous run reads as `stopped`, because this object has never held it. That question is [`getLocalDevDBServerStatus()`](#probing-for-a-running-server), which reads the PID records rather than memory. It is also a snapshot that does not survive an `await`, so use it for a log line or a branch that tolerates being wrong, not as a check that some later call is relied on to pass.
+
+`stop()` waits for the child's `exit` event rather than only for the PID to disappear, so the PID file has been released by the time it resolves. It deliberately does not wait for `close`, which reports the stdio pipes closed as well as the process exited: PostgreSQL's backends inherit those pipes, and a postmaster wedged badly enough to need `SIGKILL` dies without signaling its children, which go on holding them with nothing left to reap them. So `close` can arrive late or never, and nothing `stop()` promises is about the pipes. The wait on `exit` is bounded too, and once the process itself is confirmed gone strataline finishes the cleanup itself rather than wait on an event, so a shutdown that worked is never reported as one that failed. What that leaves is that a resolved `stop()` does not mean the child's output has finished arriving. Only a `start()` whose server died waits for that, briefly and with a bound, so its error can carry what PostgreSQL said.
+
+**This library traps no signals.** Wiring `SIGINT`/`SIGTERM`/`SIGHUP` is the program's job, the same as it already is for [`RunStratalineCLI`](#cli-integration). A signal listener suppresses Node's default termination for the whole process, so a library that installs one silently changes how its host dies, and where two of them disagree the loudest wins. Call `shutdown(signal)` from your own handler: it stops the server and resolves, so the exit stays yours.
+
+```ts
+const server = new LocalDevDBServer(config);
+
+// Held, not just awaited. A signal can arrive during startup, and shutdown()
+// rejects while a start is in flight, so the handler has to wait for the start
+// to settle rather than call shutdown() into a refusal.
+let settled = false;
+
+const startup = server.start().then(
+  (): unknown => {
+    settled = true;
+
+    return null;
+  },
+  (error: unknown) => {
+    settled = true;
+
+    return error;
+  },
+);
+
+startup.then((error) => {
+  if (error !== null) {
+    console.error(`Fatal error: ${error}`);
+    process.exit(1);
+  }
+});
+
+// Bounded, because trapping a signal suppresses Node's own termination and an
+// unbounded wait would be a script that ignores SIGTERM forever. It clears the
+// bounded phases with room over: a previous server's shutdown escalation runs
+// to about 42 seconds, the readiness wait polls for about 30 more, and user and
+// database setup follows. Not a ceiling on a start, since initdb has no bound
+// of its own, but well clear of what a working machine does. This is for a
+// start that is stuck rather than one that is slow, and giving up early only
+// reaches the same force-kill sooner while throwing away the starts that would
+// have finished.
+const START_WAIT_MS = 90_000;
+
+let stopping: Promise<void> | null = null;
+
+function abandonStartup(reason: string): void {
+  console.error(`${reason} Exiting without a clean shutdown.`);
+  process.exit(1);
+}
+
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+  process.on(signal, () => {
+    // A second signal while the first is still WAITING gives up on the wait.
+    // Once the shutdown is running it is left alone: cutting an escalation off
+    // part-way can leave a data directory needing recovery.
+    if (stopping) {
+      if (!settled) {
+        abandonStartup("Signaled again while still waiting for startup.");
+      }
+
+      return;
+    }
+
+    const startWait = setTimeout(
+      () => abandonStartup("Timed out waiting for startup to finish."),
+      START_WAIT_MS,
+    );
+
+    startWait.unref();
+
+    stopping = startup
+      .then((error) => {
+        clearTimeout(startWait);
+
+        // A failed start has already torn its own child down, and the handler
+        // above is about to exit. Nothing here to stop.
+        if (error !== null) {
+          return;
+        }
+
+        return server.shutdown(signal).then(() => process.exit(0));
+      })
+      // shutdown() rejects when the server could not be stopped. Handle it, or
+      // the rejection is unhandled and what says which server is still running
+      // arrives as the first line of a crash dump.
+      .catch((error: unknown) => {
+        clearTimeout(startWait);
+        console.error(`Shutdown failed: ${error}`);
+        process.exit(1);
+      });
+  });
+}
+```
+
+Waiting for the start is the point of that shape, not incidental to it. Calling `shutdown(signal)` straight from the handler rejects for the whole of `start()`, which on a cold run is its longest stretch, and a script that then exits leaves the postmaster to the synchronous `exit` hook. That hook only `SIGKILL`s: no shutdown checkpoint, a stale `postmaster.pid`, and the SysV shared memory and semaphores PostgreSQL releases on a clean exit and not on a hard kill.
+
+The wait needs a bound for the same reason it needs to exist. Trapping a signal suppresses Node's own termination, so an unwaited-out `start()` becomes a script that ignores `SIGTERM`. A first-run `initdb` is unbounded and is the one step here that can be, so without the timer a supervisor's grace period expires and `SIGKILL`s the script, reaching the ungraceful ending more slowly than not waiting would have. Giving up is no worse than never having waited, so the bound only trades away the startups that would have finished later than it.
+
+> **Wire this, or a supervisor orphans your database.** An untrapped `SIGTERM` terminates Node immediately without running any JavaScript, including the force-kill hook below. `docker stop`, systemd, or any process manager then leaves the postmaster running, holding the port and the data directory. `Ctrl+C` at a terminal usually survives it because the signal goes to the whole foreground process group and PostgreSQL gets its own copy, but that is luck rather than design.
+
+`shutdown(signal)` is `stop()` with the signal recorded in the log. What reaches PostgreSQL is always the `SIGINT` → `SIGQUIT` → `SIGKILL` escalation, because those are the only shutdown modes it has, and the signal that reached your process says nothing about which one this server needs.
+
+One `process` listener is installed for `exit`, and it force-kills a surviving postmaster. It makes no lifecycle decision because it is synchronous and runs only once the process is already leaving. It exists so a database does not outlive the program that spawned it, going on with the first server and coming off with the last.
+
+#### Who Exits
+
+**Not this library, ever.** It has no way to end your process and takes no decision that could. `onExit` is a notification, not an exit handler: it reports the one thing you could not otherwise find out, a server that stopped when nobody asked it to, and hands you PostgreSQL's own exit code to act on.
+
+| What happened | `onExit` |
+| --- | --- |
+| You called `stop()` or `shutdown(signal)` | not called — you are awaiting it |
+| A signal | not called — nothing is trapped |
+| An uncaught exception in your process | not called — not this library's business |
+| The server died unasked | **called** with PostgreSQL's exit code |
+
+Supply nothing and nothing happens. The process stays up with no database behind it, which is logged as an error precisely because it is otherwise silent. Deciding that a dead database should take the program with it is the program's call. A test harness, a provisioning step, or anything that wanted a database for a while may have somewhere to carry on to.
+
+The one `process` listener this library installs is a shared synchronous `exit` hook that force-kills any surviving child, and it manages itself. `start()` puts it on and the shutdown takes it off with the last child, so an instance sitting idle between cycles holds nothing and a program that builds servers over its lifetime accumulates nothing. One hook serves every server in the process, so several running at once still install exactly one, and it comes off when the last of them lets go.
+
+Note what it does not cover, because that gap is the whole reason the signal handler above exists. Node runs an `exit` hook on a normal exit, on `process.exit()`, and after an uncaught exception, but not when a signal terminates the process with nothing trapping it. `SIGINT` from Ctrl+C, `SIGTERM` from a supervisor or a plain `kill`, and `SIGHUP` when the terminal closes each end the process without the hook running at all, which leaves the postmaster holding the port and the data directory. The example above traps those three and calls `shutdown(signal)`, which is what closes the gap, and it is why wiring one is not optional for a program that is meant to be stopped. `SIGKILL` can be trapped by nothing, so nothing closes that one, and the hook cannot help there either.
+
+Keep your own handler's shutdown to a single `await`. Calling `process.exit()` on `SIGINT` while `shutdown()` is still escalating cuts it off part-way through, which can leave a data directory needing recovery. Exit from the `.then`, as the example does, not alongside it.
+
+#### Probing for a Running Server
+
+`getLocalDevDBServerStatus()` answers the question a `LocalDevDBServer` instance cannot: whether a server is running for a data directory right now, including one left by a previous run or started by another process. It reads PostgreSQL's own `postmaster.pid` and Strataline's PID record rather than any in-memory state, so it works from a fresh process, a different tool, or a script that never constructs a server at all. Both it and the PID utilities it is built on are exported from `strataline/local-dev-db-server`.
+
+```ts
+import { getLocalDevDBServerStatus } from "strataline/local-dev-db-server";
+
+const status = await getLocalDevDBServerStatus({
+  pidFile: PID_FILE,
+  dataDir: DATA_DIR,
+  // Optional. Only consulted when the file and process checks cannot decide,
+  // and then the server is asked for its own data_directory, which is identity
+  // rather than inference.
+  connection: {
+    port: 5433,
+    user: "myapp_user",
+    password: "myapp_pass",
+    database: "myapp_dev",
+  },
+});
+
+if (status.running || status.indeterminate) {
+  throw new Error(`Refusing to reset the data directory: ${status.reason}`);
+}
+```
+
+**Three answers, not two.** This is the whole point of the shape, and the reason `running: false` is not a license to do anything destructive:
+
+| Field | Meaning |
+| --- | --- |
+| `running: true` | A process was found **and** positively verified as this cluster's server |
+| `indeterminate: true` | Something is alive at the recorded PID and it could not be tied to this server either way |
+| `stale: true` | A record was found that could not be verified, with `staleKind` saying why |
+
+A caller about to do something irreversible, dropping a data directory or deleting a PID record, should refuse on `running || indeterminate`. `running: false` on its own means "no server was verified", never "nothing is running", and treating the second as the first is how a live server's data directory gets deleted out from under it.
+
+`staleKind` says what kind of evidence produced a stale answer, and the difference is the same one: `process-gone`, `recycled`, and `different-cluster` are positive evidence that the recorded server is gone, while `indeterminate` is the absence of evidence.
+
+The rest of the result carries what was found: `pid`, `startedAt`, `dataDir`, `port`, a `source` of `"postmaster"`, `"pid-file"`, `"connection"`, or `"none"` saying which check settled it, and a `reason` phrased for a person and suitable for dropping straight into a log line or the refusal message above. `observedStartTime` is the operating system's own start time for `pid`, sampled during the verification that identified it, for a caller that intends to signal the process: sampling it again afterwards would be a fresh observation that may describe a different process, since a PID is reused the moment its owner exits.
+
+Identification uses the process command line, start time, current boot, data directory, and owning uid, whichever the platform supplies. `DevDBServerStatus`, `DevDBStatusOptions`, `DevDBStaleKind`, and `DevDBStatusSource` are all exported if you want the named types.
 
 #### Using With Your Application
 
@@ -1552,7 +1946,10 @@ Once the dev server is running, configure your application to connect to it:
 import { Pool } from "pg";
 
 const pool = new Pool({
-  host: "localhost",
+  // 127.0.0.1 rather than "localhost", which can resolve to ::1. The dev
+  // server listens on IPv4 only, deliberately: on some hosts PostgreSQL's
+  // per-connection backends fail to set TCP_NODELAY on an IPv6 socket.
+  host: "127.0.0.1",
   port: 5433, // Match your dev server port
   user: "myapp_user", // Match your dev server user
   password: "myapp_pass", // Match your dev server password
@@ -1560,12 +1957,12 @@ const pool = new Pool({
 });
 ```
 
-Or using a connection string:
+Or use a connection string:
 
 ```typescript
 const pool = new Pool({
   connectionString:
-    "postgresql://myapp_user:myapp_pass@localhost:5433/myapp_dev",
+    "postgresql://myapp_user:myapp_pass@127.0.0.1:5433/myapp_dev",
 });
 ```
 
@@ -1576,7 +1973,7 @@ This approach gives you a real PostgreSQL instance for development without the o
 Add the following to your `.gitignore` to exclude the PostgreSQL data directory and PID file from version control:
 
 ```gitignore
-# PostgreSQL data directory and PID file - for local development
+# PostgreSQL data directory and PID file for local development
 /pgdata
 .pg_pid
 ```
@@ -1585,14 +1982,14 @@ Add the following to your `.gitignore` to exclude the PostgreSQL data directory 
 
 Both embedded helpers (Test DB Instance and Local Dev DB Server) initialize PostgreSQL with `--locale=C --encoding=UTF8`. The cluster still stores full Unicode (UTF-8) text. Only the **default sort order** is set to `C` (byte order) rather than a language-specific locale.
 
-This is deliberate. Letting `initdb` inherit the host/CI locale causes two problems: a Linux-style locale such as `LC_ALL=C.UTF-8` makes `initdb` **fail outright on macOS** (macOS libc has no `C.UTF-8`), and an inherited locale makes text sort differently on each developer's machine. Pinning `C` gives the same, deterministic ordering everywhere and avoids the index-breaking "collation version mismatch" issues that libc locales (like `en_US.UTF-8`) can cause across OS upgrades.
+This is deliberate. Letting `initdb` inherit the host or CI locale causes two problems. A Linux-style locale such as `LC_ALL=C.UTF-8` makes `initdb` **fail outright on macOS** because macOS libc has no `C.UTF-8`, and an inherited locale makes text sort differently on each developer's machine. Pinning `C` gives the same deterministic ordering everywhere and avoids the index-breaking "collation version mismatch" issues that libc locales such as `en_US.UTF-8` can cause across OS upgrades.
 
-**What This Affects, and What It Doesn't.** Collation only applies to **text** types, and only as the _default_ when a query or column doesn't specify otherwise (resolution order: explicit `COLLATE` in the query → the column's collation → the database default). So it has **no effect** on ordering by timestamps, numbers, `uuid`s, or ULIDs:
+**What This Affects, and What It Doesn't.** Collation applies only to **text** types, and only as the default when a query or column does not specify otherwise. The resolution order is an explicit `COLLATE` in the query, the column's collation, then the database default. It has **no effect** on ordering by timestamps, numbers, `uuid`s, or ULIDs:
 
-- `timestamptz` / `timestamp`, integers, and `uuid` are non-text types, always sorted by value, regardless of collation.
-- ULIDs stored as **text** are canonical Crockford base32 (`0-9A-Z`), which is time-ordered and sorts the same whether the collation is `C` or a locale. Just normalize them to uppercase on the way in (and validate them if they come from external sources). Crockford is case-insensitive, and mixed case would sort inconsistently under `C` (uppercase bytes sort before lowercase).
+- `timestamptz`, `timestamp`, integers, and `uuid` are non-text types, always sorted by value regardless of collation.
+- ULIDs stored as **text** are canonical Crockford base32 (`0-9A-Z`), which is time-ordered and sorts the same whether the collation is `C` or a locale. Normalize them to uppercase on the way in, and validate them if they come from external sources. Crockford is case-insensitive, and mixed case would sort inconsistently under `C` because uppercase bytes sort before lowercase.
 
-The `C`-vs-locale difference only shows up on **human-language text** with mixed case or accents (e.g. `"Zebra"` sorts before `"apple"` under `C`). If you need dictionary-style ordering, set it explicitly with a per-column or per-query `COLLATE` rather than relying on the database default:
+The `C`-versus-locale difference only appears on **human-language text** with mixed case or accents, for example, `"Zebra"` sorts before `"apple"` under `C`. If you need dictionary-style ordering, set it explicitly with a per-column or per-query `COLLATE` rather than relying on the database default:
 
 ```sql
 -- per query, in the user's language
@@ -1604,9 +2001,9 @@ CREATE TABLE people (last_name text COLLATE "en-US-x-icu");
 
 Being explicit is the recommended pattern regardless of this library:
 
-- **Correctness:** One cluster-wide collation can't be right for English, Spanish, German, etc. at the same time. Only the query or column knows which language it's ordering.
-- **You May Not Control the Default:** Managed providers often fix the cluster collation, and a database's collation can't be changed after it's created (short of a dump/restore). Per-column and per-query `COLLATE` always work.
-- **Portability:** Your real production database is a separate, managed PostgreSQL instance with its own collation. `--locale=C` only governs the local embedded dev/test databases, never prod. Setting collation explicitly is what keeps ordering consistent across all of them (local, CI, production) instead of silently depending on whatever default each environment happens to have.
+- **Correctness:** One cluster-wide collation cannot be right for English, Spanish, German, and every other language at the same time. Only the query or column knows which language it is ordering.
+- **You May Not Control the Default:** Managed providers often fix the cluster collation, and a database's collation cannot be changed after it is created without a dump and restore. Per-column and per-query `COLLATE` always work.
+- **Portability:** Your real production database is a separate, managed PostgreSQL instance with its own collation. `--locale=C` governs only the local embedded dev and test databases, never production. Setting collation explicitly keeps ordering consistent across local, CI, and production databases instead of silently depending on each environment's default.
 
 ## Development
 
@@ -1626,18 +2023,17 @@ bun test
 When preparing a new release:
 
 1. Update the version in `package.json`
-2. Run the build command, which will automatically update the README version
+2. Run the build command, which automatically updates the README version
 
 ```bash
-# Build the project (includes README version update)
+# Build the project, including the README version update
 bun run build
 ```
 
-The build process runs the `update-docs` script defined in package.json before bundling. It regenerates the README table of contents (`markdown-toc-gen`), synchronizes the README version with package.json (`scripts/update-readme-version.ts`), and formats the docs (`format:docs`). Afterwards, you can publish the package to npm:
+The build process runs the `update-docs` script defined in `package.json` before bundling. It regenerates the README table of contents with `markdown-toc-gen`, synchronizes the README version with `package.json` through `scripts/update-readme-version.ts`, and formats the docs. You can then publish the package to npm:
 
 ```bash
-# Publish to npm
 bun publish
 ```
 
-Make sure to commit the new version back to GIT
+Commit the release version changes after publishing.

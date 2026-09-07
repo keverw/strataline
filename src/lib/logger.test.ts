@@ -138,10 +138,9 @@ describe("Logger Utilities", () => {
       const logInput: LogDataInput = { task: "MTask", message: "Verbose on" };
       mutableLogger.info(logInput);
 
-      expect(logSpy).toHaveBeenCalledWith({
-        ...logInput,
-        message: "[MTask] Verbose on",
-      });
+      // Forwarded untouched: the base logger renders task and stage, and a
+      // prefix baked in here would have it render them twice.
+      expect(logSpy).toHaveBeenCalledWith(logInput);
     });
 
     it("should not log messages when verbose is false", () => {
@@ -156,16 +155,26 @@ describe("Logger Utilities", () => {
       const logInput: LogDataInput = { task: "MWarn", message: "Warn on" };
       mutableLogger.warn(logInput);
 
-      expect(warnSpy).toHaveBeenCalledWith({
-        ...logInput,
-        message: "[MWarn] Warn on",
-      });
+      expect(warnSpy).toHaveBeenCalledWith(logInput);
     });
 
     it("should not call baseLogger.warn when verbose is false", () => {
       const mutableLogger = new MutableLogger(baseLoggerMock, false);
       mutableLogger.warn({ message: "Warn off" });
       expect(warnSpy).not.toHaveBeenCalled();
+    });
+
+    it("should fall back to info when the base logger has no warn", () => {
+      // `Logger` declares warn, but a JavaScript caller can supply an object
+      // without it, and wrapping one here produced a logger that HAS warn and
+      // reached the one that did not.
+      const warnless = { info: logSpy, error: errorSpy } as unknown as Logger;
+      const mutableLogger = new MutableLogger(warnless, true);
+      const logInput: LogDataInput = { task: "MWarn", message: "Warn on" };
+
+      mutableLogger.warn(logInput);
+
+      expect(logSpy).toHaveBeenCalledWith(logInput);
     });
 
     it("should log errors when verbose is true", () => {
@@ -179,11 +188,7 @@ describe("Logger Utilities", () => {
 
       mutableLogger.error(logInput);
 
-      expect(errorSpy).toHaveBeenCalledWith({
-        ...logInput,
-        message: "[MError] Error on",
-        error: errorObj,
-      });
+      expect(errorSpy).toHaveBeenCalledWith(logInput);
     });
 
     it("should not log errors when verbose is false", () => {
@@ -200,10 +205,7 @@ describe("Logger Utilities", () => {
       mutableLogger.setVerbose(true);
       const logInput: LogDataInput = { task: "MSet", message: "Now logging" };
       mutableLogger.info(logInput);
-      expect(logSpy).toHaveBeenCalledWith({
-        ...logInput,
-        message: "[MSet] Now logging",
-      });
+      expect(logSpy).toHaveBeenCalledWith(logInput);
 
       mutableLogger.setVerbose(false);
       logSpy.mockClear(); // Clear previous calls

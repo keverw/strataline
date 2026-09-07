@@ -1,15 +1,30 @@
 import { Pool } from "pg";
 import { MigrationManager, Migration } from "../migration-system";
+import { makeSafeLogger } from "../callback-safety";
 import {
-  Logger as StratalineLogger,
-  BaseLogger,
-  LogDataInput,
+  createPrefixedLogger,
   getErrorMessage,
+  type LogLevel,
+  type LogSource,
+  type Logger,
 } from "../logger";
 import EmbeddedPostgres from "embedded-postgres";
 import * as tmp from "tmp";
-import getPort from "get-port";
+import { findFreePort } from "./free-port";
+import { getFilePresence } from "./file-presence";
+// Type-only, and shared with LocalDevDBServer so both surfaces answer
+// getLifecycleState() in one vocabulary. See ./lifecycle-state.
+import { type LifecycleState } from "./lifecycle-state";
+import { isProcessAlive, readPostmasterPidFile } from "./pid-file";
+import {
+  ipcExhaustionHint,
+  PINNED_LOG_LINE_PREFIX,
+  PostgresOutputBuffer,
+  PostgresOutputReader,
+  type PostgresOutputRead,
+} from "./postgres-output";
 import * as fs from "fs";
+import { join } from "path";
 
 // Default configuration for test database
 const DEFAULT_DB_USER = "test_user";
@@ -17,124 +32,132 @@ const DEFAULT_DB_PASSWORD = "test_password";
 const DEFAULT_DB_NAME = "test_database";
 
 /**
+ * The one address this cluster listens on, and the only one to dial it by.
+ *
+ * A literal rather than "localhost", which is a NAME and can resolve to ::1.
+ * See the pinned `listen_addresses` in
+ * {@link TestDatabaseInstance.buildEmbeddedPostgres}: the server is bound to
+ * IPv4 alone, so every client side has to say so too. Named once because
+ * "every client side" turned out to include one that is easy to miss, the
+ * connection embedded-postgres opens for `createDatabase()`.
+ */
+const LOOPBACK_HOST = "127.0.0.1";
+
+export { type LifecycleState } from "./lifecycle-state";
+
+/**
  * Logger function type for TestDatabaseInstance
  */
-export type TestDBLoggerFunction = (
-  type:
-    | "info"
-    | "error"
-    | "warn"
-    | "pg"
-    | "migrate-info"
-    | "migrate-error"
-    | "migrate-warn",
-  message: string,
-) => void;
+/**
+ * The vocabulary this class logs in, and the two axes each word maps to.
+ *
+ * Internal shorthand, the same way LocalDevDBServer keeps one. The `migrate-`
+ * words were a source and a level crossed into a string; here they come apart
+ * into `source: "migration"` and the level they always meant.
+ *
+ * `setup` names the same thing it names on the dev server: the steps of
+ * bringing a cluster up, as opposed to the surface's own voice. It has to,
+ * because a source is what `createConsoleLogger` quiets by name, and a word
+ * that meant startup chatter on one surface and nothing at all on the other
+ * would make `{ setup: false }` a setting whose effect depended on which
+ * database you handed the logger to. Every line here that says what the
+ * startup is doing carries it, and what stays sourceless is what this class
+ * says in its own voice: that it is starting, that it started, that it is
+ * stopping, and why something went wrong.
+ */
+const TEST_DB_LOG_TAGS = {
+  info: ["info", undefined],
+  warn: ["warn", undefined],
+  error: ["error", undefined],
+  pg: ["info", "pg"],
+  setup: ["info", "setup"],
+  "migrate-info": ["info", "migration"],
+  "migrate-warn": ["warn", "migration"],
+  "migrate-error": ["error", "migration"],
+} as const satisfies Record<string, readonly [LogLevel, LogSource | undefined]>;
+
+type TestDBLogTag = keyof typeof TEST_DB_LOG_TAGS;
 
 /**
- * Console-based logger implementation for TestDatabase
- * @param pgVerbose Whether to log verbose PostgreSQL messages
- * @param migrateVerbose Whether to log verbose migration messages
+ * True when a start failed because PostgreSQL could not take the port.
+ *
+ * Read out of the server's own output, because there is nothing else to read:
+ * `EmbeddedPostgres.start()` rejects with a bare `reject()` on the child's
+ * `close`, so every way a start can fail arrives as the same `undefined`.
+ *
+ * Matched across the WHOLE attempt rather than the last thing written, which
+ * is the mistake this encodes against. PostgreSQL reports a taken port over
+ * several lines and the bind line is never the last of them:
+ *
+ *   LOG:  could not bind IPv4 address "127.0.0.1": Address already in use
+ *   WARNING:  could not create listen socket for "127.0.0.1"
+ *   FATAL:  could not create any TCP/IP sockets
+ *   LOG:  database system is shut down
+ *
+ * Testing only the final chunk tests the shutdown notice, which matches
+ * nothing, so the retry never ran at all.
+ *
+ * The socket-creation lines are matched as well as the bind line because the
+ * wording varies with what was taken and with which address families exist.
+ * The IPv6 spellings stay matched too: `listen_addresses` is pinned to IPv4
+ * for the clusters this starts, but the same reader is handed the output of
+ * ones started elsewhere.
+ *
+ * @internal Exported so the match can be checked against real PostgreSQL
+ * output without provoking a port collision.
  */
-export const createTestDBConsoleLogger = (
-  pgVerbose: boolean = false,
-  migrateVerbose: boolean = true,
-): TestDBLoggerFunction => {
-  return (type, message) => {
-    switch (type) {
-      case "info":
-        // eslint-disable-next-line no-console
-        console.log(message);
-        break;
-      case "error":
-        // eslint-disable-next-line no-console
-        console.error(message);
-        break;
-      case "warn":
-        // eslint-disable-next-line no-console
-        console.warn(message);
-        break;
-      case "pg":
-        if (pgVerbose) {
-          // eslint-disable-next-line no-console
-          console.log(`[PG] ${message}`);
-        }
-        break;
-      case "migrate-info":
-        if (migrateVerbose) {
-          // eslint-disable-next-line no-console
-          console.log(`[MIGRATE-INFO] ${message}`);
-        }
-        break;
-      case "migrate-error":
-        // eslint-disable-next-line no-console
-        console.error(`[MIGRATE-ERROR] ${message}`);
-        break;
-      case "migrate-warn":
-        // eslint-disable-next-line no-console
-        console.warn(`[MIGRATE-WARN] ${message}`);
-        break;
-    }
-  };
-};
+export function isBindFailure(output: string): boolean {
+  return /could not bind|address already in use|could not create any TCP\/IP sockets|could not create listen socket/i.test(
+    output,
+  );
+}
 
 /**
- * Adapter that converts between the Strataline Logger interface and our TestDB logger
- * This separates test DB logs from migration system logs while preserving severity levels
+ * An embedded server whose port can be changed between starts.
+ *
+ * Here so the bind retry can reuse one instance rather than construct a
+ * second, which is not a tidiness point. `EmbeddedPostgres` adds `this` to a
+ * module-level set from its CONSTRUCTOR, not from `initialise()`, and nothing
+ * ever removes an entry: its own exit hook then calls `stop()` on every
+ * instance ever built. A start that failed leaves `this.process` pointing at
+ * the postmaster that has already exited, and `stop()` waits for an `exit`
+ * event that fired before its listener was attached and will not fire again —
+ * the same never-ending wait {@link TestDatabaseInstance.stopServerWithinBound}
+ * bounds, except that call is embedded-postgres's own and cannot be bounded
+ * from here. So an abandoned attempt costs ten seconds of async-exit-hook's
+ * force-exit timeout at the end of the run.
+ *
+ * Rebuilding per attempt therefore turned a SUCCESSFUL start into a stalled
+ * exit, on a path a run reaches by having lost a port rather than by having
+ * gone wrong. Reusing the instance registers nothing extra, so a start that
+ * retried and then worked exits as promptly as one that never retried.
+ *
+ * `start()` reads `this.options.port` when it SPAWNS rather than caching it, so
+ * rebinding it between attempts is the whole of what this needs. That reading
+ * is the load-bearing half and no type expresses it: an upstream that moved
+ * the read into the constructor would compile unchanged here and silently
+ * start on the old port, which is a taken port, which is the bug this exists
+ * to avoid arrived at from the other side. A subclass rather than a cast for
+ * the half that IS checked — `options` is `protected` and its `port` a
+ * documented, mutable field, so the compiler at least holds us to the shape.
+ *
+ * What this does NOT fix is the single instance a start that fails outright
+ * leaves behind. That one is embedded-postgres's to fix, and is upstream as
+ * leinelissen/embedded-postgres#32.
  */
-class TestDBStratalineLogger extends BaseLogger implements StratalineLogger {
-  private testDbLogger?: TestDBLoggerFunction;
-
-  constructor(logger?: TestDBLoggerFunction) {
-    super();
-    this.testDbLogger = logger;
-  }
-
-  info(data: LogDataInput): void {
-    if (!this.testDbLogger) {
-      return;
-    }
-
-    const taskPrefix = data.task ? `[${data.task}]` : "";
-    const stagePrefix = data.stage ? `[${data.stage}]` : "";
-    const prefix = `${taskPrefix} ${stagePrefix}`.trim();
-    const message = prefix ? `${prefix} ${data.message}` : data.message;
-
-    // All info logs through this adapter are migration-related
-    this.testDbLogger("migrate-info", message);
-  }
-
-  error(data: LogDataInput): void {
-    if (!this.testDbLogger) {
-      return;
-    }
-
-    const taskPrefix = data.task ? `[${data.task}]` : "";
-    const stagePrefix = data.stage ? `[${data.stage}]` : "";
-    const prefix = `${taskPrefix} ${stagePrefix}`.trim();
-    const errorMsg = data.error
-      ? `${data.message}: ${getErrorMessage(data.error)}`
-      : data.message;
-    const message = prefix ? `${prefix} ${errorMsg}` : errorMsg;
-
-    // All errors through this adapter are migration-related
-    this.testDbLogger("migrate-error", message);
-  }
-
-  warn(data: LogDataInput): void {
-    if (!this.testDbLogger) {
-      return;
-    }
-
-    const taskPrefix = data.task ? `[${data.task}]` : "";
-    const stagePrefix = data.stage ? `[${data.stage}]` : "";
-    const prefix = `${taskPrefix} ${stagePrefix}`.trim();
-    const message = prefix ? `${prefix} ${data.message}` : data.message;
-
-    // All warnings through this adapter are migration-related
-    this.testDbLogger("migrate-warn", message);
+class RetargetablePostgres extends EmbeddedPostgres {
+  /** Points the next `start()` at a different port. */
+  setPort(port: number): void {
+    this.options.port = port;
   }
 }
+
+/** Somewhere for lines to go when no logger was supplied. */
+const noOpLogger: Logger = {
+  info: () => {},
+  warn: () => {},
+  error: () => {},
+};
 
 /**
  * Configuration options for {@link TestDatabaseInstance}. All fields are
@@ -143,7 +166,7 @@ class TestDBStratalineLogger extends BaseLogger implements StratalineLogger {
  */
 export interface TestDatabaseOptions {
   port?: number;
-  logger?: TestDBLoggerFunction;
+  logger?: Logger;
   user?: string;
   password?: string;
   databaseName?: string;
@@ -169,12 +192,36 @@ export interface TestDatabaseOptions {
  * await testDB.stop();
  */
 export class TestDatabaseInstance {
-  private db?: EmbeddedPostgres;
+  private db?: RetargetablePostgres;
+  /**
+   * The server a stop gave up on while its postmaster was still running.
+   *
+   * The counterpart of `LocalDevDBServer`'s `unstoppableChild`, and here for
+   * the same reason: a stop that could not finish must not read as one that
+   * did. Held as the reference rather than a flag so a later {@link stop} has
+   * something to try again with, and so {@link start} can refuse rather than
+   * build a second cluster over the top of a live one.
+   *
+   * Set wherever the cluster was not CONFIRMED GONE — see
+   * {@link stopServerWithinBound} and {@link serverStillRunning}. That is a
+   * live postmaster, and equally a `postmaster.pid` this could not read, since
+   * an answer it could not get must not license deleting a data directory.
+   * Only a file confirmed absent, which is what a clean exit leaves, releases
+   * normally.
+   */
+  private unstoppedServer: RetargetablePostgres | null = null;
   private pool?: Pool;
   private migrationsApplied: boolean = false;
   private tempDir?: string;
   private port: number;
-  private logger?: TestDBLoggerFunction;
+  /**
+   * Whether `findFreePort` chose the port, rather than the caller.
+   *
+   * The retry below is allowed only on a port this picked. See
+   * {@link startWithPortRetry}.
+   */
+  private readonly portChosenAutomatically: boolean;
+  private logger?: Logger;
   private user: string;
   private password: string;
   private databaseName: string;
@@ -187,7 +234,13 @@ export class TestDatabaseInstance {
    */
   constructor(options: TestDatabaseOptions = {}) {
     this.port = options.port || 0; // 0 means we'll find a port dynamically
-    this.logger = options.logger;
+    // Settled once, from the caller's own option, and never recomputed. See
+    // the note in start().
+    this.portChosenAutomatically = !this.port;
+    // Wrapped on the way in, so no call site below has to guard it and a
+    // logger that throws loses its line rather than the process. The other two
+    // entry points do the same; this one was simply missed.
+    this.logger = options.logger && makeSafeLogger(options.logger);
     this.user = options.user || DEFAULT_DB_USER;
     this.password = options.password || DEFAULT_DB_PASSWORD;
     this.databaseName = options.databaseName || DEFAULT_DB_NAME;
@@ -199,48 +252,701 @@ export class TestDatabaseInstance {
    * @param type Message type
    * @param message Message content
    */
-  private log(
-    type:
-      | "info"
-      | "error"
-      | "warn"
-      | "pg"
-      | "migrate-info"
-      | "migrate-error"
-      | "migrate-warn",
-    message: string,
-  ): void {
-    if (this.logger) {
-      this.logger(type, message);
+  private log(type: TestDBLogTag, message: string, override?: LogLevel): void {
+    if (!this.logger) {
+      return;
     }
+
+    const [defaultLevel, source] = TEST_DB_LOG_TAGS[type];
+    const level = override ?? defaultLevel;
+
+    this.logger[level](source ? { source, message } : { message });
+  }
+
+  /**
+   * Which lifecycle this instance is in, decided the same way {@link start}
+   * and {@link stop} decide whether to refuse.
+   *
+   * There to be asked BEFORE either of them, since both refuse an overlap by
+   * throwing and neither is a way to find out. A suite with more than one
+   * route into a teardown — an `afterAll` and its own error handling, say —
+   * has no other way to tell "a stop is already running", which joins, from "a
+   * start is, and this call is about to throw".
+   *
+   * The counterpart of `LocalDevDBServer.getLifecycleState`, answering with
+   * the same {@link LifecycleState} so a host driving both surfaces reads one
+   * vocabulary rather than two. Read entirely from this class's own fields,
+   * which is why the surface that mostly wraps somebody else's library can
+   * answer it at all: what it reports is which lifecycle call this object is
+   * in the middle of, and this object is the thing making them.
+   *
+   * A snapshot, and only this instance's own view — see ./lifecycle-state.
+   *
+   * {@link isReady} is the narrower question and stays: this says which
+   * lifecycle the instance is in, that says whether there is a pool to query
+   * right now. `running` is the only state `isReady` reports true for, and the
+   * two cannot disagree, being read from the same two fields.
+   */
+  public getLifecycleState(): LifecycleState {
+    // Ordered so the answer and the refusal cannot disagree, which is not
+    // quite the order start() guards in — see the retained-server note below.
+    // A teardown clears `pool` before it waits on the server, so reading the
+    // pool first would call an instance being torn down `stopped` and promise
+    // a start() that in fact throws.
+    if (this.startInFlight) {
+      return "starting";
+    }
+
+    // Ahead of the retained server, in the order `LocalDevDBServer` reads its
+    // own two fields. A stop that gave up has finished, so the ordinary way to
+    // hold `unstoppedServer` is with nothing in flight — but a RETRY stop sets
+    // both at once, and that instance is mid-teardown rather than resting:
+    // start() throws and stop() joins the one already running, which is the
+    // `stopping` row rather than the `unstoppable` one. Reading the retained
+    // server first answered `unstoppable` there, so the two surfaces this type
+    // exists to unify gave opposite answers for the same situation.
+    if (this.cleanupInFlight) {
+      return "stopping";
+    }
+
+    // Nothing in flight, so the retained server is the only thing saying this
+    // instance still holds one. Behind the teardown check for the reason
+    // above, and ahead of the pool below, which cannot see it: a stop that
+    // gave up leaves no pool and would otherwise read `stopped`.
+    if (this.unstoppedServer) {
+      return "unstoppable";
+    }
+
+    return this.isRunning && this.pool ? "running" : "stopped";
   }
 
   /**
    * Check if the database is running
+   *
+   * Whether a start finished and a stop has not, which is what a test suite
+   * wants to know. Not a health check: nothing here watches the postmaster, so
+   * a cluster killed out from under a running instance still reads ready.
+   * Confirmed rather than assumed, by SIGKILLing one and looking: the process
+   * survives it, the next query fails at once with `ECONNREFUSED`, and
+   * `stop()` still completes, so what the stale reading costs is a slightly
+   * vaguer error and nothing else.
+   *
+   * Watching for it would mean the child handle, and embedded-postgres keeps
+   * that one `private` rather than `protected` — TypeScript-private, so a
+   * subclass can reach it through a cast, but the compiler then checks
+   * nothing and an upstream rename would leave the listener silently never
+   * firing. That is the trap {@link RetargetablePostgres} documents about
+   * `options.port`, for a smaller payoff. `LocalDevDBServer` answers this from
+   * Node's own report on a child it spawned itself and has no such problem.
+   *
    * @returns true if the database is running and ready for queries
    */
   public isReady(): boolean {
     return this.isRunning && !!this.pool;
   }
 
-  /**
-   * Start the embedded PostgreSQL server and apply migration
-   */
-  public async start(): Promise<void> {
-    if (this.pool) {
-      return;
-    }
+  /** How long a stop is given before it is treated as already done. */
+  private static readonly STOP_TIMEOUT_MS = 10_000;
 
-    // Use a separate try-catch for initial setup errors vs cleanup errors
+  /**
+   * Stops the server under a bound, because the stop it calls can never
+   * return.
+   *
+   * Reported upstream as leinelissen/embedded-postgres#32, "stop() never
+   * resolves if the postmaster already exited, so the exit hook stalls process
+   * exit by 10s", open since July 2026 and unchanged in the 18.4.0-beta.17
+   * this depends on. Watch that issue rather than this comment: when it is
+   * fixed the bound below becomes dead weight and can go.
+   *
+   * `EmbeddedPostgres.stop()` waits for the child's `exit` event and sends
+   * SIGINT to provoke it:
+   *
+   *     await new Promise((resolve) => {
+   *       this.process?.on('exit', resolve);
+   *       this.process?.kill('SIGINT');
+   *     });
+   *
+   * A postmaster that has ALREADY exited fired that event before the listener
+   * was attached, and Node does not replay it. The handle is still set, so the
+   * guard above it passes, and the promise is waited on forever.
+   *
+   * Which is precisely the state a failed start leaves: the postmaster wrote
+   * why it could not start and died, and cleanup() then asks for it to be
+   * stopped. So every failed start hung here rather than rejecting, whatever
+   * the reason for it, and the caller was left with no error at all instead of
+   * the one PostgreSQL had already written. A port that could not be bound is
+   * the way this was found; an incompatible data directory or exhausted shared
+   * memory reach it identically.
+   *
+   * A bound rather than a fix, since the wait belongs to somebody else's code.
+   * Giving up on it is safe in the case that produces it, because the process
+   * being gone is the whole reason the event never came.
+   *
+   * Which is why the timeout alone does not settle it. A postmaster that is
+   * merely SLOW reaches the same timeout: `stop()` sends SIGINT, PostgreSQL
+   * reads that as a fast shutdown, and writing the shutdown checkpoint on a
+   * loaded machine can take longer than the bound. Treating that as "it had
+   * already exited" hands cleanup() a live server and it deletes the data
+   * directory out from under it. So a timeout asks the cluster whether it is
+   * still there — its own postmaster.pid, which PostgreSQL removes only on a
+   * clean exit — and reports which of the two happened. A PID that has been
+   * recycled reads as still running, which errs toward leaving a temporary
+   * directory behind rather than removing a live cluster's.
+   *
+   * What this does NOT cover is the second half of that issue. embedded-postgres
+   * keeps a module-level set of every instance it CONSTRUCTS, never prunes it,
+   * and calls `stop()` on all of them from its own exit hook. That call is not
+   * this one and cannot be bounded from here, so a postmaster that died out of
+   * band can still add its ten seconds to process exit.
+   *
+   * What that leaves is a rule about ABANDONED instances, of which the number
+   * to aim at is zero rather than few. The cost does not scale with the count:
+   * their hook stops every instance under one `Promise.all` and async-exit-hook
+   * arms a single force-exit timer over the whole set, so five stalled
+   * instances cost the same ten seconds as one. What a second instance buys is
+   * therefore nothing at all, which is why {@link RetargetablePostgres} exists
+   * and why the bind retry rebinds a port rather than building again. A start
+   * that fails and is started again does build a second, correctly: `cleanup()`
+   * has dropped the first by then, so the rule is one per start, not one per
+   * instance of this class.
+   *
+   * Clearing the child reference their exit hook reads would cure the stall
+   * outright and is still not done. That one is `private`, it would have to be
+   * gated on the child being confirmed dead — clearing it makes their `stop()`
+   * early-return, so a survivor would be left unsignaled rather than sent the
+   * fast-shutdown SIGINT that call otherwise sends it — and a stalled exit on a
+   * start that has already failed is cheaper than depending on the shape of
+   * somebody else's internals to that depth.
+   */
+  private async stopServerWithinBound(
+    db: EmbeddedPostgres,
+  ): Promise<"stopped" | "still-running"> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const abandoned = new Promise<"timed-out">((resolve) => {
+      timer = setTimeout(
+        () => resolve("timed-out"),
+        TestDatabaseInstance.STOP_TIMEOUT_MS,
+      );
+    });
+
     try {
-      // If no port was specified or port is 0, find an available port
-      if (!this.port || this.port === 0) {
-        this.port = await getPort();
+      const outcome = await Promise.race([
+        db.stop().then(() => "stopped" as const),
+        abandoned,
+      ]);
+
+      if (outcome === "stopped") {
+        return "stopped";
+      }
+
+      if (await this.serverStillRunning()) {
+        this.log(
+          "warn",
+          "Stopping embedded PostgreSQL did not return within " +
+            `${TestDatabaseInstance.STOP_TIMEOUT_MS}ms, and its postmaster could not be confirmed gone. ` +
+            "It is most likely still writing its shutdown checkpoint, though a postmaster.pid this could not " +
+            "read reaches here the same way. Leaving its data directory in place rather than removing it out " +
+            "from under what may be a live server.",
+        );
+
+        return "still-running";
       }
 
       this.log(
+        "warn",
+        "Stopping embedded PostgreSQL did not return. Its postmaster is gone, so this is a wait " +
+          "that never completes rather than a server still running. Carrying on with cleanup.",
+      );
+
+      return "stopped";
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Whether the cluster's own postmaster is still alive.
+   *
+   * Read from `postmaster.pid`, which PostgreSQL writes at startup and removes
+   * only when it exits cleanly, rather than from the child handle: that handle
+   * is private to embedded-postgres, and depending on the shape of somebody
+   * else's internals is what the note above declines to do.
+   *
+   * Unknown counts as running. This gates deleting a data directory, so an
+   * answer it could not get must not license that.
+   *
+   * Which takes the file's PRESENCE as well as its contents, because
+   * `readPostmasterPidFile` cannot tell the two apart on its own: it answers
+   * null for a file that is not there, for one this process may not read, and
+   * for one whose contents are not a record, and those mean opposite things
+   * here. A postmaster removes its own file on a clean exit, so a confirmed
+   * absence is a server that finished. Anything else is a question that could
+   * not be answered, and the caller acts on the answer by deleting the data
+   * directory — so a torn write, an EACCES, or a failing disk has to read as
+   * still running rather than as gone.
+   *
+   * Not fixed in `readPostmasterPidFile` itself, deliberately. That one is
+   * public through `strataline/local-dev-db-server` and callers depend on what
+   * its null means, so the presence check layers on here instead of changing a
+   * published contract.
+   */
+  private async serverStillRunning(): Promise<boolean> {
+    if (!this.tempDir) {
+      return false;
+    }
+
+    const pidFile = join(this.tempDir, "postmaster.pid");
+
+    try {
+      const record = await readPostmasterPidFile(this.tempDir);
+
+      if (record !== null) {
+        return isProcessAlive(record.pid);
+      }
+
+      // No record came back. Only a confirmed absence is a server that exited.
+      return (await getFilePresence(pidFile)) !== "absent";
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * The port an automatic start uses, and the seam the bind race is tested at.
+   *
+   * A `protected` method rather than a mocked module, so the retry path can be
+   * driven from a subclass without reaching into the module registry. It is
+   * the same shape as the injectable `probes` in ./pid-file: the race it exists
+   * for cannot be provoked on demand, and a loop that has never run in any test
+   * is a loop nobody has seen work.
+   *
+   * @internal Not part of the published API.
+   */
+  protected async findPort(): Promise<number> {
+    return findFreePort();
+  }
+
+  /** How many ports a start may lose to the bind race before giving up. */
+  private static readonly PORT_RETRIES = 3;
+
+  /**
+   * Everything PostgreSQL wrote during the current start attempt.
+   *
+   * `EmbeddedPostgres.start()` rejects with no value at all, so the reason a
+   * start failed exists nowhere except the output it logged on the way down,
+   * and that output arrives in several chunks. Reset per attempt, so a retry
+   * is judged on its own failure rather than the previous one's.
+   *
+   * The same buffer LocalDevDBServer keeps, bounded the same way and for the
+   * same reasons. `onLog` keeps firing for the life of the server and nothing
+   * resets this once the start has succeeded, so an unbounded one accumulates
+   * a running database's entire log in memory for a diagnosis nobody is going
+   * to ask for. See PostgresOutputBuffer for why the bound counts characters.
+   */
+  private readonly attemptOutput = new PostgresOutputBuffer();
+
+  /**
+   * The same output again, held back at a line that has not finished arriving.
+   *
+   * One assembler rather than the two LocalDevDBServer keeps, because there is
+   * only one stream to keep them for: embedded-postgres reads the postmaster's
+   * stderr alone, and hands every chunk of it to a single `onLog`.
+   *
+   * See `PostgresOutputReader` in ./postgres-output for why what is logged is
+   * assembled while {@link attemptOutput} above stays exactly as it arrived.
+   */
+  private readonly attemptLines = new PostgresOutputReader();
+
+  /**
+   * Puts a whole message through the logger at the level it asks for.
+   *
+   * PostgreSQL says how bad the line is, in the line. Reading it is what keeps
+   * the `{ pg: false }` source filter focused on routine output rather than
+   * also hiding the FATAL saying why the server would not start. Which message
+   * the level belongs to, when a chunk broke one in half, is
+   * PostgresOutputReader's.
+   */
+  private logServerOutput(reads: PostgresOutputRead[]): void {
+    for (const read of reads) {
+      this.log("pg", read.text, read.level);
+    }
+  }
+
+  /**
+   * Logs a line the assembler is still holding, once nothing more is coming.
+   *
+   * A postmaster that refuses to start writes the reason and exits, and
+   * nothing promises that last write ended in a newline. Called where an
+   * attempt has settled rather than on a stream event, since the stream
+   * belongs to embedded-postgres and this never sees it end.
+   */
+  private flushServerOutput(): void {
+    this.logServerOutput(this.attemptLines.flush());
+  }
+
+  /**
+   * Builds the embedded server for one port, against this run's directory.
+   *
+   * Once per start, never per attempt. A retry rebinds the port on this
+   * instance instead of building another — see {@link RetargetablePostgres}.
+   *
+   * `protected` for the same reason {@link findPort} is: the count is the
+   * whole of what stops an abandoned instance stalling process exit, and a
+   * rule nothing checks is a rule that goes back to being broken. Counting
+   * calls here is how port-retry.test.ts holds a retry to one.
+   *
+   * @internal Not part of the published API.
+   */
+  protected buildEmbeddedPostgres(port: number): RetargetablePostgres {
+    return new RetargetablePostgres({
+      port,
+      user: this.user,
+      password: this.password,
+      persistent: false, // Don't persist data between test runs
+      databaseDir: this.tempDir,
+      // Pin initdb's locale instead of letting it inherit the host/CI
+      // shell's, for two reasons: (1) a Linux-style locale like
+      // LC_ALL=C.UTF-8 makes initdb fail on macOS ("invalid locale settings")
+      // because macOS libc has no C.UTF-8; (2) an inherited locale makes the
+      // DB's collation vary per machine. "C" + UTF8 is valid on every OS and
+      // gives the same byte-order collation everywhere — ideal for a
+      // throwaway DB (just not locale-aware sorting, so don't "fix" this to
+      // en_US).
+      // `--lc-messages=C` as well as `--locale=C`, and the redundancy is the
+      // point. embedded-postgres passes its OWN `--lc-messages`, from a locale
+      // it detects (normally en_US.UTF-8), and it passes it ahead of anything
+      // given here -- and initdb lets an explicit `--lc-messages` beat
+      // `--locale` however they are ordered. So `--locale=C` alone left this
+      // cluster on en_US.UTF-8 while LocalDevDBServer's was on C. Repeating
+      // the flag after theirs is what settles it: initdb takes the last
+      // occurrence, verified against the bundled binary rather than assumed.
+      //
+      // Worth settling because postgresOutputLevel and ipcExhaustionHint read
+      // English severity words out of this server's output. Both clusters now
+      // arrange that rather than one arranging it and the other happening to
+      // detect an English locale.
+      initdbFlags: ["--locale=C", "--encoding=UTF8", "--lc-messages=C"],
+      // IPv4 only, the same pin LocalDevDBServer applies and for the same
+      // reason. embedded-postgres passes no `listen_addresses`, so the cluster
+      // takes PostgreSQL's default of `localhost`, which binds BOTH 127.0.0.1
+      // and ::1 -- and on some hosts the per-connection backends fail to set
+      // TCP_NODELAY on an IPv6 socket and log a FATAL, sometimes crashing.
+      // Binding one family also halves what a start has to acquire: a port
+      // free on IPv4 and taken on ::1 currently fails the whole start, which
+      // is the bind race free-port.ts and the retry below exist to narrow.
+      //
+      // Every client side is pinned to match: the pool, getCredentials(), and
+      // createTestDatabase(), which exists because embedded-postgres would
+      // otherwise dial `localhost` for that one step. A server listening only
+      // on 127.0.0.1 and a client resolving `localhost` to ::1 is a connection
+      // refused, so pinning one end without the other trades a rare failure
+      // for a certain one.
+      // The prefix is pinned for the reason PINNED_LOG_LINE_PREFIX gives, and
+      // on this surface the data directory is a throwaway, so nothing is being
+      // overridden that anybody chose.
+      postgresFlags: [
+        "-c",
+        `listen_addresses=${LOOPBACK_HOST}`,
+        "-c",
+        `log_line_prefix=${PINNED_LOG_LINE_PREFIX}`,
+      ],
+      onLog: (message: string) => {
+        // Appended, not replaced. PostgreSQL writes a failed bind across
+        // several chunks and the bind line is never the last of them: the real
+        // sequence is `could not bind IPv6 address ... Address already in
+        // use`, then `could not create any TCP/IP sockets`, then `database
+        // system is shut down`. Keeping only the last chunk therefore tested
+        // the shutdown notice, matched nothing, and made the retry below
+        // unreachable.
+        this.attemptOutput.append(message);
+        // Whole lines only for the part that is LOGGED, while the buffer above
+        // keeps the bytes as they arrived. embedded-postgres hands on whatever
+        // `chunk.toString('utf-8')` produced, so a severity word can arrive as
+        // `FAT` and then `AL:  ...` — and neither half reads as a severity, so
+        // the FATAL saying why the server would not start is logged at `info`
+        // and a logger built with `{ pg: false }` drops it. See
+        // PostgresOutputReader.
+        this.logServerOutput(this.attemptLines.take(message));
+      },
+    });
+  }
+
+  /**
+   * True when a failed start was PostgreSQL refusing to bind the port.
+   *
+   * Read out of the server's own output rather than from the rejection,
+   * because there is nothing in the rejection to read: embedded-postgres
+   * rejects with a bare `reject()` on the child's `close`, so every way a
+   * start can fail arrives as the same `undefined`. Matching the message is
+   * the only thing that separates a port that was taken from a cluster that
+   * will not start at all, and retrying the second would be three initdbs and
+   * the same failure.
+   */
+  private failedToBind(): boolean {
+    return isBindFailure(this.attemptOutput.read());
+  }
+
+  /**
+   * Turns a failed start into an error that says why.
+   *
+   * `EmbeddedPostgres.start()` rejects with a bare `reject()` on the child's
+   * `close`, so the rejection value is `undefined` and carries nothing at all.
+   * Rethrown as it stands, the first `.message` read on it throws a TypeError
+   * that replaces the failure it was trying to report, and the caller is told
+   * about a property of `undefined` rather than about an incompatible data
+   * directory or exhausted shared memory.
+   *
+   * The reason exists — PostgreSQL wrote it, and {@link attemptOutput} has it
+   * — so a valueless rejection is replaced by an error carrying that text. A
+   * rejection that IS an error is passed through untouched: it already says
+   * more about itself than this could add.
+   */
+  private startFailure(error: unknown): unknown {
+    if (error !== undefined && error !== null) {
+      return error;
+    }
+
+    const detail = this.attemptOutput.read();
+
+    return new Error(
+      detail
+        ? `PostgreSQL failed to start. PostgreSQL said:\n${detail}${ipcExhaustionHint(detail)}`
+        : "PostgreSQL failed to start, and it wrote no output explaining why.",
+    );
+  }
+
+  /**
+   * Creates the test database over the pinned address.
+   *
+   * Deliberately not `EmbeddedPostgres.createDatabase()`, which builds its
+   * client through `getPgClient()` and takes that method's default host of
+   * `localhost`. Against a cluster bound to 127.0.0.1 alone, a host whose
+   * resolver answers ::1 first would fail the start here with ECONNREFUSED,
+   * on a step that worked before the pin only because the cluster happened to
+   * be listening on both families. `getPgClient` takes the host as an
+   * argument, so the same work is done a line lower down and reaches the
+   * address the server is actually on.
+   */
+  private async createTestDatabase(db: RetargetablePostgres): Promise<void> {
+    const client = db.getPgClient("postgres", LOOPBACK_HOST);
+
+    await client.connect();
+
+    try {
+      await client.query(
+        `CREATE DATABASE ${client.escapeIdentifier(this.databaseName)}`,
+      );
+    } finally {
+      await client.end();
+    }
+  }
+
+  /**
+   * Starts the server, taking another port if this one was claimed in the gap.
+   *
+   * The race this closes: `findFreePort` in ./free-port confirms a port is
+   * free and then closes the socket it proved it with, and initdb runs between
+   * that and the postmaster binding it. Anything may take the number in
+   * between, and on a busy machine the likeliest thief is the kernel handing it out as the
+   * local port for an outgoing connection. Choosing from outside the ephemeral
+   * range makes that rare rather than impossible, and a program that binds the
+   * port deliberately is not covered by the range choice at all.
+   *
+   * Cheap, which is what makes it worth doing rather than merely correct.
+   * initdb writes no port into the cluster, so a retry keeps the data
+   * directory it already built and only spawns a new postmaster against it.
+   *
+   * Only for a port this picked. An explicit `port` is the caller naming a
+   * number for a reason, and quietly starting somewhere else would hand back a
+   * database at an address they are not going to connect to.
+   */
+  private async startWithPortRetry(): Promise<void> {
+    // One server for every attempt below, so it is read once. Nothing in the
+    // loop replaces it: a retry rebinds this instance's port rather than
+    // building another, which is the whole point of RetargetablePostgres.
+    const db = this.db;
+
+    if (!db) {
+      throw new Error(
+        "PostgreSQL server was not constructed before start was attempted",
+      );
+    }
+
+    for (
+      let attempt = 0;
+      attempt <= TestDatabaseInstance.PORT_RETRIES;
+      attempt++
+    ) {
+      this.attemptOutput.clear();
+
+      try {
+        await db.start();
+
+        return;
+      } catch (error) {
+        // The postmaster is gone by the time start() rejects, so a line still
+        // held is the last thing it wrote — which on this path is the reason
+        // it would not start. Ahead of every exit below, since both of them
+        // leave: one throws and the other loops on to clear the buffer.
+        this.flushServerOutput();
+
+        const canRetry =
+          this.portChosenAutomatically &&
+          attempt < TestDatabaseInstance.PORT_RETRIES &&
+          this.failedToBind();
+
+        if (!canRetry) {
+          throw this.startFailure(error);
+        }
+
+        const taken = this.port;
+
+        // Rebound rather than rebuilt. A second instance would be registered
+        // for the life of the process and stall its exit — see
+        // RetargetablePostgres. The data directory is unchanged, and initdb
+        // wrote no port into it, so pointing this one at another number is the
+        // whole of what a retry needs.
+        this.port = await this.findPort();
+        db.setPort(this.port);
+
+        // Worth saying out loud rather than retrying quietly. It is the one
+        // symptom of a machine whose ephemeral range covers the ports this
+        // picks from, and a run that says it three times is saying something
+        // the range choice cannot fix.
+        this.log(
+          "warn",
+          `Port ${taken} was taken between being chosen and PostgreSQL binding it. ` +
+            `Retrying on port ${this.port} against the same data directory.`,
+        );
+      }
+    }
+  }
+
+  /**
+   * The start in progress, so a second one is refused rather than run beside
+   * it.
+   *
+   * The same memo `LocalDevDBServer` keeps under the same name, and refused
+   * for the reason it gives: the already-started guard below reads `pool`,
+   * which nothing sets until the very end of a start, so without this two
+   * overlapping calls both find the instance idle and both build a cluster.
+   * The second's `db` and `tempDir` overwrite the first's, and the first
+   * postmaster is then reachable by nothing — `performCleanup` stops and
+   * deletes whatever the fields hold at teardown, and `serverStillRunning`
+   * asks about the wrong data directory — so it outlives the run holding a
+   * port and a temporary directory with nothing recording it. Which is the
+   * outcome the retained-server handling exists to prevent, arrived at from
+   * inside rather than from a stop that gave up.
+   *
+   * Refused rather than joined, as {@link cleanupInFlight} is joined rather
+   * than refused, and the asymmetry is the same one LocalDevDBServer draws: a
+   * start that refuses leaves no database, which is visible and costs a retry,
+   * while a teardown that refused would leave a server running.
+   */
+  private startInFlight: Promise<void> | null = null;
+
+  /**
+   * Start the embedded PostgreSQL server and apply migration
+   *
+   * A second call while one is already starting is refused. Await the first.
+   */
+  public async start(): Promise<void> {
+    // Ahead of the other two, because a start that is still running owns them
+    // both: its own failure path calls cleanup(), and that cleanup is what
+    // sets `unstoppedServer`. Reporting either of those to an overlapping
+    // caller would describe the first start's state rather than the mistake
+    // this call actually made.
+    if (this.startInFlight) {
+      throw new Error(
+        "Cannot start the test database: it is already starting. Await the first start() call.",
+      );
+    }
+
+    // Ahead of the already-started guard below, which cannot see this: a stop
+    // that gave up leaves no pool. Building here would overwrite `db` and
+    // `tempDir` with a fresh cluster's and leave the live one holding its port
+    // and its files with nothing recording it, which is the outcome retaining
+    // them exists to prevent. LocalDevDBServer refuses its own `unstoppable`
+    // state for the same reason.
+    if (this.unstoppedServer) {
+      throw new Error(
+        "A previous test database could not be stopped and its PostgreSQL may still be running. " +
+          "Call stop() again once it has shut down, or construct a new TestDatabaseInstance.",
+      );
+    }
+
+    // Ahead of the already-started guard below, which cannot see a teardown in
+    // progress: cleanup() clears `pool` early and then spends up to ten
+    // seconds waiting on the server. A start() entering during that wait built
+    // a whole new cluster, and the teardown resumed to drop `db` and delete
+    // `tempDir` — by then the NEW cluster's, removed out from under a running
+    // postmaster with its only handle already thrown away. The narrower half
+    // is worse still: entering a moment earlier, while `pool` is briefly set,
+    // returned "already started" for an instance being torn down.
+    //
+    // Refused rather than joined, as LocalDevDBServer refuses a start against
+    // a shutdown. The two describe different end states and waiting would race
+    // the teardown for the same directory. Await stop() first.
+    if (this.cleanupInFlight) {
+      throw new Error(
+        "Cannot start the test database: it is currently being stopped. Await stop() first.",
+      );
+    }
+
+    // Already up, so this is a no-op rather than a refusal, which is the one
+    // overlap neither surface treats as a mistake: the caller asked for a
+    // running database and there is one. Said out loud all the same, the way
+    // LocalDevDBServer says it, because it is the only one of these paths that
+    // returns as though it had done the work. A caller who has lost track of
+    // its own lifecycle otherwise gets no signal at all.
+    if (this.pool) {
+      this.log(
+        "warn",
+        "The test database is already started, skipping start()",
+      );
+
+      return;
+    }
+
+    // Cleared before the promise callers hold settles, so the next start()
+    // sees no memo. `finally` rather than a two-armed `then`, since a failed
+    // start has to clear it too or every retry would be refused.
+    this.startInFlight = this.performStart().finally(() => {
+      this.startInFlight = null;
+    });
+
+    return this.startInFlight;
+  }
+
+  private async performStart(): Promise<void> {
+    // Use a separate try-catch for initial setup errors vs cleanup errors
+    try {
+      // If no port was specified or port is 0, find an available port.
+      // An explicit `port` is taken as given and never searched for: the
+      // caller has a reason for that number, and picking a different one
+      // would silently ignore it.
+      // Decided in the constructor from what the CALLER supplied, not here
+      // from the current port. A second start() on the same instance still
+      // holds the port the first one chose, since cleanup() does not reset it,
+      // so deciding here would call that a supplied port: no fresh search, no
+      // retry on the very path the retry exists for, and a log line crediting
+      // the caller for a number they never gave.
+      if (this.portChosenAutomatically) {
+        this.port = await this.findPort();
+      }
+
+      // Which port, and whether this picked it. An automatic port is the one
+      // worth naming: it is not in the caller's configuration anywhere, so a
+      // log line is the only place it appears, and it is what a "could not
+      // bind" further down would be about. See ./free-port for how it is
+      // chosen and what that does and does not guarantee.
+      this.log(
         "info",
-        `Starting embedded PostgreSQL for tests on port ${this.port}`,
+        `Starting embedded PostgreSQL for tests on port ${this.port}` +
+          (this.portChosenAutomatically
+            ? " (chosen automatically; pass `port` to pin it)"
+            : " (from the supplied `port`)"),
       );
 
       // Create a temporary directory for the database using promise-based approach
@@ -260,53 +966,39 @@ export class TestDatabaseInstance {
         );
       });
 
-      this.log("info", `Created temporary directory: ${this.tempDir}`);
+      this.log("setup", `Created temporary directory: ${this.tempDir}`);
 
       // Create and start an embedded PostgreSQL server
-      this.db = new EmbeddedPostgres({
-        port: this.port,
-        user: this.user,
-        password: this.password,
-        persistent: false, // Don't persist data between test runs
-        databaseDir: this.tempDir,
-        // Pin initdb's locale instead of letting it inherit the host/CI
-        // shell's, for two reasons: (1) a Linux-style locale like
-        // LC_ALL=C.UTF-8 makes initdb fail on macOS ("invalid locale settings")
-        // because macOS libc has no C.UTF-8; (2) an inherited locale makes the
-        // DB's collation vary per machine. "C" + UTF8 is valid on every OS and
-        // gives the same byte-order collation everywhere — ideal for a
-        // throwaway DB (just not locale-aware sorting, so don't "fix" this to
-        // en_US).
-        initdbFlags: ["--locale=C", "--encoding=UTF8"],
-        onLog: (message: string) => {
-          this.log("pg", message);
-        },
-      });
+      this.db = this.buildEmbeddedPostgres(this.port);
 
-      this.log("info", "Initializing embedded PostgreSQL...");
+      this.log("setup", "Initializing embedded PostgreSQL...");
 
       try {
-        // Initialize and start the PostgreSQL server
+        // Initialize and start the PostgreSQL server. initdb writes no port
+        // anywhere, so the cluster it produces belongs to no port in
+        // particular and a retry below can reuse it as it stands.
         await this.db.initialise();
-        this.log("info", "PostgreSQL initialized successfully");
+        this.log("setup", "PostgreSQL initialized successfully");
 
-        await this.db.start();
-        this.log("info", "PostgreSQL server started successfully");
+        await this.startWithPortRetry();
+        this.log("setup", "PostgreSQL server started successfully");
 
         // Create the test database
-        await this.db.createDatabase(this.databaseName);
-        this.log("info", `Created test database: ${this.databaseName}`);
+        await this.createTestDatabase(this.db);
+        this.log("setup", `Created test database: ${this.databaseName}`);
       } catch (error) {
         this.log(
           "error",
-          `Error during PostgreSQL startup: ${(error as Error).message}`,
+          `Error during PostgreSQL startup: ${getErrorMessage(error)}`,
         );
         throw error; // Will be caught by outer try-catch
       }
 
       // Create a connection pool to the test database
       this.pool = new Pool({
-        host: "localhost",
+        // Matches the pinned `listen_addresses` above rather than resolving
+        // `localhost`, which can answer ::1 where nothing is listening.
+        host: LOOPBACK_HOST,
         port: this.port,
         database: this.databaseName,
         user: this.user,
@@ -320,7 +1012,7 @@ export class TestDatabaseInstance {
       try {
         const result = await this.pool.query("SELECT 1 as test_value");
         this.log(
-          "info",
+          "setup",
           `Database connection test successful: ${JSON.stringify(result.rows[0])}`,
         );
         this.log(
@@ -344,7 +1036,7 @@ export class TestDatabaseInstance {
     } catch (error) {
       this.log(
         "error",
-        `Failed to start embedded PostgreSQL: ${(error as Error).message}`,
+        `Failed to start embedded PostgreSQL: ${getErrorMessage(error)}`,
       );
       try {
         // Use a separate try-catch for cleanup to ensure it never throws
@@ -355,6 +1047,31 @@ export class TestDatabaseInstance {
           `Non-fatal error during cleanup after failed start: ${(cleanupError as Error).message}`,
         );
       }
+
+      // The teardown gave up on a postmaster it could not confirm gone, which
+      // `performCleanup` reports by RETURNING with the server retained rather
+      // than by throwing — so the catch above sees nothing and the original
+      // failure would have gone back on its own. That failure is real and
+      // stays the cause, but on its own it describes a start that tidied up
+      // after itself, and this one did not: a PostgreSQL is holding a port and
+      // a data directory, and the only account of it was a log line a caller
+      // with no logger never sees. Said in the error instead, which is the
+      // same bar `LocalDevDBServer.start()` holds its own unstoppable child
+      // to, and for the same reason: the next start() refuses on this state,
+      // so a caller told only about the first failure retries and is refused
+      // for what reads as an unrelated reason.
+      if (this.unstoppedServer) {
+        throw new Error(
+          `The test database failed to start, and the PostgreSQL it had started could not be stopped. ` +
+            `It may still be holding port ${this.port}${
+              this.tempDir ? ` and its data directory (${this.tempDir})` : ""
+            }. ` +
+            "Call stop() once it has shut down, or stop it manually. " +
+            `Cause: ${getErrorMessage(error)}`,
+          { cause: error },
+        );
+      }
+
       throw error;
     }
   }
@@ -381,7 +1098,11 @@ export class TestDatabaseInstance {
     }
 
     return {
-      host: "localhost",
+      // The address the server is actually listening on. See the pinned
+      // `listen_addresses` in buildEmbeddedPostgres: handing back `localhost`
+      // would give a caller a name that can resolve to ::1, where this cluster
+      // is deliberately not bound.
+      host: LOOPBACK_HOST,
       port: this.port,
       database: this.databaseName,
       user: this.user,
@@ -414,7 +1135,11 @@ export class TestDatabaseInstance {
     }
 
     // Create a strataline logger adapter using our logger (if any)
-    const stratalineLogger = new TestDBStratalineLogger(this.logger);
+    // Marked as the migration system's lines rather than the test database's
+    // own, which is what the `migrate-` half of the tag set is for.
+    const stratalineLogger = createPrefixedLogger(this.logger ?? noOpLogger, {
+      source: "migration",
+    });
     const migrationManager = new MigrationManager(this.pool, stratalineLogger);
 
     this.log("migrate-info", "Applying migrations to test database...");
@@ -480,7 +1205,44 @@ export class TestDatabaseInstance {
   /**
    * Clean up resources (internal method)
    */
+  /**
+   * The teardown in progress, so concurrent callers share one rather than
+   * running two over the same state.
+   *
+   * The same memo `LocalDevDBServer` keeps as `shutdownInFlight`, and joined
+   * rather than refused for the same reason: a teardown that threw at an
+   * overlap would leave a server running, which is what the call exists to
+   * prevent. Held at the cleanup rather than at {@link stop}, so a failed
+   * {@link start} tearing its own attempt down joins it too.
+   *
+   * Two of these really did collide, and none of it was theoretical. Both read
+   * `pool` before either cleared it, so the second `pool.end()` rejected with
+   * pg's own "Called end on pool more than once" and was logged as an error
+   * that had not happened. Both then called `stopServerWithinBound` on one
+   * server, which sends a second SIGINT and races two ten-second bounds. And
+   * both decided whether the server had stopped, so one could record it as
+   * unstopped while the other released it, leaving the instance in whichever
+   * state finished last.
+   */
+  private cleanupInFlight: Promise<void> | null = null;
+
   private async cleanup(): Promise<void> {
+    if (this.cleanupInFlight) {
+      return this.cleanupInFlight;
+    }
+
+    // Cleared before the promise callers hold settles, so the next teardown
+    // starts a fresh one. `performCleanup` never throws on its own account,
+    // but `finally` rather than `then` regardless: a memo left behind by a
+    // rejection would have every later stop() join a teardown that is over.
+    this.cleanupInFlight = this.performCleanup().finally(() => {
+      this.cleanupInFlight = null;
+    });
+
+    return this.cleanupInFlight;
+  }
+
+  private async performCleanup(): Promise<void> {
     // Set running state to false immediately
     this.isRunning = false;
 
@@ -497,17 +1259,68 @@ export class TestDatabaseInstance {
       this.pool = undefined;
     }
 
+    // Whether the data directory is this cleanup's to delete. Only a server
+    // confirmed gone frees it: removing the files under a postmaster that is
+    // still shutting down leaves it writing into a directory that is not there
+    // and still holding the port.
+    let serverStopped = true;
+
     if (this.db) {
+      const db = this.db;
+
       try {
-        await this.db.stop();
+        serverStopped = (await this.stopServerWithinBound(db)) === "stopped";
       } catch (error) {
         this.log(
           "error",
           `Error stopping embedded PostgreSQL: ${(error as Error).message}`,
         );
+
+        // A stop that threw settled nothing about the postmaster, and the
+        // initializer above is the answer that deletes the directory. `stop()`
+        // can reject with the server untouched — its Windows branch spawns
+        // taskkill from inside the wait, so a spawn that fails takes the whole
+        // promise down while the postmaster carries on — so ask the cluster
+        // the same question a timeout asks rather than assuming.
+        serverStopped = !(await this.serverStillRunning());
       }
-      this.db = undefined;
-      this.migrationsApplied = false;
+
+      // Only a server confirmed gone is let go. Dropping the reference for one
+      // that is still running would leave nothing to try again with: `stop()`
+      // would find no server and report success, `start()` would build a
+      // second cluster over the top of the live one, and the only account of
+      // it would be a log line. Held instead, the same way LocalDevDBServer
+      // holds a child that outlived its escalation.
+      if (!serverStopped) {
+        this.unstoppedServer = db;
+      } else {
+        this.db = undefined;
+        this.unstoppedServer = null;
+        this.migrationsApplied = false;
+
+        // Nothing more will arrive through `onLog` now that the server this
+        // built is let go, so anything the assembler is still holding is the
+        // last of what it wrote and has nowhere later to be logged from. Not
+        // done on the branch above, where the server is still writing and a
+        // flush would cut a line it has not finished.
+        this.flushServerOutput();
+      }
+    }
+
+    if (this.tempDir && !serverStopped) {
+      this.log(
+        "warn",
+        `Leaving the temporary directory in place: ${this.tempDir}. ` +
+          "PostgreSQL could not be confirmed gone there when the stop gave up, so removing it now might " +
+          "delete a live cluster's files. Call stop() again once it has finished shutting down, " +
+          "or delete the directory by hand once you have checked that nothing is using it.",
+      );
+
+      // The path is KEPT rather than cleared, which is what lets a later
+      // stop() ask whether that cluster is still there and finish the job.
+      // Returning is how the removal below is skipped; there is nothing after
+      // it in this method.
+      return;
     }
 
     // Clean up the temporary directory with a delay
@@ -545,20 +1358,72 @@ export class TestDatabaseInstance {
   }
 
   /**
-   * Stop the embedded database server and clean up resources
-   * @returns A promise that resolves when the database is stopped
+   * Stops the embedded server and cleans up after it.
+   *
+   * Rejects when the server could not be stopped, the way a server's `stop()`
+   * is expected to: fastify's `close()`, Node's own `net.Server.close()`, and
+   * `LocalDevDBServer.stop()` all raise rather than hand back an outcome to
+   * inspect, and a teardown that reported failure only through a return value
+   * is a teardown most callers will never check. Both database surfaces here
+   * therefore fail the same way, so learning one does not teach the wrong
+   * thing about the other.
+   *
+   * The cost is deliberate and worth stating: this usually runs in an
+   * `afterAll`, so a rejection fails the suite. That is the point — a
+   * PostgreSQL still holding a port and a data directory is a real problem
+   * with the run, not a detail to leave in a log nobody reads. Where it is
+   * genuinely not worth failing over, `catch` it at the call site, which is a
+   * decision the caller can make and this method cannot.
+   *
+   * Safe to call again. A stop that could not finish keeps the server and its
+   * data directory, so a later call asks the cluster afresh and completes once
+   * the postmaster has gone.
+   *
+   * Refused only against a start, which is the one overlap a teardown cannot
+   * wait out: `performCleanup` would end the pool and stop the server while
+   * the start is still spawning one, and a start that fails tears its own
+   * attempt down anyway. The same refusal `LocalDevDBServer.stop()` makes, and
+   * the only one either of them makes — a second stop joins the first rather
+   * than throwing, since a teardown that refused would leave a server running.
+   * Await `start()` first.
+   *
+   * @throws When the stop gave up without confirming the cluster was gone,
+   * when a start is in flight, or when the teardown fails for any other
+   * reason.
    */
   public async stop(): Promise<void> {
+    if (this.startInFlight) {
+      throw new Error(
+        "Cannot stop the test database: it is currently starting. Await start() first.",
+      );
+    }
+
     this.log("info", "Stopping test database...");
+
     try {
       await this.cleanup();
-      this.log("info", "Test database stopped");
     } catch (error) {
+      // Nothing here is expected — cleanup() handles its own filesystem and
+      // shutdown errors — so this is the unforeseen one. Logged for the
+      // context the throw does not carry, then raised rather than swallowed.
       this.log(
         "error",
-        `Error during database stop: ${(error as Error).message}`,
+        `Error during database stop: ${getErrorMessage(error)}`,
       );
-      // Don't rethrow to keep stop() fail-safe
+
+      throw error;
     }
+
+    if (this.unstoppedServer) {
+      throw new Error(
+        "Test database was not stopped: PostgreSQL could not be confirmed gone when the stop gave up, " +
+          `so the server and its data directory have been kept${
+            this.tempDir ? ` (${this.tempDir})` : ""
+          }. ` +
+          "Call stop() again once it has finished shutting down.",
+      );
+    }
+
+    this.log("info", "Test database stopped");
   }
 }

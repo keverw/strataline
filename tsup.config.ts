@@ -72,6 +72,17 @@ export default defineConfig([
     clean: true, // Safe to clean since it's in its own subdirectory
     external: allExternals,
   },
+  // Logging
+  {
+    entry: ["src/logger.ts"],
+    outDir: "dist/logger",
+    format: ["cjs", "esm"],
+    dts: true,
+    splitting: false,
+    sourcemap: true,
+    clean: true, // Safe to clean since it's in its own subdirectory
+    external: allExternals,
+  },
   // Test database instance
   {
     entry: ["src/test-db-instance.ts"],

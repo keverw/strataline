@@ -81,7 +81,7 @@ export function createSchemaHelpers(
 
   /**
    * Resolve whether a table (or other relation) exists, the way Postgres itself
-   * would resolve `ALTER TABLE <name>`: through `to_regclass`, which honours the
+   * would resolve `ALTER TABLE <name>`: through `to_regclass`, which honors the
    * current `search_path` and accepts schema-qualified names ("schema.table").
    * Returns true if the relation exists, false otherwise.
    *
