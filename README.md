@@ -77,7 +77,7 @@ Whether you're building a side project or orchestrating millions of rows in prod
     - [How Shutdown Works](#how-shutdown-works)
     - [Who Exits](#who-exits)
     - [Probing for a Running Server](#probing-for-a-running-server)
-    - [Using With Your Application](#using-with-your-application)
+    - [Using with Your Application](#using-with-your-application)
     - [Git Configuration](#git-configuration)
   - [Locale and Collation](#locale-and-collation)
 - [Development](#development)
@@ -1266,7 +1266,7 @@ For more context, you can refer to this [GitHub issue](https://github.com/leinel
 
 ### Test DB Instance
 
-This helper creates short-lived, non-persistent Postgres clusters for testing purposes. It provides isolated database instances that automatically shut down when tests complete, with optional migration application. Using `embedded-postgres`, it runs PostgreSQL directly in your test environment without external dependencies, making it ideal for integration and unit tests.
+This helper creates short-lived, non-persistent Postgres clusters for testing purposes. It provides isolated database instances that you stop during test teardown, with optional migration application. Using `embedded-postgres`, it runs PostgreSQL directly in your test environment without external dependencies, making it ideal for integration and unit tests.
 
 #### Features
 
@@ -1473,7 +1473,7 @@ It uses the same embedded PostgreSQL binaries as Strataline's Test DB Instance, 
 - The dev database server (`bun run dev:db`) uses [@embedded-postgres](https://www.npmjs.com/package/@embedded-postgres) to provide platform-specific PostgreSQL 18 binaries via npm.
   - _Note: Strataline currently depends on a **pre-release** (beta) of `embedded-postgres` for its PostgreSQL 18 binaries, and the version range (`^18.4.0-beta.17`) can resolve forward to later 18.x betas. This only affects the local embedded dev/test databases, never your production instance, but pin the exact version in your own `package.json` if you want fully reproducible local builds._
 - _Note: The embedded dev database does **not** bundle `pg_upgrade`. When we bump the embedded version in the future, you may need to delete your local data directory (`pgdata/`) and let it reinitialize. This is usually fine for dev/test workflows._
-- **Production deployments** still require a managed PostgreSQL 18+ instance, and upgrades must be handled manually by your ops team.
+- **Production deployments** should use a separate PostgreSQL instance because the embedded helpers are intended only for local development and testing. A managed PostgreSQL 18+ service is recommended, with upgrades handled through your provider or operations team.
 
 Unlike test instances, the dev server is designed to **persist data between restarts**. That means you can keep your seeded content, local accounts, and data intact between sessions, making it especially useful when developing or demoing your app.
 
@@ -1483,7 +1483,7 @@ This setup is great for:
 - Testing workflows without needing to re-seed every time
 - Building or demoing features against consistent local data
 
-The server handles startup, cleanup, and automatically creates the specified user, password, and database combination for you.
+On the first start for a data directory, the server initializes a PostgreSQL cluster and creates the configured user and database. Later starts reuse that cluster and its data. They create the configured user or database only if either is missing.
 
 #### Setting Up a Dev Database Script
 
@@ -1643,7 +1643,7 @@ const server = new LocalDevDBServer({
 
 > **Note on Required Fields:** `port`, `user`, `password`, `database`, `dataDir`, and `pidFile` are all required (TypeScript enforces this). Only `logger`, `onExit`, and `logConnections` are optional. This differs from the [Test DB Instance](#test-db-instance), where everything, including the port, is optional and a free port is auto-assigned, because test databases are throwaway and isolated while the dev server is long-lived and shared with your app.
 
-**Note:** The server automatically creates the specified user, password, and database during startup. You don't need to create these manually - just specify the credentials you want to use and the server will set them up for you.
+**Note:** The server initializes `dataDir` only when it does not already contain an initialized PostgreSQL cluster. On every start, it checks for the configured user and database and creates either only if missing. An existing application user's password is left unchanged, so keep the same user and password when restarting an existing data directory. To change that password, alter the role in PostgreSQL or start with a fresh data directory.
 
 > **Heads up: a `postgres` superuser is also created.** Besides the user you configure, startup ensures a `postgres` superuser exists with the well-known password `postgres` (it's created if missing, or its password is reset to `postgres` if it already exists). This is a local-development convenience, but it means the cluster has a predictable superuser login. Keep the dev server bound to localhost (it is, by default) and **don't expose its port** on shared or untrusted networks.
 
@@ -1694,7 +1694,7 @@ The logger is the `Logger` interface exported from `strataline/logger`, and the 
 
 #### Data Persistence
 
-The dev server creates a persistent data directory (e.g., `pgdata/`) that maintains your database state between restarts. This means:
+The dev server initializes a persistent data directory (e.g., `pgdata/`) once, then reuses it on later starts. This means:
 
 - Your tables, data, and schema changes persist across server restarts
 - You can seed data once and keep it for development sessions
@@ -1882,9 +1882,9 @@ One `process` listener is installed for `exit`, and it force-kills a surviving p
 
 | What happened | `onExit` |
 | --- | --- |
-| You called `stop()` or `shutdown(signal)` | not called — you are awaiting it |
-| A signal | not called — nothing is trapped |
-| An uncaught exception in your process | not called — not this library's business |
+| You called `stop()` or `shutdown(signal)` | not called because you are awaiting it |
+| A signal | not called because nothing is trapped |
+| An uncaught exception in your process | not called because this library does not handle it |
 | The server died unasked | **called** with PostgreSQL's exit code |
 
 Supply nothing and nothing happens. The process stays up with no database behind it, which is logged as an error precisely because it is otherwise silent. Deciding that a dead database should take the program with it is the program's call. A test harness, a provisioning step, or anything that wanted a database for a while may have somewhere to carry on to.
@@ -1921,6 +1921,8 @@ if (status.running || status.indeterminate) {
 }
 ```
 
+You can supply `connectionProbe` to perform the connection tiebreaker through a custom integration. `connection.timeoutMs`, which defaults to three seconds, bounds how long the status check awaits the built-in or custom probe. If the probe does not settle in time, the status remains `indeterminate` and its `reason` reports the timeout.
+
 **Three answers, not two.** This is the whole point of the shape, and the reason `running: false` is not a license to do anything destructive:
 
 | Field | Meaning |
@@ -1937,7 +1939,7 @@ The rest of the result carries what was found: `pid`, `startedAt`, `dataDir`, `p
 
 Identification uses the process command line, start time, current boot, data directory, and owning uid, whichever the platform supplies. `DevDBServerStatus`, `DevDBStatusOptions`, `DevDBStaleKind`, and `DevDBStatusSource` are all exported if you want the named types.
 
-#### Using With Your Application
+#### Using with Your Application
 
 Once the dev server is running, configure your application to connect to it:
 

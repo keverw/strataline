@@ -1368,6 +1368,37 @@ describe("connection tiebreaker", () => {
     expect(status.reason).toContain("nothing answered on port 5433");
   });
 
+  test("bounds a custom connection probe with the configured timeout", async () => {
+    writeFileSync(pidFile, String(4242));
+
+    const status = await getLocalDevDBServerStatus({
+      pidFile,
+      dataDir,
+      probes: probesWith({
+        isAlive: () => true,
+        command: () => null,
+        startTime: () => null,
+        bootTime: () => null,
+      }),
+      connection: { ...CONNECTION, timeoutMs: 25 },
+      connectionProbe: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+
+        return {
+          dataDir,
+          startedAt: null,
+          responded: true,
+          error: null,
+        };
+      },
+    });
+
+    expect(status.running).toBe(false);
+    expect(status.indeterminate).toBe(true);
+    expect(status.reason).toContain("timed out after 25ms");
+    expect(status.probeFailures.join(" ")).toContain("timed out after 25ms");
+  });
+
   test("is skipped entirely when no connection details are given", async () => {
     const pid = await spawnFakePostgres(null);
     writeFileSync(pidFile, String(pid));

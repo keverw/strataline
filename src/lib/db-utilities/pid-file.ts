@@ -224,7 +224,7 @@ export interface DevDBStatusOptions {
    * itself. Omit to skip that step entirely.
    */
   connection?: DevDBConnectionProbe;
-  /** Override the connection probe. Intended for tests. */
+  /** Use a custom connection probe. It is bounded by connection.timeoutMs. */
   connectionProbe?: (
     connection: DevDBConnectionProbe,
   ) => Promise<DevDBConnectionResult>;
@@ -1759,7 +1759,7 @@ export interface DevDBConnectionProbe {
   password: string;
   database: string;
   host?: string;
-  /** How long to wait before giving up. Defaults to 3 seconds. */
+  /** How long the status check waits for the tiebreaker. Defaults to 3 seconds. */
   timeoutMs?: number;
 }
 
@@ -1915,9 +1915,18 @@ export async function getLocalDevDBServerStatus(
   // tiebreaker that could not run is exactly what a person reading a refusal
   // wants named.
   let answer: DevDBConnectionResult;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutMs = options.connection.timeoutMs ?? 3000;
 
   try {
-    answer = await probe(options.connection);
+    answer = await Promise.race([
+      probe(options.connection),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => {
+          reject(new Error(`connection probe timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      }),
+    ]);
   } catch (e) {
     const failure = `connection identification: ${describeProbeError(e)}`;
 
@@ -1926,6 +1935,10 @@ export async function getLocalDevDBServerStatus(
       probeFailures: mergeProbeFailures(status.probeFailures, [failure]),
       reason: `${status.reason}; the server on port ${options.connection.port} could not be asked to identify itself (${getProbeErrorMessage(e)})`,
     };
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
   }
 
   if (answer.dataDir !== null) {
