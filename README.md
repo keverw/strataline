@@ -802,12 +802,7 @@ interface MigrationResult {
   // "lock_lost" = held the lock but lost it mid-run (unsafe; run was aborted).
   // "aborted"   = stopped early via a caller-supplied AbortSignal (graceful).
   status:
-    | "completed"
-    | "locked"
-    | "lock_lost"
-    | "error"
-    | "deferred"
-    | "aborted";
+    "completed" | "locked" | "lock_lost" | "error" | "deferred" | "aborted";
   reason?: string; // User-friendly error/deferral message
   completedMigrations: string[]; // IDs of migrations completed in this run
   previouslyAppliedMigrations: string[]; // IDs *fully* applied in previous runs (every phase done). A migration that only partially applied before (e.g. a phase failed/was interrupted) is NOT counted here — it appears in pendingMigrations instead, so the two lists never overlap.
@@ -1745,11 +1740,7 @@ Overlapping lifecycle requests are not queued. `start()` rejects while a start o
 
 ```ts
 type DevDBLifecycleState =
-  | "stopped"
-  | "starting"
-  | "running"
-  | "stopping"
-  | "unstoppable";
+  "stopped" | "starting" | "running" | "stopping" | "unstoppable";
 
 server.getLifecycleState(); // "running"
 ```
