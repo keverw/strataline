@@ -1914,6 +1914,8 @@ if (status.running || status.indeterminate) {
 
 You can supply `connectionProbe` to perform the connection tiebreaker through a custom integration. `connection.timeoutMs`, which defaults to three seconds, bounds how long the status check awaits the built-in or custom probe. If the probe does not settle in time, the status remains `indeterminate` and its `reason` reports the timeout.
 
+That bound covers the tiebreaker as a whole rather than each step of it. The built-in probe makes a connection and then two queries, so it spends a share of the budget on each rather than the whole value on all three, and it is the caller's limit that holds. Because the value is divided, it has to be a whole number of milliseconds, at least 5 and no larger than a timer can hold. Anything else throws as soon as the status check is called, naming the option and what was read, rather than being clamped to something the caller did not write.
+
 **Three answers, not two.** This is the whole point of the shape, and the reason `running: false` is not a license to do anything destructive:
 
 | Field | Meaning |

@@ -1399,6 +1399,87 @@ describe("connection tiebreaker", () => {
     expect(status.probeFailures.join(" ")).toContain("timed out after 25ms");
   });
 
+  test("rejects a timeout that cannot bound the steps it is split across", async () => {
+    // Clamping would be worse than refusing: the caller wrote a bound, and a
+    // status check that quietly runs to a different one is the thing the
+    // option exists to prevent. Each of these is a plausible way to write it
+    // wrong rather than an arbitrary bad value. The last one is the same
+    // failure from the other end, since setTimeout reruns a delay past the
+    // 32-bit ceiling as 1ms rather than refusing it.
+    for (const timeoutMs of [0, -1, 4, 2.5, Number.NaN, 2_147_483_648]) {
+      writeFileSync(pidFile, String(4242));
+
+      await expect(
+        getLocalDevDBServerStatus({
+          pidFile,
+          dataDir,
+          probes: probesWith({
+            isAlive: () => true,
+            command: () => null,
+            startTime: () => null,
+            bootTime: () => null,
+          }),
+          connection: { ...CONNECTION, timeoutMs },
+          connectionProbe: async () => {
+            throw new Error("the probe should never have been reached");
+          },
+        }),
+      ).rejects.toThrow(/connection\.timeoutMs must be a whole number/);
+    }
+  });
+
+  test("rejects before opening anything, so nothing is left to clean up", async () => {
+    // The check has to happen ahead of the probe rather than inside it. A
+    // connection opened and then abandoned over a bad constant is a socket
+    // nobody closes, and the error would name the connection rather than the
+    // option that was wrong.
+    writeFileSync(pidFile, String(4242));
+
+    let reached = false;
+
+    await expect(
+      getLocalDevDBServerStatus({
+        pidFile,
+        dataDir,
+        probes: probesWith({
+          isAlive: () => true,
+          command: () => null,
+          startTime: () => null,
+          bootTime: () => null,
+        }),
+        connection: { ...CONNECTION, timeoutMs: 0 },
+        connectionProbe: async () => {
+          reached = true;
+
+          return { dataDir, startedAt: null, responded: true, error: null };
+        },
+      }),
+    ).rejects.toThrow();
+
+    expect(reached).toBe(false);
+  });
+
+  test("rejects a bad timeout even when the tiebreaker would not have run", async () => {
+    // The tiebreaker is only reached when the cheap checks cannot decide, so
+    // validating where it is used would make an unusable timeout an error on
+    // some runs and silence on others. A caller who never sees the complaint
+    // on the runs that decide early is the one who finds it during an
+    // ambiguous shutdown, which is the worst moment to learn the bound was
+    // never in force.
+    writeFileSync(
+      pidFile,
+      JSON.stringify(buildDevDBPidRecord(DEAD_PID, dataDir, 5433)),
+    );
+
+    await expect(
+      getLocalDevDBServerStatus({
+        pidFile,
+        dataDir,
+        connection: { ...CONNECTION, timeoutMs: 0 },
+      }),
+    ).rejects.toThrow(/connection\.timeoutMs must be a whole number/);
+  });
+
   test("is skipped entirely when no connection details are given", async () => {
     const pid = await spawnFakePostgres(null);
     writeFileSync(pidFile, String(pid));

@@ -1765,6 +1765,12 @@ export interface DevDBConnectionProbe {
    * It bounds the tiebreaker as a whole rather than each step of it, so
    * {@link identifyViaConnection} spends a fraction of it on connecting and a
    * fraction on each query rather than the whole value on all three.
+   *
+   * Must be a whole number of milliseconds, at least 5, which is where every
+   * step of the split still gets one, and no larger than a timer can hold. A
+   * value outside that throws rather than being clamped, since a bound quietly
+   * replaced by a different one is how a status check comes to outlast the
+   * limit it was given.
    */
   timeoutMs?: number;
 }
@@ -1781,6 +1787,66 @@ export interface DevDBConnectionResult {
   error: string | null;
 }
 
+/** Default bound on the connection tiebreaker, in milliseconds. */
+const DEFAULT_CONNECTION_TIMEOUT_MS = 3000;
+
+/**
+ * Smallest bound the tiebreaker can be given, in milliseconds.
+ *
+ * The budget is divided across a connect and two queries, and node-postgres
+ * reads a zero timeout as no timeout at all, so a value small enough to round
+ * a step down to nothing would remove the bound it was asked to tighten. Five
+ * is where every step still gets a whole millisecond. It is a floor on what is
+ * meaningful rather than a recommendation: a value this small will time out
+ * against any real server, which is the caller's business, but it will do so
+ * having actually been bounded.
+ */
+const MIN_CONNECTION_TIMEOUT_MS = 5;
+
+/**
+ * Largest bound the tiebreaker can be given, in milliseconds.
+ *
+ * The same failure as the floor, from the other end: setTimeout holds its
+ * delay in a 32-bit signed integer, and a larger one is not rejected but
+ * silently rerun as 1ms, so a caller asking for an hour would get a
+ * tiebreaker that gave up before it could connect and a status that went
+ * indeterminate every time. This is a little over 24 days, which is not a
+ * timeout anybody means.
+ */
+const MAX_CONNECTION_TIMEOUT_MS = 2_147_483_647;
+
+/**
+ * Reads a caller-supplied tiebreaker timeout, or the default when there is
+ * none.
+ *
+ * Rejected rather than clamped, and rejected before anything is opened. A
+ * timeout is the one option here whose whole job is to be an upper bound, so
+ * quietly substituting a different number for an unusable one configures
+ * something other than what was written and says nothing, which is how a
+ * status check comes to hang on a value that looked like it forbade hanging.
+ * Fractions are refused for the same reason the CLI refuses them in its
+ * numeric environment variables: `0.5` is far likelier to be seconds written
+ * in the wrong unit than a request for half a millisecond.
+ */
+function resolveConnectionTimeoutMs(timeoutMs: number | undefined): number {
+  if (timeoutMs === undefined) {
+    return DEFAULT_CONNECTION_TIMEOUT_MS;
+  }
+
+  if (
+    !Number.isInteger(timeoutMs) ||
+    timeoutMs < MIN_CONNECTION_TIMEOUT_MS ||
+    timeoutMs > MAX_CONNECTION_TIMEOUT_MS
+  ) {
+    throw new Error(
+      `connection.timeoutMs must be a whole number of milliseconds between ${MIN_CONNECTION_TIMEOUT_MS} and ${MAX_CONNECTION_TIMEOUT_MS}, but was ${String(timeoutMs)}. ` +
+        "It bounds the connection tiebreaker as a whole, which is a connect and two queries, so a smaller value cannot bound each of them, and a larger one does not fit the timer that enforces it.",
+    );
+  }
+
+  return timeoutMs;
+}
+
 /**
  * Asks a running PostgreSQL to identify itself.
  *
@@ -1792,7 +1858,7 @@ export interface DevDBConnectionResult {
 export async function identifyViaConnection(
   connection: DevDBConnectionProbe,
 ): Promise<DevDBConnectionResult> {
-  const timeoutMs = connection.timeoutMs ?? 3000;
+  const timeoutMs = resolveConnectionTimeoutMs(connection.timeoutMs);
   // timeoutMs bounds the whole probe, not each of its steps. This runs a
   // connect and then two queries, so giving all three the full value would
   // let the total reach three times it, and getLocalDevDBServerStatus would
@@ -1801,6 +1867,13 @@ export async function identifyViaConnection(
   // The budget is split instead, with the remainder left as margin so a step
   // that runs out of time reports its own error rather than racing the
   // caller's timeout for which message the reader gets.
+  //
+  // The floors below cannot fire while MIN_CONNECTION_TIMEOUT_MS is 5, since
+  // that is the value at which the smallest share still rounds to a whole
+  // millisecond. They are kept because node-postgres reads a zero timeout as
+  // no timeout at all, so a later change to the floor or to these fractions
+  // would not fail here, it would quietly hand an unresponsive server an
+  // unbounded connection.
   const connectTimeoutMs = Math.max(1, Math.floor(timeoutMs * 0.5));
   const queryTimeoutMs = Math.max(1, Math.floor(timeoutMs * 0.2));
   const client = new Client({
@@ -1904,6 +1977,15 @@ export async function identifyViaConnection(
 export async function getLocalDevDBServerStatus(
   options: DevDBStatusOptions,
 ): Promise<DevDBServerStatus> {
+  // Read the caller's bound before any of the work, not at the point the
+  // tiebreaker uses it. Whether that point is reached depends on what the
+  // cheap checks find, so validating there would reject an unusable timeout
+  // only on the runs that happened to need it, and a configuration error that
+  // shows up on some runs and not others is one nobody finds until it matters.
+  const timeoutMs = options.connection
+    ? resolveConnectionTimeoutMs(options.connection.timeoutMs)
+    : DEFAULT_CONNECTION_TIMEOUT_MS;
+
   const status = await probeStatusFromFiles(options);
 
   // The cheap checks decided, so there is nothing to pay for.
@@ -1932,7 +2014,6 @@ export async function getLocalDevDBServerStatus(
   // wants named.
   let answer: DevDBConnectionResult;
   let timeout: ReturnType<typeof setTimeout> | undefined;
-  const timeoutMs = options.connection.timeoutMs ?? 3000;
 
   try {
     answer = await Promise.race([
