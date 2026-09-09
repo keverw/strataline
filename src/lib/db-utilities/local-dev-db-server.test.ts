@@ -3929,6 +3929,56 @@ describe("LocalDevDBServer", () => {
     }
   }, 30000);
 
+  it("should finish within timeoutMs rather than spending it on each step", async () => {
+    // timeoutMs is what getLocalDevDBServerStatus waits for, so this probe has
+    // to fit its connect and its two queries inside that one budget. Giving
+    // every step the full value put the worst case at three times it, and the
+    // caller stopped waiting first: a server that connected slowly but was
+    // about to name its own data directory got cut off and reported as
+    // unidentifiable. The silent listener below never completes a handshake,
+    // so the connect step alone runs to its limit and the elapsed time is that
+    // limit rather than the whole budget.
+    const accepted: Socket[] = [];
+
+    const silent = createServer((socket) => {
+      accepted.push(socket);
+    });
+
+    const silentPort = await findFreePort();
+
+    await new Promise<void>((resolve) => silent.listen(silentPort, resolve));
+
+    try {
+      const timeoutMs = 1000;
+      const started = Date.now();
+
+      const result = await identifyViaConnection({
+        port: silentPort,
+        user: "test_dev_user",
+        password: "test_dev_password",
+        database: "test_dev_database",
+        timeoutMs,
+      });
+
+      const elapsed = Date.now() - started;
+
+      // That it was the connect step running out its own budget, rather than
+      // the attempt failing at once for some unrelated reason, which would
+      // pass the upper bound below without measuring anything.
+      expect(result.error).toMatch(/timeout/i);
+      expect(elapsed).toBeGreaterThanOrEqual(timeoutMs * 0.4);
+      // Comfortably under the budget rather than at it, so the two queries
+      // that a real server would go on to answer still have room.
+      expect(elapsed).toBeLessThan(timeoutMs * 0.8);
+    } finally {
+      for (const socket of accepted) {
+        socket.destroy();
+      }
+
+      await new Promise<void>((resolve) => silent.close(() => resolve()));
+    }
+  }, 30000);
+
   it("should report a real running server as running", async () => {
     // End to end through the status function against genuine PostgreSQL,
     // rather than the stand-in process the unit tests spawn.

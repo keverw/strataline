@@ -1759,7 +1759,13 @@ export interface DevDBConnectionProbe {
   password: string;
   database: string;
   host?: string;
-  /** How long the status check waits for the tiebreaker. Defaults to 3 seconds. */
+  /**
+   * How long the status check waits for the tiebreaker. Defaults to 3 seconds.
+   *
+   * It bounds the tiebreaker as a whole rather than each step of it, so
+   * {@link identifyViaConnection} spends a fraction of it on connecting and a
+   * fraction on each query rather than the whole value on all three.
+   */
   timeoutMs?: number;
 }
 
@@ -1787,17 +1793,27 @@ export async function identifyViaConnection(
   connection: DevDBConnectionProbe,
 ): Promise<DevDBConnectionResult> {
   const timeoutMs = connection.timeoutMs ?? 3000;
+  // timeoutMs bounds the whole probe, not each of its steps. This runs a
+  // connect and then two queries, so giving all three the full value would
+  // let the total reach three times it, and getLocalDevDBServerStatus would
+  // stop waiting first: a server that connected slowly but was about to name
+  // its own data directory would be cut off and reported as unidentifiable.
+  // The budget is split instead, with the remainder left as margin so a step
+  // that runs out of time reports its own error rather than racing the
+  // caller's timeout for which message the reader gets.
+  const connectTimeoutMs = Math.max(1, Math.floor(timeoutMs * 0.5));
+  const queryTimeoutMs = Math.max(1, Math.floor(timeoutMs * 0.2));
   const client = new Client({
     host: connection.host ?? "127.0.0.1",
     port: connection.port,
     user: connection.user,
     password: connection.password,
     database: connection.database,
-    connectionTimeoutMillis: timeoutMs,
-    // The connection timeout stops covering us once the socket is open. Apply
-    // the same bound to both identification queries so an unresponsive server
+    connectionTimeoutMillis: connectTimeoutMs,
+    // The connection timeout stops covering us once the socket is open, so
+    // both identification queries are bounded too and an unresponsive server
     // cannot hang status checks or LocalDevDBServer.start() indefinitely.
-    query_timeout: timeoutMs,
+    query_timeout: queryTimeoutMs,
   });
 
   try {
