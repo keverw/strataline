@@ -4227,7 +4227,7 @@ describe("LocalDevDBServer", () => {
   describe("accounting for the records a start decided about", () => {
     // The records are read before the status probe and confirmed after it.
     // Reading only afterwards let a record written while the probe was running
-    // — it can wait out a three-second connection timeout — become the one the
+    // — it can wait out the tiebreaker's whole budget — become the one the
     // start accounted for, without the decision having examined it at all. The
     // removals at the end then deleted a live postmaster.pid as unchanged.
     type Accounting = {

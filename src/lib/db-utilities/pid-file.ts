@@ -1760,13 +1760,21 @@ export interface DevDBConnectionProbe {
   database: string;
   host?: string;
   /**
-   * How long the status check waits for the tiebreaker. Defaults to 3 seconds.
+   * How long the status check waits for the tiebreaker. Defaults to 6 seconds.
    *
    * It bounds the tiebreaker as a whole rather than each step of it, so
-   * {@link identifyViaConnection} spends a fraction of it on connecting and a
-   * fraction on each query rather than the whole value on all three.
+   * {@link identifyViaConnection} spends a share of it on connecting (50%), a
+   * share on each of its two queries (20% each), and a share on closing (5%),
+   * rather than the whole value on each of them. The remainder is margin, so a
+   * connect or a query that runs out of time reports its own error rather than
+   * racing the status check's timeout for which message the reader gets. The
+   * close reports nothing, since by then the answer is already in hand.
    *
-   * Must be a whole number of milliseconds, at least 5, which is where every
+   * The default is twice the three seconds a single step used to get, so the
+   * connect keeps the bound it always had while the whole probe now finishes
+   * inside a value the caller wrote.
+   *
+   * Must be a whole number of milliseconds, at least 20, which is where every
    * step of the split still gets one, and no larger than a timer can hold. A
    * value outside that throws rather than being clamped, since a bound quietly
    * replaced by a different one is how a status check comes to outlast the
@@ -1787,21 +1795,30 @@ export interface DevDBConnectionResult {
   error: string | null;
 }
 
-/** Default bound on the connection tiebreaker, in milliseconds. */
-const DEFAULT_CONNECTION_TIMEOUT_MS = 3000;
+/**
+ * Default bound on the connection tiebreaker, in milliseconds.
+ *
+ * Twice the three seconds that used to be applied to each step separately,
+ * because the value now covers the whole tiebreaker. Three seconds of budget
+ * split across the steps would hand the connect half of what it had and each
+ * query a fifth, which turns a server that is merely slow into one that
+ * cannot be identified, and a start that refuses over it.
+ */
+const DEFAULT_CONNECTION_TIMEOUT_MS = 6000;
 
 /**
  * Smallest bound the tiebreaker can be given, in milliseconds.
  *
- * The budget is divided across a connect and two queries, and node-postgres
- * reads a zero timeout as no timeout at all, so a value small enough to round
- * a step down to nothing would remove the bound it was asked to tighten. Five
- * is where every step still gets a whole millisecond. It is a floor on what is
- * meaningful rather than a recommendation: a value this small will time out
+ * The budget is divided across a connect, two queries, and the close, and
+ * node-postgres reads a zero timeout as no timeout at all, so a value small
+ * enough to round a step down to nothing would remove the bound it was asked
+ * to tighten. Twenty is where the smallest share, the close's, still gets a
+ * whole millisecond. It is a floor on what is meaningful rather than a
+ * recommendation: a value this small will time out
  * against any real server, which is the caller's business, but it will do so
  * having actually been bounded.
  */
-const MIN_CONNECTION_TIMEOUT_MS = 5;
+const MIN_CONNECTION_TIMEOUT_MS = 20;
 
 /**
  * Largest bound the tiebreaker can be given, in milliseconds.
@@ -1840,7 +1857,7 @@ function resolveConnectionTimeoutMs(timeoutMs: number | undefined): number {
   ) {
     throw new Error(
       `connection.timeoutMs must be a whole number of milliseconds between ${MIN_CONNECTION_TIMEOUT_MS} and ${MAX_CONNECTION_TIMEOUT_MS}, but was ${String(timeoutMs)}. ` +
-        "It bounds the connection tiebreaker as a whole, which is a connect and two queries, so a smaller value cannot bound each of them, and a larger one does not fit the timer that enforces it.",
+        "It bounds the connection tiebreaker as a whole, which is a connect, two queries, and a close, so a smaller value cannot bound each of them, and a larger one does not fit the timer that enforces it.",
     );
   }
 
@@ -1860,15 +1877,19 @@ export async function identifyViaConnection(
 ): Promise<DevDBConnectionResult> {
   const timeoutMs = resolveConnectionTimeoutMs(connection.timeoutMs);
   // timeoutMs bounds the whole probe, not each of its steps. This runs a
-  // connect and then two queries, so giving all three the full value would
-  // let the total reach three times it, and getLocalDevDBServerStatus would
-  // stop waiting first: a server that connected slowly but was about to name
-  // its own data directory would be cut off and reported as unidentifiable.
-  // The budget is split instead, with the remainder left as margin so a step
-  // that runs out of time reports its own error rather than racing the
-  // caller's timeout for which message the reader gets.
+  // connect, then two queries, then a close, so giving each of them the full
+  // value would let the total reach four times it, and
+  // getLocalDevDBServerStatus would stop waiting first: a server that
+  // connected slowly but was about to name its own data directory would be cut
+  // off and reported as unidentifiable. The budget is split instead, with the
+  // remainder left as margin so a connect or a query that runs out of time
+  // reports its own error rather than racing the caller's timeout for which
+  // message the reader gets. The close is in the split rather than outside it
+  // because the answer is computed before it runs, so an unbounded close loses
+  // an identification that had already succeeded. It is also the one step with
+  // nothing to report: what it protects is an answer already in hand.
   //
-  // The floors below cannot fire while MIN_CONNECTION_TIMEOUT_MS is 5, since
+  // The floors below cannot fire while MIN_CONNECTION_TIMEOUT_MS is 20, since
   // that is the value at which the smallest share still rounds to a whole
   // millisecond. They are kept because node-postgres reads a zero timeout as
   // no timeout at all, so a later change to the floor or to these fractions
@@ -1876,6 +1897,22 @@ export async function identifyViaConnection(
   // unbounded connection.
   const connectTimeoutMs = Math.max(1, Math.floor(timeoutMs * 0.5));
   const queryTimeoutMs = Math.max(1, Math.floor(timeoutMs * 0.2));
+  const closeTimeoutMs = Math.max(1, Math.floor(timeoutMs * 0.05));
+
+  // A query that ran past its share of the budget is a slow server, not a
+  // restricted one and not an absent one. Both of those leave the cluster
+  // unidentified, but neither is answered by widening a privilege or by
+  // looking for a server on another port, so the share it overran and the
+  // option that widens it are what the reader is owed. node-postgres names
+  // this failure itself, so it can be told apart by its message. Either query
+  // can hit it, and they are reported from different places, so the wording
+  // lives here rather than in both of them.
+  const isQueryTimeout = (message: string) =>
+    /query read timeout/i.test(message);
+
+  const describeQueryTimeout = (what: string) =>
+    `connected, but ${what} did not answer within its ${queryTimeoutMs}ms share of the ${timeoutMs}ms budget; raise connection.timeoutMs if the server is simply slow`;
+
   const client = new Client({
     host: connection.host ?? "127.0.0.1",
     port: connection.port,
@@ -1914,21 +1951,45 @@ export async function identifyViaConnection(
         error: null,
       };
     } catch (e) {
-      // Connected, but not permitted to see which cluster this is. That is
-      // still worth reporting as a response: it cannot confirm identity, so
-      // the cautious answer stands rather than being downgraded.
+      // Connected, but could not see which cluster this is. That is still
+      // worth reporting as a response: it cannot confirm identity, so the
+      // cautious answer stands rather than being downgraded.
+      const message = e instanceof Error ? e.message : String(e);
+      // The grant is the answer to exactly one of the ways this fails, and
+      // PostgreSQL says so itself: reading a restricted GUC without the
+      // privilege is 42501. A dropped connection or a statement timeout is
+      // not fixed by widening a privilege the dev user may already hold, and
+      // advising it there sends the reader away from what actually broke.
+      const insufficientPrivilege = (e as { code?: string })?.code === "42501";
+
       return {
         dataDir: null,
         startedAt,
         responded: true,
-        error: `connected, but could not read data_directory (${
-          e instanceof Error ? e.message : String(e)
-        }); grant pg_read_all_settings to this user to allow identification`,
+        error: isQueryTimeout(message)
+          ? describeQueryTimeout("reading data_directory")
+          : insufficientPrivilege
+            ? `connected, but is not permitted to read data_directory (${message}); grant pg_read_all_settings to this user to allow identification`
+            : `connected, but could not read data_directory (${message})`,
       };
     }
   } catch (e) {
     const code = (e as NodeJS.ErrnoException)?.code;
     const message = e instanceof Error ? e.message : String(e);
+
+    // The start time is asked for first, so its timeout lands here rather than
+    // in the handler above. It is still a server that answered, and saying
+    // only "Query read timeout" would leave the reader to guess which step ran
+    // out and what widens it.
+    if (isQueryTimeout(message)) {
+      return {
+        dataDir: null,
+        startedAt: null,
+        responded: true,
+        error: describeQueryTimeout("reading the postmaster start time"),
+      };
+    }
+
     // A refusal still proves something is listening; it just will not talk to
     // us. That is worth reporting differently from nothing being there. pg's
     // own connect timeout carries no code at all, so it has to be recognized
@@ -1946,10 +2007,39 @@ export async function identifyViaConnection(
       error: message,
     };
   } finally {
+    // Bounded like every other step. pg's non-pipeline `end()` half-closes and
+    // resolves once the peer closes, so a server that never sends its own FIN
+    // leaves it pending indefinitely — and the answer above is computed before
+    // this runs, so an unbounded close would hold a successful identification
+    // until getLocalDevDBServerStatus gave up on it and called the server
+    // unidentifiable. Past its share the socket is destroyed and the answer
+    // returned, since a close that will not finish is a socket to drop rather
+    // than a reason to lose what the server already said.
+    let closeTimer: ReturnType<typeof setTimeout> | undefined;
+
     try {
-      await client.end();
+      await Promise.race([
+        client.end(),
+        new Promise<void>((resolve) => {
+          closeTimer = setTimeout(() => {
+            try {
+              client.connection.stream.destroy();
+            } catch {
+              // Already gone, or never opened. Either way there is nothing
+              // left to drop, and a throw from a timer callback has no catch
+              // above it to land in.
+            }
+
+            resolve();
+          }, closeTimeoutMs);
+        }),
+      ]);
     } catch {
       // Connection may never have opened.
+    } finally {
+      if (closeTimer) {
+        clearTimeout(closeTimer);
+      }
     }
   }
 }

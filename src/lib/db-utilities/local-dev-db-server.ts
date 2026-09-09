@@ -2111,10 +2111,10 @@ export class LocalDevDBServer {
     const postmasterPidFile = join(this.pgDataDir, "postmaster.pid");
 
     // Read BEFORE the probe as well as after. Probing is not instant — it may
-    // open a connection and wait out a three-second timeout — and reading only
-    // afterwards would let a record written during that window become the one
-    // this start accounts for without the status decision having examined it
-    // at all. The removals at the end would then delete a live postmaster.pid
+    // open a connection and wait out the whole of the tiebreaker's budget —
+    // and reading only afterwards would let a record written during that
+    // window become the one this start accounts for without the status
+    // decision having examined it at all. The removals at the end would then delete a live postmaster.pid
     // as unchanged, orphaning the server that had just claimed the directory.
     const priorPidFile = await this.readAccountedPidFileBytes(this.pidFile);
     const priorPostmasterPid =
