@@ -1769,11 +1769,11 @@ export interface DevDBConnectionProbe {
    *
    * It bounds the tiebreaker as a whole rather than each step of it, so
    * {@link identifyViaConnection} spends a share of it on connecting (50%), a
-   * share on each of its two queries (20% each), and a share on closing (5%),
-   * rather than the whole value on each of them. The remainder is margin, so a
-   * connect or a query that runs out of time reports its own error rather than
-   * racing the status check's timeout for which message the reader gets. The
-   * close reports nothing, since by then the answer is already in hand.
+   * share on each of its two queries (15% each), and a share on closing (5%),
+   * rather than the whole value on each of them. The remaining 15% is margin,
+   * so a connect or a query that runs out of time reports its own error rather
+   * than racing the status check's timeout for which message the reader gets.
+   * The close reports nothing, since by then the answer is already in hand.
    *
    * The default is twice the three seconds a single step used to get, so the
    * connect keeps the bound it always had while the whole probe now finishes
@@ -1818,8 +1818,8 @@ export interface DevDBConnectionResult {
  * Twice the three seconds that used to be applied to each step separately,
  * because the value now covers the whole tiebreaker. Three seconds of budget
  * split across the steps would hand the connect half of what it had and each
- * query a fifth, which turns a server that is merely slow into one that
- * cannot be identified, and a start that refuses over it.
+ * query a fraction of it, which turns a server that is merely slow into one
+ * that cannot be identified, and a start that refuses over it.
  */
 const DEFAULT_CONNECTION_TIMEOUT_MS = 6000;
 
@@ -1940,6 +1940,16 @@ export async function identifyViaConnection(
   // an identification that had already succeeded. It is also the one step with
   // nothing to report: what it protects is an answer already in hand.
   //
+  // The margin is 15% rather than a sliver because it has to absorb the very
+  // condition this option exists for. A machine loaded enough that the queries
+  // outlast their share is one whose event loop is late too, and every one of
+  // these steps is enforced by a timer the same loop has to get to. Shares
+  // summing to 95% would leave 300ms at the default to cover four such
+  // handoffs, which is the wrong side of a coin flip on the machines this is
+  // for: the caller's timeout would win the race the split exists to lose, and
+  // the reader would get "the probe never answered" in place of the step that
+  // overran and the option that widens it.
+  //
   // The floors below cannot fire while MIN_CONNECTION_TIMEOUT_MS is 20, since
   // that is the value at which the smallest share still rounds to a whole
   // millisecond. They are kept because node-postgres reads a zero timeout as
@@ -1947,7 +1957,7 @@ export async function identifyViaConnection(
   // would not fail here, it would quietly hand an unresponsive server an
   // unbounded connection.
   const connectTimeoutMs = Math.max(1, Math.floor(timeoutMs * 0.5));
-  const queryTimeoutMs = Math.max(1, Math.floor(timeoutMs * 0.2));
+  const queryTimeoutMs = Math.max(1, Math.floor(timeoutMs * 0.15));
   const closeTimeoutMs = Math.max(1, Math.floor(timeoutMs * 0.05));
 
   // A query that ran past its share of the budget is a slow server, not a

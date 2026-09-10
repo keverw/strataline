@@ -1920,11 +1920,11 @@ That bound covers the tiebreaker as a whole rather than each step of it. The bui
 | Step                                | Share | At the six-second default |
 | ----------------------------------- | ----- | ------------------------- |
 | Connect                             | 50%   | 3000ms                    |
-| `pg_postmaster_start_time()`        | 20%   | 1200ms                    |
-| `current_setting('data_directory')` | 20%   | 1200ms                    |
+| `pg_postmaster_start_time()`        | 15%   | 900ms                     |
+| `current_setting('data_directory')` | 15%   | 900ms                     |
 | Close                               | 5%    | 300ms                     |
 
-The remaining 5% is margin, so a connect or a query that runs out of time reports what it was doing rather than the status check reporting only that the probe never answered. The close has nothing to report, since by the time it runs the answer is already in hand. Six seconds is the default because the connect is the step that needs the room, and half of six is the three it wants on a cold or loaded machine.
+The remaining 15% is margin, so a connect or a query that runs out of time reports what it was doing rather than the status check reporting only that the probe never answered. It is that wide because it has to absorb the very condition the option exists for: a machine loaded enough that a query outlasts its share is one whose event loop is late too, and every share here is enforced by a timer that same loop has to get to. The close has nothing to report, since by the time it runs the answer is already in hand. Six seconds is the default because the connect is the step that needs the room, and half of six is the three it wants on a cold or loaded machine.
 
 Because the value is divided, it has to be a whole number of milliseconds, at least 20 and no larger than a timer can hold. Anything else throws as soon as the status check is called, naming the option and what was read, rather than being clamped to something the caller did not write.
 

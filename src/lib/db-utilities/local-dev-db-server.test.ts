@@ -4157,7 +4157,7 @@ describe("LocalDevDBServer", () => {
       expect(result.responded).toBe(true);
       expect(result.dataDir).toBeNull();
       expect(result.error).toContain("postmaster start time");
-      expect(result.error).toContain("200ms share of the 1000ms budget");
+      expect(result.error).toContain("150ms share of the 1000ms budget");
       expect(result.error).toContain("connection.timeoutMs");
 
       // Under a caller's own name for the bound, which is what a wrapper with
@@ -4220,7 +4220,7 @@ describe("LocalDevDBServer", () => {
       // one failing.
       expect(result.startedAt).toBe(Date.parse("2026-09-09T12:00:00.000Z"));
       expect(result.error).toContain("reading data_directory");
-      expect(result.error).toContain("200ms share of the 1000ms budget");
+      expect(result.error).toContain("150ms share of the 1000ms budget");
       expect(result.error).not.toContain("pg_read_all_settings");
     } finally {
       await stub.close();
