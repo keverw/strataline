@@ -4159,6 +4159,38 @@ describe("LocalDevDBServer", () => {
       expect(result.error).toContain("postmaster start time");
       expect(result.error).toContain("200ms share of the 1000ms budget");
       expect(result.error).toContain("connection.timeoutMs");
+
+      // Under a caller's own name for the bound, which is what a wrapper with
+      // a config of its own passes so the option it tells the reader to raise
+      // is the one that reader actually has. LocalDevDBServer is the wrapper
+      // in this package, and the message it produces is this one rather than
+      // the validation error, so the flat name has to reach here too.
+      const renamed = await identifyViaConnection({
+        port,
+        user: "test_dev_user",
+        password: "test_dev_password",
+        database: "test_dev_database",
+        timeoutMs: 1000,
+        timeoutOptionName: "connectionTimeoutMs",
+      });
+
+      expect(renamed.error).toContain("raise connectionTimeoutMs");
+      expect(renamed.error).not.toContain("connection.timeoutMs");
+
+      // A name that is present but says nothing is treated as absent. The
+      // field is a bare string, so a wrapper deriving it from its own config
+      // can hand over an empty one, and a diagnostic naming no option at all
+      // is worse than one naming the path it really lives at.
+      const blank = await identifyViaConnection({
+        port,
+        user: "test_dev_user",
+        password: "test_dev_password",
+        database: "test_dev_database",
+        timeoutMs: 1000,
+        timeoutOptionName: "   ",
+      });
+
+      expect(blank.error).toContain("raise connection.timeoutMs");
     } finally {
       await stub.close();
     }
@@ -4240,6 +4272,11 @@ describe("LocalDevDBServer", () => {
     // set it. Rejecting an unusable one before anything is opened is what
     // proves the value reached the tiebreaker rather than being dropped on the
     // way: nothing else in a start produces this message.
+    //
+    // It has to name the option THIS caller has. The tiebreaker calls the
+    // bound `connection.timeoutMs`, which is the path to it within the status
+    // options, and this config is flat, so a message using that name would
+    // send somebody looking for a field LocalDevDBServerConfig does not have.
     const configured = new LocalDevDBServer({
       port: await findFreePort(),
       user: "test_dev_user",
@@ -4250,9 +4287,16 @@ describe("LocalDevDBServer", () => {
       connectionTimeoutMs: 0,
     });
 
-    await expect(configured.start()).rejects.toThrow(
-      /connection\.timeoutMs must be a whole number/,
+    const failure = await configured.start().then(
+      () => null,
+      (e: unknown) => (e instanceof Error ? e.message : String(e)),
     );
+
+    expect(failure).toMatch(/connectionTimeoutMs must be a whole number/);
+    // And not under the tiebreaker's own name for it, which is the whole
+    // point: the two differ by a dot, so a reader who is told the wrong one
+    // searches their config for a field that is not there.
+    expect(failure).not.toContain("connection.timeoutMs");
   }, 30000);
 
   it("should advise the grant only where PostgreSQL reports insufficient privilege", async () => {

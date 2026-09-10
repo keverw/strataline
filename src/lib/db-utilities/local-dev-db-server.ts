@@ -2147,6 +2147,11 @@ export class LocalDevDBServer {
         // Undefined takes the tiebreaker's own default, so not configuring one
         // reads exactly as it did before this was configurable.
         timeoutMs: this.connectionTimeoutMs,
+        // The tiebreaker's own name for this bound is the path to it within
+        // the status options, and this config is flat, so a refusal telling
+        // the reader to raise `connection.timeoutMs` would name a field their
+        // config does not have. They set it here.
+        timeoutOptionName: "connectionTimeoutMs",
       },
     });
 

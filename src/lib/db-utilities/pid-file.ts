@@ -221,7 +221,16 @@ export interface DevDBStatusOptions {
    * itself. Omit to skip that step entirely.
    */
   connection?: DevDBConnectionProbe;
-  /** Use a custom connection probe. It is bounded by connection.timeoutMs. */
+  /**
+   * Use a custom connection probe.
+   *
+   * `connection.timeoutMs` bounds how long this call WAITS for it, not the
+   * probe itself: there is no cancellation signal to hand it, so one that
+   * overruns keeps running with whatever it opened. The built-in probe is not
+   * exposed to that, since it bounds its own steps to a share of the budget
+   * and so settles first. A supplied one has to bound itself, or its socket
+   * outlives the status check that stopped waiting for it.
+   */
   connectionProbe?: (
     connection: DevDBConnectionProbe,
   ) => Promise<DevDBConnectionResult>;
@@ -1777,6 +1786,18 @@ export interface DevDBConnectionProbe {
    * limit it was given.
    */
   timeoutMs?: number;
+  /**
+   * What to call {@link timeoutMs} in the diagnostics that ask for a wider
+   * one. Defaults to `connection.timeoutMs`, which is where it sits here.
+   *
+   * A caller that exposes this bound under a name of its own passes that name
+   * instead. `LocalDevDBServer` is the one in this package: its config is flat,
+   * so the field a reader has to edit is `connectionTimeoutMs`, and a refusal
+   * telling them to raise `connection.timeoutMs` names something their config
+   * does not have. The message is only worth printing if the option it names
+   * is the option that caller can set.
+   */
+  timeoutOptionName?: string;
 }
 
 /** What asking the database directly told us. */
@@ -1829,6 +1850,33 @@ const MIN_CONNECTION_TIMEOUT_MS = 20;
 const MAX_CONNECTION_TIMEOUT_MS = 2_147_483_647;
 
 /**
+ * What the tiebreaker's bound is called when the caller does not say.
+ *
+ * The path to it within {@link DevDBStatusOptions}, since that is the caller
+ * every one of these messages has unless one names itself. See
+ * {@link DevDBConnectionProbe.timeoutOptionName}.
+ */
+const DEFAULT_TIMEOUT_OPTION_NAME = "connection.timeoutMs";
+
+/**
+ * Reads a caller's name for the tiebreaker's bound, or ours when there is
+ * none.
+ *
+ * Blank counts as none. The field is a bare `string`, so a wrapper building
+ * the name from a config of its own can hand over an empty one, and the
+ * messages that use it would then open with a space and name nothing at all.
+ * A diagnostic whose whole job is to say which option to edit is worse than
+ * useless when it names none, and falling back to the real path at least
+ * leaves the reader somewhere to go.
+ *
+ * One place, rather than a fallback at each of the two call sites, so the two
+ * cannot come to disagree about what an absent name means.
+ */
+function resolveTimeoutOptionName(optionName: string | undefined): string {
+  return optionName?.trim() ? optionName : DEFAULT_TIMEOUT_OPTION_NAME;
+}
+
+/**
  * Reads a caller-supplied tiebreaker timeout, or the default when there is
  * none.
  *
@@ -1841,7 +1889,10 @@ const MAX_CONNECTION_TIMEOUT_MS = 2_147_483_647;
  * numeric environment variables: `0.5` is far likelier to be seconds written
  * in the wrong unit than a request for half a millisecond.
  */
-function resolveConnectionTimeoutMs(timeoutMs: number | undefined): number {
+function resolveConnectionTimeoutMs(
+  timeoutMs: number | undefined,
+  optionName: string,
+): number {
   if (timeoutMs === undefined) {
     return DEFAULT_CONNECTION_TIMEOUT_MS;
   }
@@ -1852,7 +1903,7 @@ function resolveConnectionTimeoutMs(timeoutMs: number | undefined): number {
     timeoutMs > MAX_CONNECTION_TIMEOUT_MS
   ) {
     throw new Error(
-      `connection.timeoutMs must be a whole number of milliseconds between ${MIN_CONNECTION_TIMEOUT_MS} and ${MAX_CONNECTION_TIMEOUT_MS}, but was ${String(timeoutMs)}. ` +
+      `${optionName} must be a whole number of milliseconds between ${MIN_CONNECTION_TIMEOUT_MS} and ${MAX_CONNECTION_TIMEOUT_MS}, but was ${String(timeoutMs)}. ` +
         "It bounds the connection tiebreaker as a whole, which is a connect, two queries, and a close, so a smaller value cannot bound each of them, and a larger one does not fit the timer that enforces it.",
     );
   }
@@ -1871,7 +1922,11 @@ function resolveConnectionTimeoutMs(timeoutMs: number | undefined): number {
 export async function identifyViaConnection(
   connection: DevDBConnectionProbe,
 ): Promise<DevDBConnectionResult> {
-  const timeoutMs = resolveConnectionTimeoutMs(connection.timeoutMs);
+  const optionName = resolveTimeoutOptionName(connection.timeoutOptionName);
+  const timeoutMs = resolveConnectionTimeoutMs(
+    connection.timeoutMs,
+    optionName,
+  );
   // timeoutMs bounds the whole probe, not each of its steps. This runs a
   // connect, then two queries, then a close, so giving each of them the full
   // value would let the total reach four times it, and
@@ -1907,7 +1962,7 @@ export async function identifyViaConnection(
     /query read timeout/i.test(message);
 
   const describeQueryTimeout = (what: string) =>
-    `connected, but ${what} did not answer within its ${queryTimeoutMs}ms share of the ${timeoutMs}ms budget; raise connection.timeoutMs if the server is simply slow`;
+    `connected, but ${what} did not answer within its ${queryTimeoutMs}ms share of the ${timeoutMs}ms budget; raise ${optionName} if the server is simply slow`;
 
   const client = new Client({
     host: connection.host ?? "127.0.0.1",
@@ -2069,7 +2124,10 @@ export async function getLocalDevDBServerStatus(
   // only on the runs that happened to need it, and a configuration error that
   // shows up on some runs and not others is one nobody finds until it matters.
   const timeoutMs = options.connection
-    ? resolveConnectionTimeoutMs(options.connection.timeoutMs)
+    ? resolveConnectionTimeoutMs(
+        options.connection.timeoutMs,
+        resolveTimeoutOptionName(options.connection.timeoutOptionName),
+      )
     : DEFAULT_CONNECTION_TIMEOUT_MS;
 
   const status = await probeStatusFromFiles(options);
@@ -2098,6 +2156,11 @@ export async function getLocalDevDBServerStatus(
   // it adds is why, recorded as a probe failure like any other, since a
   // tiebreaker that could not run is exactly what a person reading a refusal
   // wants named.
+  //
+  // The bound below is on the waiting, not on the probe. Nothing here can stop
+  // somebody else's function mid-flight, so an overrunning one is left to
+  // finish on its own and this call stops accounting for it — which is why the
+  // option is documented as a limit a supplied probe has to keep for itself.
   let answer: DevDBConnectionResult;
   let timeout: ReturnType<typeof setTimeout> | undefined;
 

@@ -1913,7 +1913,7 @@ if (status.running || status.indeterminate) {
 }
 ```
 
-You can supply `connectionProbe` to perform the connection tiebreaker through a custom integration. `connection.timeoutMs`, which defaults to six seconds, bounds how long the status check awaits the built-in or custom probe. If the probe does not settle in time, the status remains `indeterminate` and its `reason` reports the timeout.
+You can supply `connectionProbe` to perform the connection tiebreaker through a custom integration. `connection.timeoutMs`, which defaults to six seconds, bounds how long the status check awaits the built-in or custom probe. If the probe does not settle in time, the status remains `indeterminate` and its `reason` reports the timeout. That bound is on the waiting rather than on the probe, since there is no cancellation signal to hand a function somebody else wrote, so a custom probe that overruns keeps running with whatever it opened and has to bound itself. The built-in probe is not exposed to that, because it divides the same budget across its own steps and so settles first.
 
 That bound covers the tiebreaker as a whole rather than each step of it. The built-in probe makes a connection, then two queries, then closes, and each of those gets a share of the budget rather than the whole value, so the limit the caller wrote is the one the probe finishes inside:
 
@@ -1928,7 +1928,7 @@ The remaining 5% is margin, so a connect or a query that runs out of time report
 
 Because the value is divided, it has to be a whole number of milliseconds, at least 20 and no larger than a timer can hold. Anything else throws as soon as the status check is called, naming the option and what was read, rather than being clamped to something the caller did not write.
 
-`LocalDevDBServer` runs this same tiebreaker when a start finds a server already there, and its `connectionTimeoutMs` option is the bound for it, so a refusal that names `connection.timeoutMs` can be answered from the config that produced it.
+`LocalDevDBServer` runs this same tiebreaker when a start finds a server already there, and its `connectionTimeoutMs` option is the bound for it. Its config is flat, so the bound is flat too, and a start that refuses over it names `connectionTimeoutMs` rather than the path this section uses. That is the point of naming it differently: the option a refusal tells you to raise is the one in the config that produced the refusal. If you wrap the status check in something of your own, `connection.timeoutOptionName` is how you put your own name for the bound into those messages.
 
 **Three answers, not two.** This is the whole point of the shape, and the reason `running: false` is not a license to do anything destructive:
 
