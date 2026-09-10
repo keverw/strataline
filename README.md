@@ -1031,6 +1031,8 @@ import { SourceFilterLogger } from "strataline/logger";
 const logger = new SourceFilterLogger(myPinoAdapter, { pg: false });
 ```
 
+For integrations that consume raw PostgreSQL output, `postgresOutputLevel(text)` is exported from `strataline/local-dev-db-server` and returns the same `"info"`, `"warn"`, or `"error"` classification used by the embedded helpers.
+
 ##### Creating Custom Loggers
 
 You can create your own logger by extending the `BaseLogger` class:
@@ -1387,7 +1389,9 @@ afterAll(async () => {
 });
 ```
 
-Concurrent `stop()` calls join the teardown already running rather than each starting their own, and a `start()` that overlaps one is refused, so a signal handler racing a test hook is safe in both directions.
+Concurrent `stop()` calls join the teardown already running rather than each starting their own. A `start()` that overlaps a stop, or a `stop()` that overlaps startup, rejects instead of racing the other lifecycle. Await or handle that rejection at call sites that can overlap.
+
+`getLifecycleState()` returns `"stopped"`, `"starting"`, `"running"`, `"stopping"`, or `"unstoppable"`. The shared `LifecycleState` type is exported from both database entry points. `isReady()` remains the simpler check for whether startup completed and teardown has not begun. It is not a database health check, so it does not guarantee that a query will succeed.
 
 ##### Migration Logging
 
@@ -1468,7 +1472,7 @@ It uses the same embedded PostgreSQL binaries as Strataline's Test DB Instance, 
 - The dev database server (`bun run dev:db`) uses [@embedded-postgres](https://www.npmjs.com/package/@embedded-postgres) to provide platform-specific PostgreSQL 18 binaries via npm.
   - _Note: Strataline currently depends on a **pre-release** (beta) of `embedded-postgres` for its PostgreSQL 18 binaries, and the version range (`^18.4.0-beta.17`) can resolve forward to later 18.x betas. This only affects the local embedded dev/test databases, never your production instance, but pin the exact version in your own `package.json` if you want fully reproducible local builds._
 - _Note: The embedded dev database does **not** bundle `pg_upgrade`. When we bump the embedded version in the future, you may need to delete your local data directory (`pgdata/`) and let it reinitialize. This is usually fine for dev/test workflows._
-- **Production deployments** should use a separate PostgreSQL instance because the embedded helpers are intended only for local development and testing. A managed PostgreSQL 18+ service is recommended, with upgrades handled through your provider or operations team.
+- **Production deployments** should use a separate PostgreSQL instance because the embedded helpers are intended only for local development and testing. Choose and test a supported PostgreSQL version for your application, and handle upgrades through your provider or operations team.
 
 Unlike test instances, the dev server is designed to **persist data between restarts**. That means you can keep your seeded content, local accounts, and data intact between sessions, making it especially useful when developing or demoing your app.
 
@@ -1639,6 +1643,8 @@ const server = new LocalDevDBServer({
 
 > **Note on Required Fields:** `port`, `user`, `password`, `database`, `dataDir`, and `pidFile` are all required (TypeScript enforces this). Only `logger`, `onExit`, `logConnections`, and `connectionTimeoutMs` are optional. This differs from the [Test DB Instance](#test-db-instance), where everything, including the port, is optional and a free port is auto-assigned, because test databases are throwaway and isolated while the dev server is long-lived and shared with your app.
 
+`dataDir` is resolved to an absolute path when the server is constructed, so later working-directory changes do not retarget PostgreSQL. `pidFile` is used as supplied. Keep it at a stable path that every process managing this server resolves the same way.
+
 **Note:** The server initializes `dataDir` only when it does not already contain an initialized PostgreSQL cluster. On every start, it checks for the configured user and database and creates either only if missing. An existing application user's password is left unchanged, so keep the same user and password when restarting an existing data directory. To change that password, alter the role in PostgreSQL or start with a fresh data directory.
 
 > **Heads up: a `postgres` superuser is also created.** Besides the user you configure, startup ensures a `postgres` superuser exists with the well-known password `postgres` (it's created if missing, or its password is reset to `postgres` if it already exists). This is a local-development convenience, but it means the cluster has a predictable superuser login. Keep the dev server bound to localhost (it is, by default) and **don't expose its port** on shared or untrusted networks.
@@ -1709,7 +1715,7 @@ The dev server includes robust process management:
 
 - **Clean Shutdown**: Stops the verified server with PostgreSQL's fast-shutdown signal, escalating only as far as needed, so a connected client does not leave a stale data directory
 - **Stale Process Detection**: Cleans up a previous server only after verifying its identity, and refuses startup when the evidence is ambiguous
-- **PID File Management**: Tracks the server process ID for reliable cleanup
+- **PID File Management**: Stores a structured process record for identity checks and reliable cleanup. Current versions can read the bare PID written by Strataline 4.0.3 and earlier, but older versions cannot read the new JSON record, so downgrading requires removing or replacing the PID file only after confirming that the server is stopped
 - **Verified Termination**: Only ever signals a PID that has been positively matched to this cluster and this boot, and leaves an unidentifiable process alone rather than guessing
 - **Host-Owned Signals**: Installs no signal handlers. Call `shutdown(signal)` from the host's `SIGINT`, `SIGTERM`, or `SIGHUP` handler when the server should stop with the process
 
@@ -1862,7 +1868,7 @@ Waiting for the start is the point of that shape, not incidental to it. Calling 
 
 The wait needs a bound for the same reason it needs to exist. Trapping a signal suppresses Node's own termination, so an unwaited-out `start()` becomes a script that ignores `SIGTERM`. A first-run `initdb` is unbounded and is the one step here that can be, so without the timer a supervisor's grace period expires and `SIGKILL`s the script, reaching the ungraceful ending more slowly than not waiting would have. Giving up is no worse than never having waited, so the bound only trades away the startups that would have finished later than it.
 
-> **Wire this, or a supervisor orphans your database.** An untrapped `SIGTERM` terminates Node immediately without running any JavaScript, including the force-kill hook below. `docker stop`, systemd, or any process manager then leaves the postmaster running, holding the port and the data directory. `Ctrl+C` at a terminal usually survives it because the signal goes to the whole foreground process group and PostgreSQL gets its own copy, but that is luck rather than design.
+> **Wire this when a supervisor signals only the Node process.** An untrapped `SIGTERM` terminates Node without running JavaScript, including the force-kill hook below. A process manager that signals only the parent can therefore leave PostgreSQL running with the port and data directory still held. `Ctrl+C` often reaches the whole foreground process group, but applications should not rely on that delivery detail.
 
 `shutdown(signal)` is `stop()` with the signal recorded in the log. What reaches PostgreSQL is always the `SIGINT` → `SIGQUIT` → `SIGKILL` escalation, because those are the only shutdown modes it has, and the signal that reached your process says nothing about which one this server needs.
 
@@ -1879,7 +1885,7 @@ One `process` listener is installed for `exit`, and it force-kills a surviving p
 | An uncaught exception in your process | not called because this library does not handle it |
 | The server died unasked | **called** with PostgreSQL's exit code |
 
-Supply nothing and nothing happens. The process stays up with no database behind it, which is logged as an error precisely because it is otherwise silent. Deciding that a dead database should take the program with it is the program's call. A test harness, a provisioning step, or anything that wanted a database for a while may have somewhere to carry on to.
+Supply nothing and the library takes no action beyond logging. The host may stay up or exit naturally depending on what other work keeps its event loop alive. Deciding that a dead database should take the program with it is the program's call. A test harness, a provisioning step, or anything that wanted a database for a while may have somewhere to carry on to.
 
 The one `process` listener this library installs is a shared synchronous `exit` hook that force-kills any surviving child, and it manages itself. `start()` puts it on and the shutdown takes it off with the last child, so an instance sitting idle between cycles holds nothing and a program that builds servers over its lifetime accumulates nothing. One hook serves every server in the process, so several running at once still install exactly one, and it comes off when the last of them lets go.
 
@@ -1914,6 +1920,8 @@ if (status.running || status.indeterminate) {
 ```
 
 You can supply `connectionProbe` to perform the connection tiebreaker through a custom integration. `connection.timeoutMs`, which defaults to six seconds, bounds how long the status check awaits the built-in or custom probe. If the probe does not settle in time, the status remains `indeterminate` and its `reason` reports the timeout. That bound is on the waiting rather than on the probe, since there is no cancellation signal to hand a function somebody else wrote, so a custom probe that overruns keeps running with whatever it opened and has to bound itself. The built-in probe is not exposed to that, because it divides the same budget across its own steps and so settles first.
+
+The built-in tiebreaker reads PostgreSQL's `data_directory`, which is restricted to superusers and members of `pg_read_all_settings`. On each successful setup, the dev server attempts to grant `pg_read_all_settings` to the configured development role so that later status checks can identify the cluster. A failed grant produces a warning without failing startup, and a later connection tiebreaker may remain indeterminate if the file and process evidence cannot decide. A successful grant broadens that local role's ability to read server settings and is another reason not to use the embedded helper for production.
 
 That bound covers the tiebreaker as a whole rather than each step of it. The built-in probe makes a connection, then two queries, then closes, and each of those gets a share of the budget rather than the whole value, so the limit the caller wrote is the one the probe finishes inside:
 
