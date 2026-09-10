@@ -4103,10 +4103,26 @@ describe("LocalDevDBServer", () => {
 
     await new Promise<void>((resolve) => silent.listen(silentPort, resolve));
 
-    try {
-      const timeoutMs = 1000;
-      const started = Date.now();
+    const timeoutMs = 1000;
+    const scheduledDelays: number[] = [];
+    const originalSetTimeout = globalThis.setTimeout;
 
+    globalThis.setTimeout = ((
+      callback: (...args: unknown[]) => void,
+      delay?: number,
+      ...args: unknown[]
+    ) => {
+      scheduledDelays.push(delay ?? 0);
+
+      // Make either the current split or the old whole-budget regression fire
+      // immediately. The assertion is about the configured delay, so it does
+      // not need a wall-clock ceiling that can fail under event-loop load.
+      const connectionDelay =
+        delay === timeoutMs || delay === timeoutMs * 0.5 ? 0 : delay;
+      return originalSetTimeout(callback, connectionDelay, ...args);
+    }) as typeof globalThis.setTimeout;
+
+    try {
       const result = await identifyViaConnection({
         port: silentPort,
         user: "test_dev_user",
@@ -4115,17 +4131,12 @@ describe("LocalDevDBServer", () => {
         timeoutMs,
       });
 
-      const elapsed = Date.now() - started;
-
-      // That it was the connect step running out its own budget, rather than
-      // the attempt failing at once for some unrelated reason, which would
-      // pass the upper bound below without measuring anything.
       expect(result.error).toMatch(/timeout/i);
-      expect(elapsed).toBeGreaterThanOrEqual(timeoutMs * 0.4);
-      // Comfortably under the budget rather than at it, so the two queries
-      // that a real server would go on to answer still have room.
-      expect(elapsed).toBeLessThan(timeoutMs * 0.8);
+      expect(scheduledDelays).toContain(timeoutMs * 0.5);
+      expect(scheduledDelays).not.toContain(timeoutMs);
     } finally {
+      globalThis.setTimeout = originalSetTimeout;
+
       for (const socket of accepted) {
         socket.destroy();
       }
