@@ -181,12 +181,7 @@ export interface MigrationResult<D_ALL = Record<string, unknown>> {
   //   (graceful shutdown). Distinct from "error" (a real failure) and from
   //   "deferred" (a migration paused itself).
   status:
-    | "completed"
-    | "locked"
-    | "lock_lost"
-    | "error"
-    | "deferred"
-    | "aborted";
+    "completed" | "locked" | "lock_lost" | "error" | "deferred" | "aborted";
 
   // Reason for failure or deferral if applicable (always a formatted string for display)
   reason?: string;
@@ -1921,8 +1916,7 @@ export class MigrationManager {
 
     // Find the migration by ID
     const migration = this.migrations.find((m) => m.id === migrationId) as
-      | Migration<TPayload, TReturn>
-      | undefined; // Cast for type safety
+      Migration<TPayload, TReturn> | undefined; // Cast for type safety
 
     if (!migration) {
       this.logger.error({

@@ -4234,6 +4234,27 @@ describe("LocalDevDBServer", () => {
     }
   }, 30000);
 
+  it("should carry connectionTimeoutMs through to the tiebreaker", async () => {
+    // The tiebreaker's own timeout diagnostics tell the reader to raise this
+    // bound, and a start is where they read them, so a start has to be able to
+    // set it. Rejecting an unusable one before anything is opened is what
+    // proves the value reached the tiebreaker rather than being dropped on the
+    // way: nothing else in a start produces this message.
+    const configured = new LocalDevDBServer({
+      port: await findFreePort(),
+      user: "test_dev_user",
+      password: "test_dev_password",
+      database: "test_dev_database",
+      dataDir: join(tempDir.name, "timeout-pgdata"),
+      pidFile: join(tempDir.name, ".timeout_pg_pid"),
+      connectionTimeoutMs: 0,
+    });
+
+    await expect(configured.start()).rejects.toThrow(
+      /connection\.timeoutMs must be a whole number/,
+    );
+  }, 30000);
+
   it("should advise the grant only where PostgreSQL reports insufficient privilege", async () => {
     // The one failure a grant does answer, against a real server so the SQLSTATE
     // is PostgreSQL's own rather than a guess about which code it uses. A role

@@ -1633,10 +1633,11 @@ const server = new LocalDevDBServer({
   logger: customLogger, // Optional: custom structured logger
   onExit: (exitCode) => process.exit(exitCode || 1), // Optional: server-exit notification
   logConnections: false, // Optional: enable PostgreSQL connection logging (default: false)
+  connectionTimeoutMs: 6000, // Optional: bound on the connection tiebreaker a start uses to identify a server already running (default: 6000)
 });
 ```
 
-> **Note on Required Fields:** `port`, `user`, `password`, `database`, `dataDir`, and `pidFile` are all required (TypeScript enforces this). Only `logger`, `onExit`, and `logConnections` are optional. This differs from the [Test DB Instance](#test-db-instance), where everything, including the port, is optional and a free port is auto-assigned, because test databases are throwaway and isolated while the dev server is long-lived and shared with your app.
+> **Note on Required Fields:** `port`, `user`, `password`, `database`, `dataDir`, and `pidFile` are all required (TypeScript enforces this). Only `logger`, `onExit`, `logConnections`, and `connectionTimeoutMs` are optional. This differs from the [Test DB Instance](#test-db-instance), where everything, including the port, is optional and a free port is auto-assigned, because test databases are throwaway and isolated while the dev server is long-lived and shared with your app.
 
 **Note:** The server initializes `dataDir` only when it does not already contain an initialized PostgreSQL cluster. On every start, it checks for the configured user and database and creates either only if missing. An existing application user's password is left unchanged, so keep the same user and password when restarting an existing data directory. To change that password, alter the role in PostgreSQL or start with a fresh data directory.
 
@@ -1926,6 +1927,8 @@ That bound covers the tiebreaker as a whole rather than each step of it. The bui
 The remaining 5% is margin, so a connect or a query that runs out of time reports what it was doing rather than the status check reporting only that the probe never answered. The close has nothing to report, since by the time it runs the answer is already in hand. Six seconds is the default because the connect is the step that needs the room, and half of six is the three it wants on a cold or loaded machine.
 
 Because the value is divided, it has to be a whole number of milliseconds, at least 20 and no larger than a timer can hold. Anything else throws as soon as the status check is called, naming the option and what was read, rather than being clamped to something the caller did not write.
+
+`LocalDevDBServer` runs this same tiebreaker when a start finds a server already there, and its `connectionTimeoutMs` option is the bound for it, so a refusal that names `connection.timeoutMs` can be answered from the config that produced it.
 
 **Three answers, not two.** This is the whole point of the shape, and the reason `running: false` is not a license to do anything destructive:
 

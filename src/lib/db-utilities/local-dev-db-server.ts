@@ -301,8 +301,8 @@ function getCurrentUser(): string {
  * Configuration for {@link LocalDevDBServer}. Unlike `TestDatabaseOptions` on
  * the `strataline/test-db-instance` entry point, the connection fields
  * (`port`, `user`, `password`, `database`, `dataDir`, `pidFile`) are required — the dev server runs on a fixed, predictable port and
- * data directory rather than a throwaway one. Only `logger`, `onExit`, and
- * `logConnections` are optional.
+ * data directory rather than a throwaway one. Only `logger`, `onExit`,
+ * `logConnections`, and `connectionTimeoutMs` are optional.
  */
 export interface LocalDevDBServerConfig {
   port: number;
@@ -314,6 +314,17 @@ export interface LocalDevDBServerConfig {
   logger?: Logger;
   onExit?: DevDBExitHandler;
   logConnections?: boolean;
+  /**
+   * Bound on the connection tiebreaker a start uses to identify a server it
+   * found already running. See {@link DevDBConnectionProbe.timeoutMs}, whose
+   * default and validation this passes straight through.
+   *
+   * It is here because that tiebreaker's own diagnostics tell the reader to
+   * raise it. A machine loaded enough that the identification queries outlast
+   * their share of the default refuses the start and names the bound, so the
+   * bound has to be one this caller can actually widen.
+   */
+  connectionTimeoutMs?: number;
 }
 
 /**
@@ -332,6 +343,7 @@ export class LocalDevDBServer {
   private logger?: Logger;
   private onExit?: DevDBExitHandler;
   private logConnections: boolean;
+  private connectionTimeoutMs?: number;
   private currentUser: string;
   private pidVerificationProbes: ProcessProbes = systemProbes;
 
@@ -474,6 +486,7 @@ export class LocalDevDBServer {
     this.logger = config.logger && makeSafeLogger(config.logger);
     this.onExit = config.onExit;
     this.logConnections = config.logConnections ?? false;
+    this.connectionTimeoutMs = config.connectionTimeoutMs;
     this.currentUser = getCurrentUser();
 
     // Deliberately no process listeners here. The shared exit hook goes on in
@@ -2131,6 +2144,9 @@ export class LocalDevDBServer {
         user: this.pgUser,
         password: this.pgPass,
         database: this.pgDb,
+        // Undefined takes the tiebreaker's own default, so not configuring one
+        // reads exactly as it did before this was configurable.
+        timeoutMs: this.connectionTimeoutMs,
       },
     });
 

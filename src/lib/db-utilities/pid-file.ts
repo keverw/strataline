@@ -108,10 +108,7 @@ export interface DevDBPidRecord {
 
 /** How a {@link DevDBServerStatus} was determined. */
 export type DevDBStatusSource =
-  | "pid-file"
-  | "postmaster"
-  | "connection"
-  | "none";
+  "pid-file" | "postmaster" | "connection" | "none";
 
 /**
  * Why a record failed to verify. The distinction matters for callers gating
@@ -392,8 +389,7 @@ function describeProbeError(error: unknown): string {
   // kills a child at its timeout, so it is spelled out here rather than
   // assumed away.
   const errno = error as
-    | (NodeJS.ErrnoException & { signal?: NodeJS.Signals })
-    | null;
+    (NodeJS.ErrnoException & { signal?: NodeJS.Signals }) | null;
 
   // A spawn killed at its timeout reports the signal rather than a code, and
   // that distinction is the whole diagnosis: a probe that timed out says the

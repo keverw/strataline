@@ -53,6 +53,19 @@ jobs:
       - name: Lint
         run: bun run lint
 
+      # Formatting is checked rather than assumed. `update-docs` reformats only
+      # the docs, so a Prettier upgrade used to leave the source behind and
+      # nothing said so until somebody ran `bun run format` and found unrelated
+      # files in their diff.
+      #
+      # One platform only, unlike the two steps above. Formatting is a property
+      # of the files rather than of the machine, and the Windows runner checks
+      # out with core.autocrlf on, so every file arrives with CRLF endings that
+      # Prettier, whose endOfLine default is lf, would report as unformatted.
+      - name: Format check
+        if: runner.os == 'Linux'
+        run: bun run format:check
+
       # Bun's own default timeout is per test. The suite already passes
       # --timeout, and the job timeout above is what covers a wedged run.
       # Named by platform, both of them, because a skipped step is still listed
