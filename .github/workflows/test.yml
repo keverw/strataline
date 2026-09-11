@@ -1,23 +1,15 @@
 name: Test
 
-# `push` and `pull_request` read this file from the commit being tested, so a
-# workflow added on a feature branch runs there without being merged first.
-# `workflow_dispatch` is different: its button only appears once the file is on
-# the default branch. It is listed here so it works after the merge, and is not
-# what this relies on to run in the meantime.
-#
-# `push` is deliberately unfiltered for now, so this runs on the branch it was
-# added on rather than waiting for a merge. The cost is that a pull request
-# from a branch in this repository matches both triggers and runs twice. Once
-# this is on the default branch, narrow it to avoid that:
-#
-#   push:
-#     branches: [main]
-#
-# which leaves pull requests covered by the `pull_request` trigger alone.
+# Every update to an open pull request targeting main runs through
+# `pull_request`. Restricting `push` to main avoids running the same matrix a
+# second time for branches in this repository, while still testing the merged
+# result and direct pushes to main. `workflow_dispatch` keeps a manual run
+# available from the default branch.
 on:
   push:
+    branches: [main]
   pull_request:
+    branches: [main]
   workflow_dispatch:
 
 # A new push to the same branch cancels the run it supersedes. The suite starts
@@ -60,6 +52,19 @@ jobs:
 
       - name: Lint
         run: bun run lint
+
+      # Formatting is checked rather than assumed. `update-docs` reformats only
+      # the docs, so a Prettier upgrade used to leave the source behind and
+      # nothing said so until somebody ran `bun run format` and found unrelated
+      # files in their diff.
+      #
+      # One platform only, unlike the two steps above. Formatting is a property
+      # of the files rather than of the machine, and the Windows runner checks
+      # out with core.autocrlf on, so every file arrives with CRLF endings that
+      # Prettier, whose endOfLine default is lf, would report as unformatted.
+      - name: Format check
+        if: runner.os == 'Linux'
+        run: bun run format:check
 
       # Bun's own default timeout is per test. The suite already passes
       # --timeout, and the job timeout above is what covers a wedged run.

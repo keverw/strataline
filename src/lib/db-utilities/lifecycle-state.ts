@@ -42,8 +42,4 @@
  * graph is what a reader follows to work out what depends on what.
  */
 export type LifecycleState =
-  | "stopped"
-  | "starting"
-  | "running"
-  | "stopping"
-  | "unstoppable";
+  "stopped" | "starting" | "running" | "stopping" | "unstoppable";

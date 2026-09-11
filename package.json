@@ -45,6 +45,7 @@
     "test": "bun test --timeout 60000",
     "test:clean-ipc": "bun run scripts/clean-ipc.ts",
     "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,css,scss,md,html}\"",
+    "format:check": "prettier --check \"**/*.{ts,tsx,js,jsx,json,css,scss,md,html}\"",
     "format:docs": "prettier --write README.md changelog.md AGENTS.md CLAUDE.md",
     "lint": "eslint src",
     "update-docs": "markdown-toc-gen update README.md && markdown-toc-gen update changelog.md && bun run scripts/update-readme-version.ts && bun run format:docs"
@@ -67,16 +68,16 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@types/bun": "^1.3.14",
-    "@types/node": "^25.0.0",
-    "@types/pg": "^8.20.0",
+    "@types/bun": "^1.4.2",
+    "@types/node": "^25.9.5",
+    "@types/pg": "^8.23.1",
     "@types/tmp": "^0.2.6",
-    "eslint": "^10.5.0",
+    "eslint": "^10.10.0",
     "markdown-toc-gen": "^1.2.0",
-    "prettier": "^3.8.4",
+    "prettier": "^3.9.6",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",
-    "typescript-eslint": "^8.61.0"
+    "typescript-eslint": "^8.70.0"
   },
   "peerDependencies": {
     "pg": "^8.21.0"

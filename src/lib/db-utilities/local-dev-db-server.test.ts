@@ -284,6 +284,161 @@ async function supersedeAChild(
   return superseded;
 }
 
+/**
+ * A listener that speaks just enough of the PostgreSQL wire protocol to get a
+ * pg `Client` connected, and then does exactly what it is told with the two
+ * identification queries.
+ *
+ * The point is the steps a real server never lets us reach on demand. A server
+ * that completes its handshake and then declines to answer a query is what
+ * `query_timeout` exists for, and a server that accepts `Terminate` and never
+ * closes the socket is what the bounded close exists for, but neither can be
+ * asked of a genuine PostgreSQL. Both are ordinary here.
+ *
+ * `answer` says how many of the queries to respond to, so 0 stalls the start
+ * time, 1 answers it and stalls `data_directory`, and 2 answers both.
+ * `closeOnTerminate` is what a server that never sends its own FIN turns off.
+ */
+function startStubPostgres(options: {
+  port: number;
+  answer: 0 | 1 | 2;
+  closeOnTerminate?: boolean;
+  startedAt?: string;
+  dataDir?: string;
+}): {
+  close: () => Promise<void>;
+} {
+  const {
+    port,
+    answer,
+    closeOnTerminate = true,
+    startedAt = "2026-09-09 12:00:00.000000+00",
+    dataDir = "/tmp/stub-pgdata",
+  } = options;
+
+  const cstring = (value: string) =>
+    Buffer.concat([Buffer.from(value, "utf8"), Buffer.from([0])]);
+
+  const tagged = (type: string, body: Buffer) => {
+    const header = Buffer.alloc(5);
+
+    header.write(type, 0, "ascii");
+    header.writeInt32BE(body.length + 4, 1);
+
+    return Buffer.concat([header, body]);
+  };
+
+  // 'R' with a zero payload is AuthenticationOk, and 'Z' with 'I' is
+  // ReadyForQuery outside a transaction, which is what pg waits for before it
+  // calls the connection open.
+  const authOk = tagged(
+    "R",
+    (() => {
+      const body = Buffer.alloc(4);
+
+      body.writeInt32BE(0, 0);
+
+      return body;
+    })(),
+  );
+  const readyForQuery = tagged("Z", Buffer.from("I", "ascii"));
+
+  // One column, described and then sent. typeOid 1184 is timestamptz and 25 is
+  // text, which is what pg's own parsers key off to hand back a Date and a
+  // string rather than two buffers.
+  const singleColumn = (name: string, typeOid: number, value: string) => {
+    const description = Buffer.alloc(18);
+
+    description.writeInt32BE(0, 0); // table oid
+    description.writeInt16BE(0, 4); // column attribute number
+    description.writeInt32BE(typeOid, 6);
+    description.writeInt16BE(-1, 10); // variable width
+    description.writeInt32BE(-1, 12); // no type modifier
+    description.writeInt16BE(0, 16); // text format
+
+    const fieldCount = Buffer.alloc(2);
+
+    fieldCount.writeInt16BE(1, 0);
+
+    const encoded = Buffer.from(value, "utf8");
+    const length = Buffer.alloc(4);
+
+    length.writeInt32BE(encoded.length, 0);
+
+    return Buffer.concat([
+      tagged("T", Buffer.concat([fieldCount, cstring(name), description])),
+      tagged("D", Buffer.concat([fieldCount, length, encoded])),
+      tagged("C", cstring("SELECT 1")),
+      readyForQuery,
+    ]);
+  };
+
+  const answers = [
+    singleColumn("started_at", 1184, startedAt),
+    singleColumn("data_directory", 25, dataDir),
+  ];
+
+  const sockets: Socket[] = [];
+  // allowHalfOpen, because the close this exists to test is a half-close: pg
+  // writes Terminate and shuts down its own side. Node would otherwise end the
+  // server side for us the moment that FIN arrived, which closes the socket
+  // that a stalled close needs left open.
+  const server = createServer({ allowHalfOpen: true }, (socket) => {
+    sockets.push(socket);
+
+    let handshake = false;
+    let asked = 0;
+
+    socket.on("error", () => {
+      // The client destroys this side when its close runs out of time, which
+      // is the case under test rather than a failure.
+    });
+
+    socket.on("data", (chunk: Buffer) => {
+      if (!handshake) {
+        // The startup packet is the one message with no type byte. Nothing in
+        // it needs reading: this listener has no authentication to do and no
+        // catalog to look anything up in.
+        handshake = true;
+        socket.write(Buffer.concat([authOk, readyForQuery]));
+
+        return;
+      }
+
+      // Every later message is typed, and pg sends these one at a time: it
+      // waits for ReadyForQuery before the next query, so a chunk holds one.
+      const type = String.fromCharCode(chunk.readUInt8(0));
+
+      if (type === "Q") {
+        asked += 1;
+
+        if (asked <= answer) {
+          socket.write(answers[asked - 1] as Buffer);
+        }
+
+        // Past `answer`, say nothing at all. That is the stall.
+        return;
+      }
+
+      if (type === "X" && closeOnTerminate) {
+        socket.end();
+      }
+    });
+  });
+
+  server.listen(port);
+
+  return {
+    close: async () => {
+      for (const socket of sockets) {
+        socket.destroy();
+      }
+
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
 describe("LocalDevDBServer", () => {
   let server: LocalDevDBServer;
   let tempDir: tmp.DirResult;
@@ -3929,6 +4084,275 @@ describe("LocalDevDBServer", () => {
     }
   }, 30000);
 
+  it("should finish within timeoutMs rather than spending it on each step", async () => {
+    // timeoutMs is what getLocalDevDBServerStatus waits for, so this probe has
+    // to fit its connect and its two queries inside that one budget. Giving
+    // every step the full value put the worst case at three times it, and the
+    // caller stopped waiting first: a server that connected slowly but was
+    // about to name its own data directory got cut off and reported as
+    // unidentifiable. The silent listener below never completes a handshake,
+    // so the connect step alone runs to its limit and the elapsed time is that
+    // limit rather than the whole budget.
+    const accepted: Socket[] = [];
+
+    const silent = createServer((socket) => {
+      accepted.push(socket);
+    });
+
+    const silentPort = await findFreePort();
+
+    await new Promise<void>((resolve) => silent.listen(silentPort, resolve));
+
+    const timeoutMs = 1000;
+    const scheduledDelays: number[] = [];
+    const originalSetTimeout = globalThis.setTimeout;
+
+    globalThis.setTimeout = ((
+      callback: (...args: unknown[]) => void,
+      delay?: number,
+      ...args: unknown[]
+    ) => {
+      scheduledDelays.push(delay ?? 0);
+
+      // Make either the current split or the old whole-budget regression fire
+      // immediately. The assertion is about the configured delay, so it does
+      // not need a wall-clock ceiling that can fail under event-loop load.
+      const connectionDelay =
+        delay === timeoutMs || delay === timeoutMs * 0.5 ? 0 : delay;
+      return originalSetTimeout(callback, connectionDelay, ...args);
+    }) as typeof globalThis.setTimeout;
+
+    try {
+      const result = await identifyViaConnection({
+        port: silentPort,
+        user: "test_dev_user",
+        password: "test_dev_password",
+        database: "test_dev_database",
+        timeoutMs,
+      });
+
+      expect(result.error).toMatch(/timeout/i);
+      expect(scheduledDelays).toContain(timeoutMs * 0.5);
+      expect(scheduledDelays).not.toContain(timeoutMs);
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+
+      for (const socket of accepted) {
+        socket.destroy();
+      }
+
+      await new Promise<void>((resolve) => silent.close(() => resolve()));
+    }
+  }, 30000);
+
+  it("should name the start time step when it outlasts its share", async () => {
+    // A server that finished its handshake and then said nothing. The failure
+    // pg reports is a bare "Query read timeout", which names neither the step
+    // that ran out nor the option that widens it, and this one arrives through
+    // the outer handler because the start time is asked for first.
+    const port = await findFreePort();
+    const stub = startStubPostgres({ port, answer: 0 });
+
+    try {
+      const result = await identifyViaConnection({
+        port,
+        user: "test_dev_user",
+        password: "test_dev_password",
+        database: "test_dev_database",
+        timeoutMs: 1000,
+      });
+
+      // It answered the handshake, so something is certainly there. Reporting
+      // this as no response would send the reader looking for a server that is
+      // in fact running.
+      expect(result.responded).toBe(true);
+      expect(result.dataDir).toBeNull();
+      expect(result.error).toContain("postmaster start time");
+      expect(result.error).toContain("150ms share of the 1000ms budget");
+      expect(result.error).toContain("connection.timeoutMs");
+
+      // Under a caller's own name for the bound, which is what a wrapper with
+      // a config of its own passes so the option it tells the reader to raise
+      // is the one that reader actually has. LocalDevDBServer is the wrapper
+      // in this package, and the message it produces is this one rather than
+      // the validation error, so the flat name has to reach here too.
+      const renamed = await identifyViaConnection({
+        port,
+        user: "test_dev_user",
+        password: "test_dev_password",
+        database: "test_dev_database",
+        timeoutMs: 1000,
+        timeoutOptionName: "connectionTimeoutMs",
+      });
+
+      expect(renamed.error).toContain("raise connectionTimeoutMs");
+      expect(renamed.error).not.toContain("connection.timeoutMs");
+
+      // A name that is present but says nothing is treated as absent. The
+      // field is a bare string, so a wrapper deriving it from its own config
+      // can hand over an empty one, and a diagnostic naming no option at all
+      // is worse than one naming the path it really lives at.
+      const blank = await identifyViaConnection({
+        port,
+        user: "test_dev_user",
+        password: "test_dev_password",
+        database: "test_dev_database",
+        timeoutMs: 1000,
+        timeoutOptionName: "   ",
+      });
+
+      expect(blank.error).toContain("raise connection.timeoutMs");
+    } finally {
+      await stub.close();
+    }
+  }, 30000);
+
+  it("should name the data_directory step when it outlasts its share", async () => {
+    // The same stall one query later, which arrives through the inner handler
+    // instead. That handler's other branch advises a pg_read_all_settings
+    // grant, and a timeout answered with a grant sends somebody to widen a
+    // privilege the dev user already holds while the slow machine goes unlooked
+    // at.
+    const port = await findFreePort();
+    const stub = startStubPostgres({ port, answer: 1 });
+
+    try {
+      const result = await identifyViaConnection({
+        port,
+        user: "test_dev_user",
+        password: "test_dev_password",
+        database: "test_dev_database",
+        timeoutMs: 1000,
+      });
+
+      expect(result.responded).toBe(true);
+      expect(result.dataDir).toBeNull();
+      // The first query did answer, so what it returned survives the second
+      // one failing.
+      expect(result.startedAt).toBe(Date.parse("2026-09-09T12:00:00.000Z"));
+      expect(result.error).toContain("reading data_directory");
+      expect(result.error).toContain("150ms share of the 1000ms budget");
+      expect(result.error).not.toContain("pg_read_all_settings");
+    } finally {
+      await stub.close();
+    }
+  }, 30000);
+
+  it("should keep an identification a stalled close would otherwise lose", async () => {
+    // Both queries answered, so the data directory is already in hand, and
+    // then the server accepts Terminate without ever closing the socket. pg's
+    // end() half-closes and resolves when the peer closes, so an unbounded one
+    // would sit here holding a finished answer until the status check gave up
+    // and called the server unidentifiable.
+    const port = await findFreePort();
+    const stub = startStubPostgres({
+      port,
+      answer: 2,
+      closeOnTerminate: false,
+      dataDir: "/tmp/stub-pgdata-stalled",
+    });
+
+    try {
+      const timeoutMs = 2000;
+      const started = Date.now();
+
+      const result = await identifyViaConnection({
+        port,
+        user: "test_dev_user",
+        password: "test_dev_password",
+        database: "test_dev_database",
+        timeoutMs,
+      });
+
+      const elapsed = Date.now() - started;
+
+      expect(result.error).toBeNull();
+      expect(result.dataDir).toBe("/tmp/stub-pgdata-stalled");
+      expect(result.responded).toBe(true);
+      // Back inside the close's own share rather than at the budget, which is
+      // where getLocalDevDBServerStatus would have stopped waiting.
+      expect(elapsed).toBeLessThan(timeoutMs * 0.5);
+    } finally {
+      await stub.close();
+    }
+  }, 30000);
+
+  it("should carry connectionTimeoutMs through to the tiebreaker", async () => {
+    // The tiebreaker's own timeout diagnostics tell the reader to raise this
+    // bound, and a start is where they read them, so a start has to be able to
+    // set it. Rejecting an unusable one before anything is opened is what
+    // proves the value reached the tiebreaker rather than being dropped on the
+    // way: nothing else in a start produces this message.
+    //
+    // It has to name the option THIS caller has. The tiebreaker calls the
+    // bound `connection.timeoutMs`, which is the path to it within the status
+    // options, and this config is flat, so a message using that name would
+    // send somebody looking for a field LocalDevDBServerConfig does not have.
+    const configured = new LocalDevDBServer({
+      port: await findFreePort(),
+      user: "test_dev_user",
+      password: "test_dev_password",
+      database: "test_dev_database",
+      dataDir: join(tempDir.name, "timeout-pgdata"),
+      pidFile: join(tempDir.name, ".timeout_pg_pid"),
+      connectionTimeoutMs: 0,
+    });
+
+    const failure = await configured.start().then(
+      () => null,
+      (e: unknown) => (e instanceof Error ? e.message : String(e)),
+    );
+
+    expect(failure).toMatch(/connectionTimeoutMs must be a whole number/);
+    // And not under the tiebreaker's own name for it, which is the whole
+    // point: the two differ by a dot, so a reader who is told the wrong one
+    // searches their config for a field that is not there.
+    expect(failure).not.toContain("connection.timeoutMs");
+  }, 30000);
+
+  it("should advise the grant only where PostgreSQL reports insufficient privilege", async () => {
+    // The one failure a grant does answer, against a real server so the SQLSTATE
+    // is PostgreSQL's own rather than a guess about which code it uses. A role
+    // without pg_read_all_settings can still call pg_postmaster_start_time(),
+    // which is why the start time is asked for first.
+    await server.start();
+
+    const admin = new Client({
+      host: "localhost",
+      port: serverPort,
+      user: "postgres",
+      password: "postgres",
+      database: "test_dev_database",
+    });
+
+    await admin.connect();
+
+    try {
+      await admin.query(
+        "CREATE ROLE probe_restricted LOGIN PASSWORD 'probe_restricted_pw'",
+      );
+    } finally {
+      await admin.end();
+    }
+
+    const result = await identifyViaConnection({
+      port: serverPort,
+      user: "probe_restricted",
+      password: "probe_restricted_pw",
+      database: "test_dev_database",
+    });
+
+    // Answered, and even said when it started. What it would not say is which
+    // cluster it is, so the cautious answer has to stand.
+    expect(result.responded).toBe(true);
+    expect(result.dataDir).toBeNull();
+    expect(result.startedAt).toBeGreaterThan(0);
+    expect(result.error).toContain("not permitted to read data_directory");
+    expect(result.error).toContain("grant pg_read_all_settings");
+
+    await server.stop();
+  }, 60000);
+
   it("should report a real running server as running", async () => {
     // End to end through the status function against genuine PostgreSQL,
     // rather than the stand-in process the unit tests spawn.
@@ -4177,7 +4601,7 @@ describe("LocalDevDBServer", () => {
   describe("accounting for the records a start decided about", () => {
     // The records are read before the status probe and confirmed after it.
     // Reading only afterwards let a record written while the probe was running
-    // — it can wait out a three-second connection timeout — become the one the
+    // — it can wait out the tiebreaker's whole budget — become the one the
     // start accounted for, without the decision having examined it at all. The
     // removals at the end then deleted a live postmaster.pid as unchanged.
     type Accounting = {
