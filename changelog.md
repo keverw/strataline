@@ -2,11 +2,11 @@
 
 <!-- toc -->
 
-- [Unreleased](#unreleased)
+- [5.0.0 (September 10, 2026)](#500-september-10-2026)
 
 <!-- tocstop -->
 
-## Unreleased
+## 5.0.0 (September 10, 2026)
 
 This release hardens the embedded development and test databases against process-identity mistakes, failed starts, and overlapping lifecycle calls. It also gives every entry point one structured logging API.
 
