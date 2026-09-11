@@ -2127,8 +2127,9 @@ export class LocalDevDBServer {
     // open a connection and wait out the whole of the tiebreaker's budget —
     // and reading only afterwards would let a record written during that
     // window become the one this start accounts for without the status
-    // decision having examined it at all. The removals at the end would then delete a live postmaster.pid
-    // as unchanged, orphaning the server that had just claimed the directory.
+    // decision having examined it at all. The removals at the end would then
+    // delete a live postmaster.pid as unchanged, orphaning the server that had
+    // just claimed the directory.
     const priorPidFile = await this.readAccountedPidFileBytes(this.pidFile);
     const priorPostmasterPid =
       await this.readAccountedPidFileBytes(postmasterPidFile);
